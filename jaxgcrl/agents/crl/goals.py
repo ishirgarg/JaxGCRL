@@ -319,8 +319,7 @@ class MetricPreservationGoalProposal(GoalProposer):
             f_sah = energy_fn(self.energy_fn_name, phi_sh, psi_h)  # (num_env,)
 
             # combine: f(s,a1,g) + f(g,a2,h) - f(s,a3,h); except we translate to Q function
-            proposed_goal_densites = estimate_log_density_knn(candidate_goals)
-            M = f_sag[:, None] + f_gah - f_sah[None, :] + proposed_goal_densites[:, None]
+            M = f_sag[:, None] + f_gah - f_sah[None, :]
             return M
 
         # compute for all states
