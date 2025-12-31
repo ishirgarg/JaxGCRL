@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from brax.training.replay_buffers import ReplayBuffer
 from brax.training.types import PRNGKey
 from jax import flatten_util
+from jax.experimental import multihost_utils
 
 # TODO: make only single type of Replay Buffer (for CRL and baselines)
 Sample = TypeVar("Sample")
@@ -55,10 +56,12 @@ class QueueBase(ReplayBuffer[ReplayBufferState, Sample], Generic[Sample]):
         self.episode_length = episode_length
 
     def init(self, key: PRNGKey) -> ReplayBufferState:
+        # Pin replay buffer data to CPU to avoid OOM on GPU
+        cpu_device = jax.devices('cpu')[0]
         return ReplayBufferState(
-            data=jnp.zeros(self._data_shape, self._data_dtype),
-            sample_position=jnp.zeros((), jnp.int32),
-            insert_position=jnp.zeros((), jnp.int32),
+            data=jax.device_put(jnp.zeros(self._data_shape, self._data_dtype), cpu_device),
+            sample_position=jax.device_put(jnp.zeros((), jnp.int32), cpu_device),
+            insert_position=jax.device_put(jnp.zeros((), jnp.int32), cpu_device),
             key=key,
         )
 
@@ -90,7 +93,10 @@ class QueueBase(ReplayBuffer[ReplayBufferState, Sample], Generic[Sample]):
                 f"doesn't match the expected value ({self._data_shape})"
             )
 
+        # Keep data on CPU - transfer samples from GPU if needed
+        cpu_device = jax.devices('cpu')[0]
         update = self._flatten_fn(samples)
+        update = jax.device_put(update, cpu_device)
         data = buffer_state.data
 
         # If needed, roll the buffer to make sure there's enough space to fit
@@ -104,6 +110,11 @@ class QueueBase(ReplayBuffer[ReplayBufferState, Sample], Generic[Sample]):
         data = jax.lax.dynamic_update_slice_in_dim(data, update, position, axis=0)
         position = (position + len(update)) % (len(data) + 1)
         sample_position = jnp.maximum(0, buffer_state.sample_position + roll)
+
+        # Ensure all data stays on CPU
+        data = jax.device_put(data, cpu_device)
+        position = jax.device_put(position, cpu_device)
+        sample_position = jax.device_put(sample_position, cpu_device)
 
         return buffer_state.replace(
             data=data,
@@ -153,10 +164,12 @@ class TrajectoryUniformSamplingQueue:
         self.episode_length = episode_length
 
     def init(self, key):
+        # Pin replay buffer data to CPU to avoid OOM on GPU
+        cpu_device = jax.devices('cpu')[0]
         return ReplayBufferState(
-            data=jnp.zeros(self._data_shape, self._data_dtype),
-            sample_position=jnp.zeros((), jnp.int32),
-            insert_position=jnp.zeros((), jnp.int32),
+            data=jax.device_put(jnp.zeros(self._data_shape, self._data_dtype), cpu_device),
+            sample_position=jax.device_put(jnp.zeros((), jnp.int32), cpu_device),
+            insert_position=jax.device_put(jnp.zeros((), jnp.int32), cpu_device),
             key=key,
         )
 
@@ -196,7 +209,10 @@ class TrajectoryUniformSamplingQueue:
                 f"doesn't match the expected value ({self._data_shape})"
             )
 
+        # Keep data on CPU - transfer samples from GPU if needed
+        cpu_device = jax.devices('cpu')[0]
         update = self._flatten_fn(samples)  # Updates has shape (unroll_len, num_envs, self._data_shape[-1])
+        update = jax.device_put(update, cpu_device)
         data = buffer_state.data  # shape = (max_replay_size, num_envs, data_size)
 
         # If needed, roll the buffer to make sure there's enough space to fit
@@ -214,6 +230,11 @@ class TrajectoryUniformSamplingQueue:
         sample_position = jnp.maximum(
             0, buffer_state.sample_position + roll
         )  # what is the use of this line? sample_position always remains 0 as roll can never be positive
+
+        # Ensure all data stays on CPU
+        data = jax.device_put(data, cpu_device)
+        position = jax.device_put(position, cpu_device)
+        sample_position = jax.device_put(sample_position, cpu_device)
 
         return buffer_state.replace(
             data=data,
@@ -270,8 +291,14 @@ class TrajectoryUniformSamplingQueue:
 
         flatten_batch takes care of this
         """
+        # Fetch data from CPU and immediately transfer sampled batch to GPU
         batch = create_batch_vmaped(buffer_state.data[:, envs_idxs, :], matrix)
         transitions = self._unflatten_fn(batch)
+        
+        # Transfer only the sampled transitions to GPU for training
+        gpu_device = jax.devices('gpu')[0] if jax.devices('gpu') else jax.devices()[0]
+        transitions = jax.tree_util.tree_map(lambda x: jax.device_put(x, gpu_device), transitions)
+        
         return buffer_state.replace(key=key), transitions
 
     def size(self, buffer_state: ReplayBufferState) -> int:

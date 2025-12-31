@@ -411,21 +411,15 @@ class CRL:
             },
         )
 
-        def jit_wrap(buffer):
-            buffer.insert_internal = jax.jit(buffer.insert_internal)
-            buffer.sample_internal = jax.jit(buffer.sample_internal)
-            return buffer
-
-        replay_buffer = jit_wrap(
-            TrajectoryUniformSamplingQueue(
-                max_replay_size=self.max_replay_size,
-                dummy_data_sample=dummy_transition,
-                sample_batch_size=self.batch_size,
-                num_envs=config.num_envs,
-                episode_length=config.episode_length,
-            )
+        # Don't JIT buffer operations - they handle CPU/GPU transfers explicitly
+        replay_buffer = TrajectoryUniformSamplingQueue(
+            max_replay_size=self.max_replay_size,
+            dummy_data_sample=dummy_transition,
+            sample_batch_size=self.batch_size,
+            num_envs=config.num_envs,
+            episode_length=config.episode_length,
         )
-        buffer_state = jax.jit(replay_buffer.init)(buffer_key)
+        buffer_state = replay_buffer.init(buffer_key)
 
         if self.goal_proposer_name == "quantile":
             goal_proposer = MediumEnergyGoalProposal(
