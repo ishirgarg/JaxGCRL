@@ -291,13 +291,16 @@ class TrajectoryUniformSamplingQueue:
 
         flatten_batch takes care of this
         """
-        # Fetch data from CPU and immediately transfer sampled batch to GPU
+        # Fetch sampled indices from CPU buffer
         batch = create_batch_vmaped(buffer_state.data[:, envs_idxs, :], matrix)
-        transitions = self._unflatten_fn(batch)
         
-        # Transfer only the sampled transitions to GPU for training
+        # Transfer raw batch to GPU first, BEFORE unflattening
+        # This ensures subsequent operations happen on GPU
         gpu_device = jax.devices('gpu')[0] if jax.devices('gpu') else jax.devices()[0]
-        transitions = jax.tree_util.tree_map(lambda x: jax.device_put(x, gpu_device), transitions)
+        batch = jax.device_put(batch, gpu_device)
+        
+        # Now unflatten on GPU so all downstream operations stay on GPU
+        transitions = self._unflatten_fn(batch)
         
         return buffer_state.replace(key=key), transitions
 

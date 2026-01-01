@@ -392,6 +392,10 @@ class CRL:
             critic_state=critic_state,
             alpha_state=alpha_state,
         )
+        
+        # Explicitly place training_state on GPU to ensure computation happens there
+        gpu_device = jax.devices('gpu')[0] if jax.devices('gpu') else jax.devices()[0]
+        training_state = jax.device_put(training_state, gpu_device)
 
         # Replay Buffer
         dummy_obs = jnp.zeros((obs_size,))
