@@ -4,6 +4,7 @@ from typing import Generic, Tuple, TypeVar
 import flax
 import jax
 import jax.numpy as jnp
+import numpy as np
 from brax.training.replay_buffers import ReplayBuffer
 from brax.training.types import PRNGKey
 from jax import flatten_util
@@ -130,6 +131,15 @@ class TrajectoryUniformSamplingQueue:
     specified limit.
 
     Derived classes must implement the `sample()` method.
+    
+    Args:
+        max_replay_size: Maximum number of transitions to store.
+        dummy_data_sample: A sample transition used to determine data shape.
+        sample_batch_size: Batch size for sampling.
+        num_envs: Number of parallel environments.
+        episode_length: Length of episodes for trajectory sampling.
+        use_cpu: If True, store replay buffer data on CPU to avoid GPU OOM.
+            Data is transferred to GPU only when sampled. Default False.
     """
 
     def __init__(
@@ -139,6 +149,7 @@ class TrajectoryUniformSamplingQueue:
         sample_batch_size: int,
         num_envs: int,
         episode_length: int,
+        use_cpu: bool = False,
     ):
         self._flatten_fn = jax.vmap(jax.vmap(lambda x: flatten_util.ravel_pytree(x)[0]))
         dummy_flatten, self._unflatten_fn = flatten_util.ravel_pytree(dummy_data_sample)
@@ -151,10 +162,22 @@ class TrajectoryUniformSamplingQueue:
         self._size = 0
         self.num_envs = num_envs
         self.episode_length = episode_length
+        self._use_cpu = use_cpu
+        
+        # CPU data storage (only used if use_cpu=True)
+        self._cpu_data = None
 
     def init(self, key):
+        if self._use_cpu:
+            # Store data on CPU as numpy array
+            self._cpu_data = np.zeros(self._data_shape, dtype=np.float32)
+            # Use minimal GPU memory - just a small placeholder
+            gpu_data = jnp.zeros((1, 1, 1), self._data_dtype)
+        else:
+            gpu_data = jnp.zeros(self._data_shape, self._data_dtype)
+            
         return ReplayBufferState(
-            data=jnp.zeros(self._data_shape, self._data_dtype),
+            data=gpu_data,
             sample_position=jnp.zeros((), jnp.int32),
             insert_position=jnp.zeros((), jnp.int32),
             key=key,
@@ -190,6 +213,13 @@ class TrajectoryUniformSamplingQueue:
         Returns:
           New buffer state.
         """
+        if self._use_cpu:
+            return self._insert_internal_cpu(buffer_state, samples)
+        else:
+            return self._insert_internal_gpu(buffer_state, samples)
+
+    def _insert_internal_gpu(self, buffer_state, samples):
+        """GPU-based insert (original implementation)."""
         if buffer_state.data.shape != self._data_shape:
             raise ValueError(
                 f"buffer_state.data.shape ({buffer_state.data.shape}) "
@@ -221,12 +251,54 @@ class TrajectoryUniformSamplingQueue:
             sample_position=sample_position,
         )
 
+    def _insert_internal_cpu(self, buffer_state, samples):
+        """CPU-based insert for memory efficiency."""
+        if self._cpu_data.shape != self._data_shape:
+            raise ValueError(
+                f"cpu_data.shape ({self._cpu_data.shape}) "
+                f"doesn't match the expected value ({self._data_shape})"
+            )
+
+        # Flatten on GPU, then transfer to CPU
+        update = self._flatten_fn(samples)  # shape: (unroll_len, num_envs, data_size)
+        update_np = np.asarray(update)  # Transfer to CPU
+        
+        # Get current position (transfer scalar to CPU for numpy indexing)
+        position = int(buffer_state.insert_position)
+        max_size = self._data_shape[0]
+        update_len = update_np.shape[0]
+        
+        # If needed, roll the buffer to make room
+        roll = min(0, max_size - position - update_len)
+        if roll < 0:
+            self._cpu_data = np.roll(self._cpu_data, roll, axis=0)
+            position = position + roll
+        
+        # Update CPU buffer
+        self._cpu_data[position:position + update_len] = update_np
+        
+        # Update positions (keep as JAX arrays)
+        new_position = (position + update_len) % (max_size + 1)
+        sample_position = max(0, int(buffer_state.sample_position) + roll)
+        
+        return buffer_state.replace(
+            insert_position=jnp.array(new_position, dtype=jnp.int32),
+            sample_position=jnp.array(sample_position, dtype=jnp.int32),
+        )
+
     def sample(self, buffer_state):
         """Sample a batch of data."""
         self.check_can_sample(buffer_state, 1)
         return self.sample_internal(buffer_state)
 
     def sample_internal(self, buffer_state):
+        if self._use_cpu:
+            return self._sample_internal_cpu(buffer_state)
+        else:
+            return self._sample_internal_gpu(buffer_state)
+
+    def _sample_internal_gpu(self, buffer_state):
+        """GPU-based sampling (original implementation)."""
         if buffer_state.data.shape != self._data_shape:
             raise ValueError(
                 f"Data shape expected by the replay buffer ({self._data_shape}) does "
@@ -272,6 +344,52 @@ class TrajectoryUniformSamplingQueue:
         """
         batch = create_batch_vmaped(buffer_state.data[:, envs_idxs, :], matrix)
         transitions = self._unflatten_fn(batch)
+        return buffer_state.replace(key=key), transitions
+
+    def _sample_internal_cpu(self, buffer_state):
+        """CPU-based sampling for memory efficiency.
+        
+        Generates indices on GPU, gathers from CPU, transfers batch to GPU.
+        """
+        key, sample_key, shuffle_key = jax.random.split(buffer_state.key, 3)
+        shape = self.num_envs
+
+        # Sample env indices on GPU
+        envs_idxs = jax.random.choice(sample_key, jnp.arange(self.num_envs), shape=(shape,), replace=False)
+        
+        # Get positions as Python ints for numpy indexing
+        sample_pos = int(buffer_state.sample_position)
+        insert_pos = int(buffer_state.insert_position)
+        
+        # Generate start indices for trajectories on GPU, then transfer to CPU
+        start_values = jax.random.randint(
+            sample_key, 
+            shape=(shape,), 
+            minval=sample_pos, 
+            maxval=insert_pos - self.episode_length
+        )
+        start_values_np = np.asarray(start_values)
+        envs_idxs_np = np.asarray(envs_idxs)
+        
+        # Create index matrix on CPU using vectorized operations
+        row_indices = np.arange(self.episode_length)
+        matrix = start_values_np[:, np.newaxis] + row_indices  # shape: (num_envs, episode_length)
+        
+        # Wrap indices for circular buffer
+        matrix = matrix % self._data_shape[0]
+        
+        # Gather from CPU buffer using advanced indexing (vectorized, no Python loop)
+        # self._cpu_data shape: (max_replay_size, num_envs, data_size)
+        # We want: batch[i, j, :] = self._cpu_data[matrix[i, j], envs_idxs_np[i], :]
+        batch_np = self._cpu_data[matrix, envs_idxs_np[:, np.newaxis], :]
+        # batch_np shape: (num_envs, episode_length, data_size)
+        
+        # Transfer batch to GPU
+        batch = jnp.array(batch_np)
+        
+        # Unflatten on GPU
+        transitions = self._unflatten_fn(batch)
+        
         return buffer_state.replace(key=key), transitions
 
     def size(self, buffer_state: ReplayBufferState) -> int:

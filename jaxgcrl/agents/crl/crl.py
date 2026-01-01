@@ -251,6 +251,8 @@ class CRL:
     use_kde_correction: bool = False
     # Whether to zero out the goals in metric proposal
     zero_out_cand_goals: bool = True
+    # Whether to use CPU-backed replay buffer to avoid GPU OOM
+    use_cpu_buffer: bool = False
 
     def check_config(self, config):
         """
@@ -423,6 +425,7 @@ class CRL:
                 sample_batch_size=self.batch_size,
                 num_envs=config.num_envs,
                 episode_length=config.episode_length,
+                use_cpu=self.use_cpu_buffer,
             )
         )
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
