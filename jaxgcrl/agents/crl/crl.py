@@ -23,6 +23,7 @@ from flax.training.train_state import TrainState
 
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import ActorEvaluator
+# Use the CPU-backed replay buffer
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 from jaxgcrl.utils.visualize import visualize_goals_2d, visualize_kde_heatmap, visualize_q_function_2d
 
@@ -293,7 +294,7 @@ class CRL:
 
         env_steps_per_actor_step = config.num_envs * self.unroll_length
         num_prefill_env_steps = self.min_replay_size * config.num_envs
-        num_prefill_actor_steps = np.ceil(self.min_replay_size / self.unroll_length)
+        num_prefill_actor_steps = int(np.ceil(self.min_replay_size / self.unroll_length))
         num_training_steps_per_epoch = (config.total_env_steps - num_prefill_env_steps) // (
             config.num_evals * env_steps_per_actor_step
         )
@@ -393,7 +394,8 @@ class CRL:
             alpha_state=alpha_state,
         )
 
-        # Replay Buffer
+        # Replay Buffer - CPU-backed to avoid OOM
+        # NOTE: We do NOT JIT wrap insert_internal for CPU-backed buffer
         dummy_obs = jnp.zeros((obs_size,))
         dummy_action = jnp.zeros((action_size,))
 
@@ -411,21 +413,18 @@ class CRL:
             },
         )
 
-        def jit_wrap(buffer):
-            buffer.insert_internal = jax.jit(buffer.insert_internal)
-            buffer.sample_internal = jax.jit(buffer.sample_internal)
-            return buffer
-
-        replay_buffer = jit_wrap(
-            TrajectoryUniformSamplingQueue(
-                max_replay_size=self.max_replay_size,
-                dummy_data_sample=dummy_transition,
-                sample_batch_size=self.batch_size,
-                num_envs=config.num_envs,
-                episode_length=config.episode_length,
-            )
+        # Create replay buffer WITHOUT JIT wrapping insert_internal
+        # The CPU-backed buffer handles device placement internally
+        replay_buffer = TrajectoryUniformSamplingQueue(
+            max_replay_size=self.max_replay_size,
+            dummy_data_sample=dummy_transition,
+            sample_batch_size=self.batch_size,
+            num_envs=config.num_envs,
+            episode_length=config.episode_length,
         )
-        buffer_state = jax.jit(replay_buffer.init)(buffer_key)
+        
+        # Initialize buffer (data will be on CPU)
+        buffer_state = replay_buffer.init(buffer_key)
 
         if self.goal_proposer_name == "quantile":
             goal_proposer = MediumEnergyGoalProposal(
@@ -482,8 +481,17 @@ class CRL:
                 extras={"state_extras": state_extras},
             )
 
+        # Split get_experience into two parts:
+        # 1. collect_experience: JIT-compiled, collects transitions on GPU
+        # 2. get_experience: Non-JIT wrapper that handles CPU buffer insert
+        
         @jax.jit
-        def get_experience(actor_state, env_state, training_state, buffer_state, key):        
+        def collect_experience(actor_state, env_state, training_state, buffer_state, key):
+            """
+            JIT-compiled function that collects experience from the environment.
+            Returns transitions WITHOUT inserting into buffer.
+            Buffer insert happens outside JIT to keep data on CPU.
+            """
             @jax.jit
             def f(carry, unused_t):
                 env_state, current_key, proposed_goals, was_proposed_goal_mask = carry
@@ -540,14 +548,27 @@ class CRL:
             # data.observation has shape (unroll_length, batch_size, obs_size)
             (env_state, _, _, _), data = jax.lax.scan(f, (env_state, key, proposed_goals, was_proposed_goal_mask), (), length=self.unroll_length)
 
+            # Return transitions WITHOUT inserting - insert happens outside JIT
+            return env_state, buffer_state, data
+
+        def get_experience(actor_state, env_state, training_state, buffer_state, key):
+            """
+            Wrapper that collects experience (JIT) and inserts into buffer (CPU).
+            """
+            env_state, buffer_state, data = collect_experience(
+                actor_state, env_state, training_state, buffer_state, key
+            )
+            # Insert into CPU-backed buffer (not JIT-compiled)
             buffer_state = replay_buffer.insert(buffer_state, data)
             return env_state, buffer_state
 
         def prefill_replay_buffer(training_state, env_state, buffer_state, key):
-            @jax.jit
-            def f(carry, unused):
-                del unused
-                training_state, env_state, buffer_state, key = carry
+            """
+            Prefill replay buffer using a Python loop instead of jax.lax.scan.
+            This allows buffer inserts to happen on CPU outside of JIT.
+            """
+            logging.info("Starting replay buffer prefill...")
+            for i in range(num_prefill_actor_steps):
                 key, new_key = jax.random.split(key)
                 env_state, buffer_state = get_experience(
                     training_state.actor_state,
@@ -559,14 +580,13 @@ class CRL:
                 training_state = training_state.replace(
                     env_steps=training_state.env_steps + env_steps_per_actor_step,
                 )
-                return (training_state, env_state, buffer_state, new_key), ()
-
-            return jax.lax.scan(
-                f,
-                (training_state, env_state, buffer_state, key),
-                (),
-                length=num_prefill_actor_steps,
-            )[0]
+                key = new_key
+                
+                if (i + 1) % 10 == 0:
+                    logging.info(f"Prefill progress: {i + 1}/{num_prefill_actor_steps}")
+            
+            logging.info("Replay buffer prefill complete.")
+            return training_state, env_state, buffer_state, key
 
         @jax.jit
         def update_networks(carry, transitions):
@@ -607,11 +627,14 @@ class CRL:
                 key,
             ), metrics
 
-        @jax.jit
         def training_step(training_state, env_state, buffer_state, key):
+            """
+            Single training step - uses Python control flow for buffer operations.
+            Neural network updates remain JIT-compiled.
+            """
             experience_key1, experience_key2, sampling_key, training_key = jax.random.split(key, 4)
 
-            # update buffer
+            # Collect experience and insert into CPU buffer
             env_state, buffer_state = get_experience(
                 training_state.actor_state,
                 env_state,
@@ -624,11 +647,11 @@ class CRL:
                 env_steps=training_state.env_steps + env_steps_per_actor_step,
             )
 
-            # sample actor-step worth of transitions
+            # Sample from CPU buffer (transfers batch to GPU)
             buffer_state, transitions = replay_buffer.sample(buffer_state)
             # transitions.observation has shape (num_envs, episode_length, obs_dim)
 
-            # process transitions for training
+            # Process transitions for training (on GPU)
             batch_keys = jax.random.split(sampling_key, transitions.observation.shape[0])
             transitions = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
                 (self.discounting, state_size, tuple(train_env.goal_indices)),
@@ -642,7 +665,7 @@ class CRL:
             )
             # Shape of obs is (num_envs * episode_length, obs_dim) after flattening
 
-            # permute transitions
+            # Permute transitions
             permutation = jax.random.permutation(experience_key2, len(transitions.observation))
             transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
             transitions = jax.tree_util.tree_map(
@@ -653,7 +676,7 @@ class CRL:
             
             last_batch = transitions
 
-            # take actor-step worth of training-step
+            # Take actor-step worth of training-step (JIT-compiled)
             (
                 (
                     training_state,
@@ -695,33 +718,31 @@ class CRL:
                 last_batch
             ), metrics
 
-        @jax.jit
         def training_epoch(
             training_state,
             env_state,
             buffer_state,
             key,
         ):
-            @jax.jit
-            def f(carry, unused_t):
-                ts, es, bs, k = carry
-                k, train_key = jax.random.split(k, 2)
+            """
+            Training epoch using Python loop for proper CPU buffer handling.
+            """
+            all_metrics = []
+            last_batch = None
+            
+            for _ in range(num_training_steps_per_epoch):
+                key, train_key = jax.random.split(key)
                 (
-                    (
-                        ts,
-                        es,
-                        bs,
-                        last_batch
-                    ),
-                    metrics,
-                ) = training_step(ts, es, bs, train_key)
-                return (ts, es, bs, k), (metrics, last_batch)
+                    training_state,
+                    env_state,
+                    buffer_state,
+                    last_batch
+                ), metrics = training_step(training_state, env_state, buffer_state, train_key)
+                all_metrics.append(metrics)
 
-            (training_state, env_state, buffer_state, key), (metrics, last_batch) = jax.lax.scan(
-                f,
-                (training_state, env_state, buffer_state, key),
-                (),
-                length=num_training_steps_per_epoch,
+            # Stack metrics from all steps
+            metrics = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs), *all_metrics
             )
 
             metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
