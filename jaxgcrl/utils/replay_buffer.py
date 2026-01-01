@@ -254,7 +254,7 @@ class TrajectoryUniformSamplingQueue:
     def _insert_internal_cpu(self, buffer_state, samples):
         """CPU-based insert for memory efficiency.
         
-        Uses jax.pure_callback to escape tracing and perform CPU operations.
+        Uses jax.experimental.io_callback to escape tracing and perform CPU operations.
         """
         # Flatten on GPU first
         update = self._flatten_fn(samples)  # shape: (unroll_len, num_envs, data_size)
@@ -281,8 +281,8 @@ class TrajectoryUniformSamplingQueue:
             
             return np.array(new_position, dtype=np.int32), np.array(new_sample_position, dtype=np.int32)
         
-        # Use io_callback since we're modifying external state (self._cpu_data)
-        new_insert_pos, new_sample_pos = jax.io_callback(
+        # Use experimental.io_callback since we're modifying external state (self._cpu_data)
+        new_insert_pos, new_sample_pos = jax.experimental.io_callback(
             cpu_insert,
             (jax.ShapeDtypeStruct((), jnp.int32), jax.ShapeDtypeStruct((), jnp.int32)),
             update,
@@ -358,7 +358,7 @@ class TrajectoryUniformSamplingQueue:
     def _sample_internal_cpu(self, buffer_state):
         """CPU-based sampling for memory efficiency.
         
-        Uses jax.pure_callback to escape tracing and gather from CPU buffer.
+        Uses jax.experimental.pure_callback to escape tracing and gather from CPU buffer.
         """
         key, sample_key, shuffle_key = jax.random.split(buffer_state.key, 3)
         shape = self.num_envs
@@ -390,7 +390,7 @@ class TrajectoryUniformSamplingQueue:
             return batch_np
         
         # Use pure_callback to gather from CPU (no side effects)
-        batch = jax.pure_callback(
+        batch = jax.experimental.pure_callback(
             cpu_gather,
             jax.ShapeDtypeStruct((shape, self.episode_length, self._data_shape[2]), jnp.float32),
             start_values,
