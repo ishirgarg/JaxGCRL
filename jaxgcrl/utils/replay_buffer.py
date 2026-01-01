@@ -131,12 +131,12 @@ class TrajectoryUniformSamplingQueue:
         num_envs: int,
         episode_length: int,
     ):
-        # JIT compile flatten to run on GPU
+        # JIT compile flatten to run on GPU (called outside JIT in insert_internal)
         self._flatten_fn = jax.jit(jax.vmap(jax.vmap(lambda x: flatten_util.ravel_pytree(x)[0])))
         
         dummy_flatten, self._unflatten_fn = flatten_util.ravel_pytree(dummy_data_sample)
-        # JIT compile unflatten to run on GPU
-        self._unflatten_fn = jax.jit(jax.vmap(jax.vmap(self._unflatten_fn)))
+        # Don't JIT unflatten - it's called inside JIT-compiled code (sample is called from goal_proposer inside JIT)
+        self._unflatten_fn = jax.vmap(jax.vmap(self._unflatten_fn))
         
         data_size = len(dummy_flatten)
 
@@ -147,11 +147,8 @@ class TrajectoryUniformSamplingQueue:
         self.num_envs = num_envs
         self.episode_length = episode_length
         
-        # Pre-compile gather function
-        self._gather_fn = jax.jit(self._gather_impl)
-
     def _gather_impl(self, data_slice, matrix):
-        """Gather trajectories from data slice. Runs on GPU."""
+        """Gather trajectories from data slice."""
         def gather_single_env(env_data, indices):
             return jnp.take(env_data, indices, axis=0, mode="wrap")
         return jax.vmap(gather_single_env, in_axes=(1, 0))(data_slice, matrix)
@@ -237,13 +234,10 @@ class TrajectoryUniformSamplingQueue:
 
     def sample_internal(self, buffer_state: ReplayBufferState):
         """
-        Sample from buffer.
+        Sample from buffer using pure JAX operations (JIT-compatible).
         
-        Strategy:
-        1. Generate random indices
-        2. Slice data on CPU using numpy (fast memory access)
-        3. Transfer slice to GPU
-        4. Gather and unflatten on GPU (compute-heavy)
+        Data stays on CPU, but all indexing uses JAX ops so this can be
+        called inside JIT-compiled functions.
         """
         if buffer_state.data.shape != self._data_shape:
             raise ValueError(
@@ -254,38 +248,34 @@ class TrajectoryUniformSamplingQueue:
         key, sample_key = jax.random.split(buffer_state.key)
         shape = self.num_envs
 
-        # Generate random indices (small arrays, device doesn't matter much)
+        # Generate random indices using JAX (JIT-compatible)
         sample_key, subkey1, subkey2 = jax.random.split(sample_key, 3)
         envs_idxs = jax.random.choice(
             subkey1, jnp.arange(self.num_envs), shape=(shape,), replace=False
         )
-        envs_idxs_np = np.array(envs_idxs)
-        
-        sample_pos = int(buffer_state.sample_position)
-        insert_pos = int(buffer_state.insert_position)
         
         # Create trajectory start indices
-        min_val = sample_pos
-        max_val = max(insert_pos - self.episode_length, min_val + 1)
+        # Use jnp.maximum to handle edge case in JIT-compatible way
+        min_val = buffer_state.sample_position
+        max_val = jnp.maximum(
+            buffer_state.insert_position - self.episode_length, 
+            min_val + 1
+        )
         start_values = jax.random.randint(
             subkey2, shape=(shape,), minval=min_val, maxval=max_val
         )
         row_indices = jnp.arange(self.episode_length)
         matrix = start_values[:, jnp.newaxis] + row_indices
 
-        # Slice data on CPU using numpy - fast memory access
-        data_np = np.array(buffer_state.data)
-        data_slice_np = data_np[:, envs_idxs_np, :]
+        # Use JAX indexing (works across devices, JIT-compatible)
+        # buffer_state.data is on CPU, but JAX handles the transfer
+        data_slice = buffer_state.data[:, envs_idxs, :]
         
-        # Transfer slice to GPU for compute
-        data_slice_gpu = to_gpu(jnp.array(data_slice_np))
-        matrix_gpu = to_gpu(matrix)
+        # Gather trajectories (JAX handles device placement)
+        batch = self._gather_impl(data_slice, matrix)
         
-        # Gather on GPU (JIT compiled)
-        batch_gpu = self._gather_fn(data_slice_gpu, matrix_gpu)
-        
-        # Unflatten on GPU (JIT compiled)
-        transitions = self._unflatten_fn(batch_gpu)
+        # Unflatten
+        transitions = self._unflatten_fn(batch)
         
         return buffer_state.replace(key=key), transitions
 
