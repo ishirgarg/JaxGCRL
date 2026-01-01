@@ -57,9 +57,10 @@ class Transition(NamedTuple):
     extras: jnp.ndarray = ()
 
 
-@functools.partial(jax.jit, static_argnames=("buffer_config"))
+@functools.partial(jax.jit, static_argnames=("buffer_config",))
 def flatten_batch(buffer_config, transition, sample_key):
     # transition.observations has size (episode_length, obs_dim)
+    # buffer_config is a tuple of (gamma, state_size, goal_indices) where goal_indices is tuple of ints
     gamma, state_size, goal_indices = buffer_config
 
     # Because it's vmaped transition.obs.shape is of shape (episode_len, obs_dim)
@@ -67,31 +68,20 @@ def flatten_batch(buffer_config, transition, sample_key):
     arrangement = jnp.arange(seq_len)
     is_future_mask = jnp.array(
         arrangement[:, None] < arrangement[None], dtype=jnp.float32
-    )  # upper triangular matrix of shape seq_len, seq_len where all non-zero entries are 1
+    )
     discount = gamma ** jnp.array(arrangement[None] - arrangement[:, None], dtype=jnp.float32)
     probs = is_future_mask * discount
-
-    # probs is an upper triangular matrix of shape seq_len, seq_len of the form:
-    #    [[0.        , 0.99      , 0.98010004, 0.970299  , 0.960596 ],
-    #    [0.        , 0.        , 0.99      , 0.98010004, 0.970299  ],
-    #    [0.        , 0.        , 0.        , 0.99      , 0.98010004],
-    #    [0.        , 0.        , 0.        , 0.        , 0.99      ],
-    #    [0.        , 0.        , 0.        , 0.        , 0.        ]]
-    # assuming seq_len = 5
-    # the same result can be obtained using probs = is_future_mask * (gamma ** jnp.cumsum(is_future_mask, axis=-1))
 
     single_trajectories = jnp.concatenate(
         [transition.extras["state_extras"]["traj_id"][:, jnp.newaxis].T] * seq_len,
         axis=0,
     )
-    # array of seq_len x seq_len wheree a row is an array of traj_ids that correspond to the episode index from which that time-step was collected
-    # timesteps collected from the same episode will have the same traj_id. All rows of the single_trajectories are same.
 
     probs = probs * jnp.equal(single_trajectories, single_trajectories.T) + jnp.eye(seq_len) * 1e-5
-    # ith row of probs will be non zero only for time indices that
-    # 1) are greater than i
-    # 2) have the same traj_id as the ith time index
-    proposed_goals = transition.observation[:, -len(goal_indices):]
+    
+    # Convert goal_indices to list for indexing
+    goal_indices_list = list(goal_indices)
+    proposed_goals = transition.observation[:, -len(goal_indices_list):]
 
     def last_state_for_each_step(obs, traj_ids):
         seq_len = obs.shape[0]
@@ -107,28 +97,21 @@ def flatten_batch(buffer_config, transition, sample_key):
         obs_dim = obs.shape[1]
         
         def intermediate_states_for_t(i, num_intermediate):
-            # Mask for same trajectory AND future timesteps (including current)
             same_traj_mask = traj_ids == traj_ids[i]
             future_mask = jnp.arange(seq_len) >= i
             mask = same_traj_mask & future_mask
 
-            # Get sorted valid indices for future steps
             indices = jnp.where(mask, jnp.arange(seq_len), seq_len)
             sorted_indices = jnp.sort(indices)
             num_future = jnp.sum(mask)
 
-            # Compute evenly spaced fractional positions in (0, 1)
-            # e.g. for 2 → [1/3, 2/3], for 3 → [1/4, 1/2, 3/4]
             fractions = (jnp.arange(1, num_intermediate + 1) / (num_intermediate + 1))
 
-            # Map fractions to integer positions within the valid range
             idxs = jnp.floor(fractions * num_future).astype(jnp.int32)
             idxs = jnp.clip(idxs, 0, jnp.maximum(num_future - 1, 0))
 
-            # Gather actual indices in the trajectory
             actual_idxs = sorted_indices[idxs]
 
-            # Get the corresponding future states (with padding for no valid futures)
             def get_state(idx):
                 return jnp.where(num_future > 0, obs[idx], jnp.zeros(obs_dim))
 
@@ -137,7 +120,7 @@ def flatten_batch(buffer_config, transition, sample_key):
                 
         return jax.vmap(functools.partial(intermediate_states_for_t, num_intermediate=6))(jnp.arange(seq_len))
 
-    traj_ids = transition.extras["state_extras"]["traj_id"]  # shape (seq_len,)
+    traj_ids = transition.extras["state_extras"]["traj_id"]
     last_traj_state = last_state_for_each_step(transition.observation, traj_ids)
     intermediate_traj = get_intermediate_trajectory_states(transition.observation, traj_ids)
 
@@ -152,11 +135,13 @@ def flatten_batch(buffer_config, transition, sample_key):
     goal_index = jax.random.categorical(sample_key, jnp.log(probs))
     future_state = jnp.take(
         transition.observation, goal_index[:-1], axis=0
-    )  # the last goal_index cannot be considered as there is no future.
+    )
     future_action = jnp.take(transition.action, goal_index[:-1], axis=0)
-    goal = future_state[:, goal_indices]
+    
+    # Use array indexing for goal extraction
+    goal = future_state[:, jnp.array(goal_indices_list)]
     future_state = future_state[:, :state_size]
-    state = transition.observation[:-1, :state_size]  # all states are considered
+    state = transition.observation[:-1, :state_size]
     new_obs = jnp.concatenate([state, goal], axis=1)
 
     extras = {
@@ -176,7 +161,7 @@ def flatten_batch(buffer_config, transition, sample_key):
     }
 
     return transition._replace(
-        observation=jnp.squeeze(new_obs),  # this has shape (num_envs, episode_length-1, obs_size)
+        observation=jnp.squeeze(new_obs),
         action=jnp.squeeze(transition.action[:-1]),
         reward=jnp.squeeze(transition.reward[:-1]),
         discount=jnp.squeeze(transition.discount[:-1]),
@@ -205,14 +190,9 @@ class CRL:
     alpha_lr: float = 3e-4
     batch_size: int = 256
 
-    # gamma
     discounting: float = 0.99
-
-    # forward CRL logsumexp penalty
     logsumexp_penalty_coeff: float = 0.1
-
     train_step_multiplier: int = 1
-
     disable_entropy_actor: bool = False
 
     max_replay_size: int = 10000
@@ -223,42 +203,24 @@ class CRL:
     skip_connections: int = 4
     use_relu: bool = False
 
-    # phi(s,a) and psi(g) repr dimension
     repr_dim: int = 64
-
-    # layer norm
     use_ln: bool = False
 
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
 
-    # Proportion of proposed goals coming from the goal proposal algorithm
     goal_proposal_prob: float = 0.0
-    # If fraction of goals from the replay buffer should be computed adaptiveally; note that this causes goal_proposal_prob to be ignored
     use_adaptive_mixing: bool = False
-    # Adaptive mixing momentum term
     adaptive_mixing_momentum: float = 0.0
-    # Number of env steps to wait before starting adaptive mixing
     adaptive_mixing_warmup_steps: int = 0 
-    # Number of env steps to wait before proposing goals from the goal proposal algorithm
     goal_proposal_warmup_steps: int = 0
-    # Whether we should interpolate to 100% environment goals during training
     interpolate_to_env_goals: bool = False
-    # What goal selection percentile to use for MediumEnergyGoalProposal
     goal_selection_percentile: float = 0.5
-    # Which goal proposer to use
     goal_proposer_name: Literal["quantile", "replay_buffer", "metric", "metric_one_env_goal", "waypoint_ratio", "waypoint_ratio_one_env_goal", "fisher_trace"] = "replay_buffer"
-    # For metric proposal whether to use KDE correction term
     use_kde_correction: bool = False
-    # Whether to zero out the goals in metric proposal
     zero_out_cand_goals: bool = True
 
     def check_config(self, config):
-        """
-        episode_length: the maximum length of an episode
-            NOTE: `num_envs * (episode_length - 1)` must be divisible by
-            `batch_size` due to the way data is stored in replay buffer.
-        """
         assert config.num_envs * (config.episode_length - 1) % self.batch_size == 0, (
             "num_envs * (episode_length - 1) must be divisible by batch_size"
         )
@@ -303,18 +265,9 @@ class CRL:
             "total_env_steps too small for given num_envs and episode_length"
         )
 
-        logging.info(
-            "num_prefill_env_steps: %d",
-            num_prefill_env_steps,
-        )
-        logging.info(
-            "num_prefill_actor_steps: %d",
-            num_prefill_actor_steps,
-        )
-        logging.info(
-            "num_training_steps_per_epoch: %d",
-            num_training_steps_per_epoch,
-        )
+        logging.info("num_prefill_env_steps: %d", num_prefill_env_steps)
+        logging.info("num_prefill_actor_steps: %d", num_prefill_actor_steps)
+        logging.info("num_training_steps_per_epoch: %d", num_training_steps_per_epoch)
 
         random.seed(config.seed)
         np.random.seed(config.seed)
@@ -325,17 +278,20 @@ class CRL:
         env_state = jax.jit(train_env.reset)(env_keys)
         train_env.step = jax.jit(train_env.step)
 
-        # Dimensions definitions and sanity checks
+        # Dimensions
         action_size = train_env.action_size
         state_size = train_env.state_dim
         goal_size = len(train_env.goal_indices)
         obs_size = state_size + goal_size
+        
+        # IMPORTANT: Convert goal_indices to tuple of Python ints for hashability
+        goal_indices_tuple = tuple(int(i) for i in train_env.goal_indices)
+        
         assert obs_size == train_env.observation_size, (
             f"obs_size: {obs_size}, observation_size: {train_env.observation_size}"
         )
 
         # Network setup
-        # Actor
         actor = Actor(
             action_size=action_size,
             network_width=self.h_dim,
@@ -350,7 +306,6 @@ class CRL:
             tx=optax.adam(learning_rate=self.policy_lr),
         )
 
-        # Critic
         sa_encoder = Encoder(
             repr_dim=self.repr_dim,
             network_width=self.h_dim,
@@ -375,7 +330,6 @@ class CRL:
             tx=optax.adam(learning_rate=self.critic_lr),
         )
 
-        # Entropy coefficient
         target_entropy = -0.5 * action_size
         log_alpha = jnp.asarray(0.0, dtype=jnp.float32)
         alpha_state = TrainState.create(
@@ -384,7 +338,6 @@ class CRL:
             tx=optax.adam(learning_rate=self.alpha_lr),
         )
 
-        # Trainstate
         training_state = TrainingState(
             optimal_goal_proposal_prob=jnp.array(self.goal_proposal_prob),
             env_steps=jnp.zeros(()),
@@ -394,8 +347,7 @@ class CRL:
             alpha_state=alpha_state,
         )
 
-        # Replay Buffer - CPU-backed to avoid OOM
-        # NOTE: We do NOT JIT wrap insert_internal for CPU-backed buffer
+        # Replay Buffer - CPU-backed
         dummy_obs = jnp.zeros((obs_size,))
         dummy_action = jnp.zeros((action_size,))
 
@@ -413,8 +365,6 @@ class CRL:
             },
         )
 
-        # Create replay buffer WITHOUT JIT wrapping insert_internal
-        # The CPU-backed buffer handles device placement internally
         replay_buffer = TrajectoryUniformSamplingQueue(
             max_replay_size=self.max_replay_size,
             dummy_data_sample=dummy_transition,
@@ -423,7 +373,6 @@ class CRL:
             episode_length=config.episode_length,
         )
         
-        # Initialize buffer (data will be on CPU)
         buffer_state = replay_buffer.init(buffer_key)
 
         if self.goal_proposer_name == "quantile":
@@ -436,7 +385,7 @@ class CRL:
         elif self.goal_proposer_name == "metric":
             goal_proposer = MetricPreservationGoalProposal(energy_fn_name=self.energy_fn, use_waypoint_difficulty=True, use_one_env_goal=False, use_kde_correction=self.use_kde_correction, zero_out_cand_goals=self.zero_out_cand_goals)
         elif self.goal_proposer_name == "metric_one_env_goal":
-            goal_proposer = MetricPreservationGoalProposal(energy_fn_name=self.energy_fn,use_waypoint_difficulty=True, use_one_env_goal=True, use_kde_correction=self.use_kde_correction, zero_out_cand_goals=self.zero_out_cand_goals)
+            goal_proposer = MetricPreservationGoalProposal(energy_fn_name=self.energy_fn, use_waypoint_difficulty=True, use_one_env_goal=True, use_kde_correction=self.use_kde_correction, zero_out_cand_goals=self.zero_out_cand_goals)
         elif self.goal_proposer_name == "waypoint_ratio":
             goal_proposer = MetricPreservationGoalProposal(energy_fn_name=self.energy_fn, use_waypoint_difficulty=False, use_one_env_goal=False, use_kde_correction=False, zero_out_cand_goals=self.zero_out_cand_goals)
         elif self.goal_proposer_name == "waypoint_ratio_one_env_goal":
@@ -472,7 +421,6 @@ class CRL:
             state_extras = {x: nstate.info[x] for x in extra_fields}
             state_extras["was_proposed_goal_mask"] = was_proposed_goal_mask
 
-            # nstate.obs has shape (batch_size, obs_dim)
             return nstate, Transition(
                 observation=new_obs,
                 action=actions,
@@ -481,17 +429,9 @@ class CRL:
                 extras={"state_extras": state_extras},
             )
 
-        # Split get_experience into two parts:
-        # 1. collect_experience: JIT-compiled, collects transitions on GPU
-        # 2. get_experience: Non-JIT wrapper that handles CPU buffer insert
-        
         @jax.jit
         def collect_experience(actor_state, env_state, training_state, buffer_state, key):
-            """
-            JIT-compiled function that collects experience from the environment.
-            Returns transitions WITHOUT inserting into buffer.
-            Buffer insert happens outside JIT to keep data on CPU.
-            """
+            """JIT-compiled experience collection on GPU."""
             @jax.jit
             def f(carry, unused_t):
                 env_state, current_key, proposed_goals, was_proposed_goal_mask = carry
@@ -545,28 +485,22 @@ class CRL:
                 lambda: jnp.zeros_like(use_proposed_mask.squeeze(-1)),
             )
 
-            # data.observation has shape (unroll_length, batch_size, obs_size)
-            (env_state, _, _, _), data = jax.lax.scan(f, (env_state, key, proposed_goals, was_proposed_goal_mask), (), length=self.unroll_length)
+            (env_state, _, _, _), data = jax.lax.scan(
+                f, (env_state, key, proposed_goals, was_proposed_goal_mask), (), length=self.unroll_length
+            )
 
-            # Return transitions WITHOUT inserting - insert happens outside JIT
             return env_state, buffer_state, data
 
         def get_experience(actor_state, env_state, training_state, buffer_state, key):
-            """
-            Wrapper that collects experience (JIT) and inserts into buffer (CPU).
-            """
+            """Collect experience (JIT) and insert into CPU buffer."""
             env_state, buffer_state, data = collect_experience(
                 actor_state, env_state, training_state, buffer_state, key
             )
-            # Insert into CPU-backed buffer (not JIT-compiled)
             buffer_state = replay_buffer.insert(buffer_state, data)
             return env_state, buffer_state
 
         def prefill_replay_buffer(training_state, env_state, buffer_state, key):
-            """
-            Prefill replay buffer using a Python loop instead of jax.lax.scan.
-            This allows buffer inserts to happen on CPU outside of JIT.
-            """
+            """Prefill using Python loop for CPU buffer handling."""
             logging.info("Starting replay buffer prefill...")
             for i in range(num_prefill_actor_steps):
                 key, new_key = jax.random.split(key)
@@ -622,19 +556,38 @@ class CRL:
             metrics.update(actor_metrics)
             metrics.update(critic_metrics)
 
-            return (
-                training_state,
-                key,
-            ), metrics
+            return (training_state, key), metrics
+
+        # Pre-compile the flatten_batch with correct config
+        # Using tuple of Python floats/ints for hashability
+        buffer_config = (float(self.discounting), int(state_size), goal_indices_tuple)
+        
+        @jax.jit
+        def process_transitions(transitions, sampling_key, permutation_key):
+            """JIT-compiled transition processing on GPU."""
+            batch_keys = jax.random.split(sampling_key, transitions.observation.shape[0])
+            transitions = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
+                buffer_config,
+                transitions,
+                batch_keys,
+            )
+
+            transitions = jax.tree_util.tree_map(
+                lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"), transitions
+            )
+
+            permutation = jax.random.permutation(permutation_key, len(transitions.observation))
+            transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
+            transitions = jax.tree_util.tree_map(
+                lambda x: jnp.reshape(x, (-1, self.batch_size) + x.shape[1:]),
+                transitions,
+            )
+            return transitions
 
         def training_step(training_state, env_state, buffer_state, key):
-            """
-            Single training step - uses Python control flow for buffer operations.
-            Neural network updates remain JIT-compiled.
-            """
+            """Single training step."""
             experience_key1, experience_key2, sampling_key, training_key = jax.random.split(key, 4)
 
-            # Collect experience and insert into CPU buffer
             env_state, buffer_state = get_experience(
                 training_state.actor_state,
                 env_state,
@@ -649,53 +602,24 @@ class CRL:
 
             # Sample from CPU buffer (transfers batch to GPU)
             buffer_state, transitions = replay_buffer.sample(buffer_state)
-            # transitions.observation has shape (num_envs, episode_length, obs_dim)
 
-            # Process transitions for training (on GPU)
-            batch_keys = jax.random.split(sampling_key, transitions.observation.shape[0])
-            transitions = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
-                (self.discounting, state_size, tuple(train_env.goal_indices)),
-                transitions,
-                batch_keys,
-            )
-            # transitions.observation has shape (num_envs, episode_length, obs_dim)
-
-            transitions = jax.tree_util.tree_map(
-                lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"), transitions
-            )
-            # Shape of obs is (num_envs * episode_length, obs_dim) after flattening
-
-            # Permute transitions
-            permutation = jax.random.permutation(experience_key2, len(transitions.observation))
-            transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
-            transitions = jax.tree_util.tree_map(
-                lambda x: jnp.reshape(x, (-1, self.batch_size) + x.shape[1:]),
-                transitions,
-            )
-            # Shape of transitions.observation is (..., batch_size, obs_dim)
+            # Process transitions on GPU (JIT compiled)
+            transitions = process_transitions(transitions, sampling_key, experience_key2)
             
             last_batch = transitions
 
-            # Take actor-step worth of training-step (JIT-compiled)
-            (
-                (
-                    training_state,
-                    _,
-                ),
-                metrics,
-            ) = jax.lax.scan(update_networks, (training_state, training_key), transitions)
+            # Update networks on GPU (JIT compiled)
+            ((training_state, _), metrics) = jax.lax.scan(
+                update_networks, (training_state, training_key), transitions
+            )
 
-            # Adaptive mixing estimation - only if enabled
             if self.use_adaptive_mixing:
-                # Get the last batch metrics which contain gradient info
                 last_metrics = jax.tree_map(lambda x: x[-1], metrics)
                 
-                S1 = last_metrics.get('rb_grad_trvar') # tr Var d_rb
-                S2 = last_metrics.get('env_grad_trvar')  # tr Var d_env
-                D = last_metrics.get('env_rb_bias_squared') # norm(E[d_env - d_rb])^2
-                B = self.batch_size
+                S1 = last_metrics.get('rb_grad_trvar')
+                S2 = last_metrics.get('env_grad_trvar')
+                D = last_metrics.get('env_rb_bias_squared')
                 
-                # Compute optimal alpha
                 numerator = S1 - S2 + D
                 denominator = 2 * D
                 mixing_star = numerator / (denominator + 1e-8)
@@ -711,55 +635,35 @@ class CRL:
                 metrics['adaptive_mixing_raw'] = mixing_star
                 metrics['adaptive_mixing_smoothed'] = smoothed_mixing
 
-            return (
-                training_state,
-                env_state,
-                buffer_state,
-                last_batch
-            ), metrics
+            return (training_state, env_state, buffer_state, last_batch), metrics
 
-        def training_epoch(
-            training_state,
-            env_state,
-            buffer_state,
-            key,
-        ):
-            """
-            Training epoch using Python loop for proper CPU buffer handling.
-            """
+        def training_epoch(training_state, env_state, buffer_state, key):
+            """Training epoch using Python loop."""
             all_metrics = []
             last_batch = None
             
             for _ in range(num_training_steps_per_epoch):
                 key, train_key = jax.random.split(key)
-                (
-                    training_state,
-                    env_state,
-                    buffer_state,
-                    last_batch
-                ), metrics = training_step(training_state, env_state, buffer_state, train_key)
+                (training_state, env_state, buffer_state, last_batch), metrics = training_step(
+                    training_state, env_state, buffer_state, train_key
+                )
                 all_metrics.append(metrics)
 
-            # Stack metrics from all steps
-            metrics = jax.tree_util.tree_map(
-                lambda *xs: jnp.stack(xs), *all_metrics
-            )
-
+            metrics = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *all_metrics)
             metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
             return training_state, env_state, buffer_state, metrics, last_batch
         
         def visualize_goals(train_env, transitions, actor_state, critic_state, sa_encoder, g_encoder, energy_fn, num_samples, wandb_key):
-            obs = transitions.observation # (n, episode_len-1, batch_size, obs_dim)
-            future_state = transitions.extras["future_state"] # (n, episode_len-1, batch_size, obs_dim)
-            last_traj_state = transitions.extras["last_traj_state"][:, :, :, :state_size] # (n, episode_len-1, batch_size, obs_dim)
+            obs = transitions.observation
+            future_state = transitions.extras["future_state"]
+            last_traj_state = transitions.extras["last_traj_state"][:, :, :, :state_size]
             last_traj_state_flat = last_traj_state.reshape(-1, state_size)
-            intermediate_traj = transitions.extras["intermediate_traj"] # (n, episode_len-1, batch_size, num_intermediate_states, obs_dim)
+            intermediate_traj = transitions.extras["intermediate_traj"]
             
             states = obs[:, :, :, :state_size].reshape(-1, state_size)
             contrastive_goals = future_state[:, :, :, train_env.goal_indices].reshape(-1, len(train_env.goal_indices))
             proposed_goals = transitions.extras["proposed_goals"].reshape(-1, len(train_env.goal_indices))
             
-            # Flatten intermediate trajectories to shape (total_samples, num_intermediate_states, obs_dim)
             intermediate_traj_flat = intermediate_traj.reshape(-1, intermediate_traj.shape[-2], intermediate_traj.shape[-1])
             
             total_samples = states.shape[0]
@@ -776,12 +680,10 @@ class CRL:
             last_traj_state_mask = transitions.extras["last_traj_state_mask"].reshape(-1)
 
             visualize_goals_2d(start_xy, cont_xy, prop_xy, lts_xy, intermediate_xy, f"{wandb_key}/state_goal_plot", x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds)
-
             visualize_kde_heatmap(proposed_goals[last_traj_state_mask], "Proposed Goals", f"{wandb_key}/proposed_goal_heatmap", x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds)
-
             visualize_kde_heatmap(last_traj_state_flat[last_traj_state_mask][:, train_env.goal_indices], "Final States", f"{wandb_key}/final_states_heatmap", x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds)
 
-            for i in range(min(3, num_samples)):  # Visualize Q-function for up to 3 samples
+            for i in range(min(3, num_samples)):
                 idx = sample_indices[i]
                 visualize_q_function_2d(
                     actor, sa_encoder, g_encoder, actor_state.params, critic_state.params,
@@ -800,7 +702,6 @@ class CRL:
             training_state, env_state, buffer_state, prefill_key
         )
 
-        """Setting up evaluator"""
         evaluator = ActorEvaluator(
             deterministic_actor_step,
             eval_env,
@@ -853,7 +754,6 @@ class CRL:
             )
 
             if config.checkpoint_logdir:
-                # Save current policy and critic params.
                 params = (
                     training_state.alpha_state.params,
                     training_state.actor_state.params,
@@ -865,8 +765,6 @@ class CRL:
                 params = None
 
         total_steps = current_step
-        # assert total_steps >= config.total_env_steps
-
         logging.info("total steps: %s", total_steps)
 
         return make_policy, params, metrics
