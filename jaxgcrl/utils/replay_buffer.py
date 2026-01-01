@@ -8,6 +8,7 @@ import numpy as np
 from brax.training.replay_buffers import ReplayBuffer
 from brax.training.types import PRNGKey
 from jax import flatten_util
+from jax.experimental import host_callback as hcb
 
 # TODO: make only single type of Replay Buffer (for CRL and baselines)
 Sample = TypeVar("Sample")
@@ -254,13 +255,14 @@ class TrajectoryUniformSamplingQueue:
     def _insert_internal_cpu(self, buffer_state, samples):
         """CPU-based insert for memory efficiency.
         
-        Uses jax.experimental.io_callback to escape tracing and perform CPU operations.
+        Uses jax.experimental.host_callback to escape tracing and perform CPU operations.
         """
         # Flatten on GPU first
         update = self._flatten_fn(samples)  # shape: (unroll_len, num_envs, data_size)
         
-        def cpu_insert(update_arr, insert_pos, sample_pos):
+        def cpu_insert(args):
             """Pure Python/NumPy function for CPU buffer insertion."""
+            update_arr, insert_pos, sample_pos = args
             update_np = np.asarray(update_arr)
             position = int(insert_pos)
             max_size = self._data_shape[0]
@@ -279,20 +281,18 @@ class TrajectoryUniformSamplingQueue:
             new_position = (position + update_len) % (max_size + 1)
             new_sample_position = max(0, int(sample_pos) + roll)
             
-            return np.array(new_position, dtype=np.int32), np.array(new_sample_position, dtype=np.int32)
+            return np.array([new_position, new_sample_position], dtype=np.int32)
         
-        # Use experimental.io_callback since we're modifying external state (self._cpu_data)
-        new_insert_pos, new_sample_pos = jax.experimental.io_callback(
+        # Use host_callback.call to escape tracing
+        result = hcb.call(
             cpu_insert,
-            (jax.ShapeDtypeStruct((), jnp.int32), jax.ShapeDtypeStruct((), jnp.int32)),
-            update,
-            buffer_state.insert_position,
-            buffer_state.sample_position,
+            (update, buffer_state.insert_position, buffer_state.sample_position),
+            result_shape=jax.ShapeDtypeStruct((2,), jnp.int32),
         )
         
         return buffer_state.replace(
-            insert_position=new_insert_pos,
-            sample_position=new_sample_pos,
+            insert_position=result[0],
+            sample_position=result[1],
         )
 
     def sample(self, buffer_state):
@@ -358,7 +358,7 @@ class TrajectoryUniformSamplingQueue:
     def _sample_internal_cpu(self, buffer_state):
         """CPU-based sampling for memory efficiency.
         
-        Uses jax.experimental.pure_callback to escape tracing and gather from CPU buffer.
+        Uses jax.experimental.host_callback to escape tracing and gather from CPU buffer.
         """
         key, sample_key, shuffle_key = jax.random.split(buffer_state.key, 3)
         shape = self.num_envs
@@ -372,8 +372,9 @@ class TrajectoryUniformSamplingQueue:
             maxval=buffer_state.insert_position - self.episode_length
         )
         
-        def cpu_gather(start_vals, env_idxs):
+        def cpu_gather(args):
             """Pure Python/NumPy function for CPU buffer gathering."""
+            start_vals, env_idxs = args
             start_values_np = np.asarray(start_vals)
             envs_idxs_np = np.asarray(env_idxs)
             
@@ -389,12 +390,11 @@ class TrajectoryUniformSamplingQueue:
             
             return batch_np
         
-        # Use pure_callback to gather from CPU (no side effects)
-        batch = jax.experimental.pure_callback(
+        # Use host_callback.call to gather from CPU
+        batch = hcb.call(
             cpu_gather,
-            jax.ShapeDtypeStruct((shape, self.episode_length, self._data_shape[2]), jnp.float32),
-            start_values,
-            envs_idxs,
+            (start_values, envs_idxs),
+            result_shape=jax.ShapeDtypeStruct((shape, self.episode_length, self._data_shape[2]), jnp.float32),
         )
         
         # Unflatten on GPU
