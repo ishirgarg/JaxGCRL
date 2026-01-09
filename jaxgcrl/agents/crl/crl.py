@@ -700,22 +700,16 @@ class CRL:
                 num_valid = jnp.sum(valid_mask) + 1e-8
                 mean_loss = jnp.sum(masked_loss) / num_valid
                 
-                return mean_loss, {
-                    'proposer_loss': mean_loss,
-                    'proposer_mean_pred_prob': jnp.sum(probs * valid_mask) / num_valid,
-                    'proposer_mean_success_rate': jnp.sum(success_labels * valid_mask) / num_valid,
-                    'proposer_num_valid_samples': num_valid,
-                    'proposer_mean_goal_distance': jnp.sum(goal_distances * valid_mask) / num_valid,
-                }
+                return mean_loss
             
             # Compute gradients and update
-            grad_fn = jax.value_and_grad(proposer_loss_fn, has_aux=True)
-            (loss, metrics), grads = grad_fn(training_state.proposer_state.params)
+            grad_fn = jax.value_and_grad(proposer_loss_fn)
+            loss, grads = grad_fn(training_state.proposer_state.params)
             
             new_proposer_state = training_state.proposer_state.apply_gradients(grads=grads)
             training_state = training_state.replace(proposer_state=new_proposer_state)
             
-            return training_state, metrics
+            return training_state
 
         @jax.jit
         def update_networks(carry, transitions):
