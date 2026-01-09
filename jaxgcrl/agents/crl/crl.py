@@ -709,7 +709,8 @@ class CRL:
             new_proposer_state = training_state.proposer_state.apply_gradients(grads=grads)
             training_state = training_state.replace(proposer_state=new_proposer_state)
             
-            return training_state
+            metrics = {"learned_proposal/proposer_loss": loss}
+            return training_state, metrics
 
         @jax.jit
         def update_networks(carry, transitions):
@@ -741,8 +742,9 @@ class CRL:
             )
             
             # Update proposer network if using learned goal proposer
+            proposer_metrics = {}
             if self.goal_proposer_name == "learned_proposer":
-                training_state = update_proposer(
+                training_state, proposer_metrics = update_proposer(
                     transitions, training_state, proposer_network
                 )
             
@@ -751,6 +753,7 @@ class CRL:
             metrics = {}
             metrics.update(actor_metrics)
             metrics.update(critic_metrics)
+            metrics.update(proposer_metrics)
 
             return (
                 training_state,
