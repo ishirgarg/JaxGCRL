@@ -23,7 +23,8 @@ from jaxgcrl.utils.goals import (
 
 # Re-export for convenience
 __all__ = ['GoalProposer', 'ReplayBufferGoalProposal', 'FisherTraceGoalProposal', 
-           'MediumEnergyGoalProposal', 'MetricPreservationGoalProposal', 'QEpistemicGoalProposal', 'mix_goals']
+           'MediumEnergyGoalProposal', 'MetricPreservationGoalProposal', 'QEpistemicGoalProposal', 
+           'LearnedGoalProposal', 'mix_goals']
 
 
 @dataclass 
@@ -39,6 +40,195 @@ class ReplayBufferGoalProposal(GoalProposer):
         return base_proposer.propose_goals(
             replay_buffer, buffer_state, train_env, env_state, key
         )
+
+
+@dataclass
+class LearnedGoalProposal(GoalProposer):
+    """Proposes goals using a learned network that predicts reachability probability.
+    
+    This proposer trains a network f(s, g) where sigmoid(f(s, g)) predicts the 
+    probability that the policy can reach goal g from state s. Goals are selected
+    such that their predicted success probability is closest to a target value
+    (default 0.5, representing medium difficulty).
+    
+    The network is trained with BCE loss using observed success/failure of 
+    previously proposed goals.
+    
+    Args:
+        target_success: Target success probability for goal selection (default 0.5)
+        LOG_INTERVAL_STEPS: How often to log visualizations
+    """
+    target_success: float = 0.5
+    LOG_INTERVAL_STEPS: int = 500000
+    
+    def propose_goals(self, replay_buffer, buffer_state, training_state, train_env, env_state, key, actor, 
+                     actor_params, critic_params, sa_encoder, g_encoder, proposer_network=None, proposer_params=None):
+        """Propose goals with success probability closest to target.
+        
+        Args:
+            replay_buffer: Replay buffer to sample from
+            buffer_state: Current buffer state
+            training_state: Current training state
+            train_env: Training environment
+            env_state: Current environment state
+            key: JAX random key
+            actor: Actor network (unused)
+            actor_params: Actor parameters (unused)
+            critic_params: Critic parameters (unused)
+            sa_encoder: State-action encoder (unused)
+            g_encoder: Goal encoder (unused)
+            proposer_network: The learned proposer network
+            proposer_params: Parameters of the proposer network
+            
+        Returns:
+            proposed_goals: (batch_size, goal_size) array of proposed goals
+            buffer_state: Updated buffer state
+        """
+        # Get current states from env_state
+        state_size = train_env.state_dim
+        current_states = env_state.obs[:, :state_size]  # (batch_size, state_dim)
+        batch_size = current_states.shape[0]
+        
+        # Sample candidate goals from replay buffer final states
+        buffer_state, candidate_transitions = replay_buffer.sample(buffer_state)
+        traj_ids = candidate_transitions.extras["state_extras"]["traj_id"]
+        candidate_obs = candidate_transitions.observation
+        
+        def get_last_state(obs_seq, traj_id_seq):
+            """Get the last state for each trajectory"""
+            seq_len = obs_seq.shape[0]
+            mask = traj_id_seq == traj_id_seq[0]
+            last_idx = jnp.max(jnp.where(mask, jnp.arange(seq_len), 0))
+            return obs_seq[last_idx]
+        
+        last_states = jax.vmap(get_last_state)(candidate_obs, traj_ids)
+        candidate_goals = last_states[:, train_env.goal_indices]  # (num_candidates, goal_size)
+        num_candidates = candidate_goals.shape[0]
+        
+        # If proposer network is not available, fall back to random selection
+        if proposer_network is None or proposer_params is None:
+            # Random selection as fallback
+            key, select_key = jax.random.split(key)
+            random_indices = jax.random.randint(select_key, (batch_size,), 0, num_candidates)
+            proposed_goals = candidate_goals[random_indices]
+            return proposed_goals, buffer_state
+        
+        target_logit = jnp.log(self.target_success / (1 - self.target_success + 1e-8))
+        
+        def compute_scores_for_state(state):
+            """Compute predicted success scores for all candidate goals from a given state."""
+            # Replicate state for all candidates
+            states_expanded = jnp.tile(state[None, :], (num_candidates, 1))  # (num_candidates, state_dim)
+            # Get scores from proposer network
+            scores = proposer_network.apply(proposer_params, states_expanded, candidate_goals)  # (num_candidates,)
+            return scores
+        
+        # Compute scores for all (state, candidate_goal) pairs
+        all_scores = jax.vmap(compute_scores_for_state)(current_states)  # (batch_size, num_candidates)
+        
+        # For each state, select the candidate with score closest to target logit
+        score_distances = jnp.abs(all_scores - target_logit)
+        best_goal_indices = jnp.argmin(score_distances, axis=1)  # (batch_size,)
+        proposed_goals = candidate_goals[best_goal_indices]  # (batch_size, goal_size)
+        
+        # Log statistics
+        jax.experimental.io_callback(
+            LearnedGoalProposal._log_learned_proposal_statistics,
+            None,
+            all_scores,
+            candidate_goals,
+            current_states,
+            train_env.goal_indices,
+            training_state.env_steps,
+            self.target_success,
+            self.LOG_INTERVAL_STEPS
+        )
+        
+        return proposed_goals, buffer_state
+    
+    # Class variable to track last log step
+    _last_logged_at = -500000
+    
+    @staticmethod
+    def _log_learned_proposal_statistics(all_scores, candidate_goals, current_states, goal_indices, 
+                                          env_steps, target_success, log_interval_steps):
+        """Log heatmaps showing predicted success probabilities for randomly chosen states."""
+        current_step = int(env_steps)
+        if current_step - LearnedGoalProposal._last_logged_at < log_interval_steps:
+            return
+        
+        LearnedGoalProposal._last_logged_at = current_step
+        
+        # Convert scores to probabilities
+        all_probs = 1 / (1 + np.exp(-all_scores))  # sigmoid
+        
+        # Create visualization
+        pil_image = LearnedGoalProposal._create_learned_proposal_heatmaps(
+            all_probs, candidate_goals, current_states, goal_indices, target_success
+        )
+        
+        wandb.log({'learned_proposal/probability_heatmaps': wandb.Image(pil_image)}, step=int(env_steps))
+    
+    @staticmethod
+    def _create_learned_proposal_heatmaps(all_probs, candidate_goals, current_states, goal_indices, target_success):
+        """Create heatmap visualizations of predicted success probabilities."""
+        batch_size = all_probs.shape[0]
+        
+        # Extract goal portion from current states
+        current_goals = current_states[:, goal_indices]
+        
+        # Select 4 random states
+        num_plots = min(4, batch_size)
+        random_state_indices = np.random.choice(batch_size, size=num_plots, replace=False)
+        
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        axes = axes.flatten()
+        
+        for plot_idx, state_idx in enumerate(random_state_indices):
+            ax = axes[plot_idx]
+            
+            probs = all_probs[state_idx]  # (num_candidates,)
+            current_goal = current_goals[state_idx]
+            
+            # Color by predicted success probability
+            scatter = ax.scatter(candidate_goals[:, 0], candidate_goals[:, 1],
+                                c=probs, cmap='RdYlGn', s=150, alpha=0.8,
+                                vmin=0, vmax=1,
+                                edgecolors='black', linewidths=0.5, label='Candidate Goals')
+            # Plot the current state as a star
+            ax.scatter(current_goal[0], current_goal[1], c='blue', s=400, marker='*',
+                        edgecolors='black', linewidths=2, zorder=5, label='Current State')
+            
+            # Mark the selected goal (closest to target probability)
+            target_logit = np.log(target_success / (1 - target_success + 1e-8))
+            scores = np.log(probs / (1 - probs + 1e-8) + 1e-8)
+            best_idx = np.argmin(np.abs(scores - target_logit))
+            ax.scatter(candidate_goals[best_idx, 0], candidate_goals[best_idx, 1], 
+                      c='magenta', s=300, marker='o',
+                      edgecolors='black', linewidths=3, zorder=6, label='Selected Goal')
+        
+            plt.colorbar(scatter, ax=ax, label='P(success)')
+            
+            ax.set_title(f'State {state_idx}: Selected P(success) = {probs[best_idx]:.3f} (target={target_success})',
+                        fontsize=11, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='upper right', fontsize=9)
+            if candidate_goals.shape[1] >= 2:
+                ax.set_aspect('equal', adjustable='box')
+        
+        # Hide unused subplots
+        for i in range(num_plots, len(axes)):
+            axes[i].axis('off')
+        
+        plt.tight_layout()
+        
+        # Save to buffer and convert to PIL Image
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+        plt.close()
+        
+        return Image.open(buf)
 
 
 @dataclass

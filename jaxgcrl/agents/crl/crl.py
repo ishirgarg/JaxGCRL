@@ -27,8 +27,8 @@ from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 from jaxgcrl.utils.visualize import visualize_goals_2d, visualize_kde_heatmap, visualize_q_function_2d
 
 from .losses import update_actor_and_alpha, update_critic
-from .networks import Actor, Encoder
-from .goals import GoalProposer, ReplayBufferGoalProposal, MediumEnergyGoalProposal, MetricPreservationGoalProposal, FisherTraceGoalProposal, QEpistemicGoalProposal, mix_goals
+from .networks import Actor, Encoder, GoalProposerNetwork
+from .goals import GoalProposer, ReplayBufferGoalProposal, MediumEnergyGoalProposal, MetricPreservationGoalProposal, FisherTraceGoalProposal, QEpistemicGoalProposal, LearnedGoalProposal, mix_goals
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -44,6 +44,7 @@ class TrainingState:
     actor_state: TrainState
     critic_state: TrainState
     alpha_state: TrainState
+    proposer_state: Optional[TrainState] = None  # Only used for learned goal proposer
 
 
 class Transition(NamedTuple):
@@ -246,7 +247,7 @@ class CRL:
     # What goal selection percentile to use for MediumEnergyGoalProposal
     goal_selection_percentile: float = 0.5
     # Which goal proposer to use
-    goal_proposer_name: Literal["quantile", "replay_buffer", "metric", "metric_one_env_goal", "waypoint_ratio", "waypoint_ratio_one_env_goal", "max_waypoint_ratio", "fisher_trace", "fisher_trace_actor", "fisher_trace_combined", "q_epistemic"] = "replay_buffer"
+    goal_proposer_name: Literal["quantile", "replay_buffer", "metric", "metric_one_env_goal", "waypoint_ratio", "waypoint_ratio_one_env_goal", "max_waypoint_ratio", "fisher_trace", "fisher_trace_actor", "fisher_trace_combined", "q_epistemic", "learned_proposer"] = "replay_buffer"
     # For metric proposal whether to use KDE correction term
     use_kde_correction: bool = False
     # Whether to zero out the goals in metric proposal
@@ -263,6 +264,16 @@ class CRL:
     q_zero_center: bool = False
     # Temperature for softmax goal sampling over M matrix (0 = greedy, >0 = softmax sampling)
     goal_sampling_temperature: float = 1.0
+
+    # Learned goal proposer parameters
+    # Learning rate for the proposer network
+    proposer_lr: float = 3e-4
+    # Target success rate for goal selection (goals with P(success) closest to this are selected)
+    proposer_target_success: float = 0.5
+    # Number of hidden layers in the proposer MLP
+    n_proposer_hidden: int = 3
+    # Width of hidden layers in the proposer network
+    proposer_h_dim: int = 256
 
     def check_config(self, config):
         """
@@ -406,6 +417,29 @@ class CRL:
             tx=optax.adam(learning_rate=self.alpha_lr),
         )
 
+        # Goal proposer network (only for learned proposer)
+        proposer_network = None
+        proposer_state = None
+        if self.goal_proposer_name == "learned_proposal":
+            key, proposer_key = jax.random.split(key)
+            proposer_network = GoalProposerNetwork(
+                network_width=self.proposer_h_dim,
+                network_depth=self.n_proposer_hidden,
+                use_relu=self.use_relu,
+                use_ln=self.use_ln,
+            )
+            # Input is (state, goal) so input dimension is state_size + goal_size
+            proposer_params = proposer_network.init(
+                proposer_key, 
+                np.ones([1, state_size]), 
+                np.ones([1, goal_size])
+            )
+            proposer_state = TrainState.create(
+                apply_fn=proposer_network.apply,
+                params=proposer_params,
+                tx=optax.adam(learning_rate=self.proposer_lr),
+            )
+
         # Trainstate
         training_state = TrainingState(
             optimal_goal_proposal_prob=jnp.array(self.goal_proposal_prob),
@@ -414,6 +448,7 @@ class CRL:
             actor_state=actor_state,
             critic_state=critic_state,
             alpha_state=alpha_state,
+            proposer_state=proposer_state,
         )
 
         # Replay Buffer
@@ -480,6 +515,10 @@ class CRL:
                 use_env_goals=self.q_epistemic_use_env_goals,
                 zero_center=self.q_zero_center
             )
+        elif self.goal_proposer_name == "learned_proposer":
+            goal_proposer = LearnedGoalProposal(
+                target_success=self.proposer_target_success,
+            )
         else:
             raise ValueError(f"Unknown goal proposer: {self.goal_proposer_name}")
 
@@ -537,13 +576,25 @@ class CRL:
 
             key, proposal_key, mix_key = jax.random.split(key, 3)
             
-            new_goals, buffer_state = goal_proposer.propose_goals(
-                replay_buffer, buffer_state,
-                training_state, train_env, env_state,
-                proposal_key,
-                actor, actor_state.params, critic_state.params,
-                sa_encoder, g_encoder
-            )
+            # For learned proposer, pass the proposer network and params
+            if self.goal_proposer_name == "learned":
+                new_goals, buffer_state = goal_proposer.propose_goals(
+                    replay_buffer, buffer_state,
+                    training_state, train_env, env_state,
+                    proposal_key,
+                    actor, actor_state.params, critic_state.params,
+                    sa_encoder, g_encoder,
+                    proposer_network=proposer_network,
+                    proposer_params=training_state.proposer_state.params if training_state.proposer_state is not None else None
+                )
+            else:
+                new_goals, buffer_state = goal_proposer.propose_goals(
+                    replay_buffer, buffer_state,
+                    training_state, train_env, env_state,
+                    proposal_key,
+                    actor, actor_state.params, critic_state.params,
+                    sa_encoder, g_encoder
+                )
             original_goals = env_state.obs[:, -len(train_env.goal_indices):]
 
             if self.use_adaptive_mixing:
@@ -604,6 +655,68 @@ class CRL:
                 length=num_prefill_actor_steps,
             )[0]
 
+        def update_proposer(transitions, training_state, proposer_net):
+            """Update the learned goal proposer with BCE loss.
+            
+            The proposer learns to predict P(success | state, goal) using observed
+            outcomes from trajectories where goals were proposed.
+            
+            Success is defined as the agent reaching within `success_threshold` of 
+            the proposed goal by the end of the trajectory.
+            """
+            # Extract data from transitions
+            # transitions has shape (batch_size, ...) after flattening
+            states = transitions.extras["state"]  # (batch_size, state_dim)
+            proposed_goals = transitions.extras["proposed_goals"]  # (batch_size, goal_size)
+            last_traj_state = transitions.extras["last_traj_state"][:, :state_size]  # (batch_size, state_dim)
+            was_proposed_mask = transitions.extras["state_extras"]["was_proposed_goal_mask"]  # (batch_size,)
+            last_traj_mask = transitions.extras["last_traj_state_mask"]  # (batch_size,) - True for last step of trajectory
+            
+            # Extract goal portion from final states
+            goal_indices_array = jnp.array(train_env.goal_indices)
+            final_goals = last_traj_state[:, goal_indices_array]  # (batch_size, goal_size)
+            
+            # Compute success: distance between final state and proposed goal < threshold
+            goal_distances = jnp.sqrt(jnp.sum((final_goals - proposed_goals) ** 2, axis=-1))
+            success_labels = (goal_distances < train_env.goal_reach_thresh).astype(jnp.float32)
+            
+            # Create mask for valid training samples:
+            # 1. Goal was proposed (not from environment)
+            # 2. This is the last step of the trajectory (so we know the outcome)
+            valid_mask = was_proposed_mask * last_traj_mask
+            
+            def proposer_loss_fn(params):
+                """BCE loss for proposer predictions."""
+                scores = proposer_net.apply(params, states, proposed_goals)  # (batch_size,)
+                probs = jax.nn.sigmoid(scores)
+                
+                # BCE loss: -[y * log(p) + (1-y) * log(1-p)]
+                eps = 1e-7
+                bce = -(success_labels * jnp.log(probs + eps) + 
+                       (1 - success_labels) * jnp.log(1 - probs + eps))
+                
+                # Only compute loss for valid samples
+                masked_loss = bce * valid_mask
+                num_valid = jnp.sum(valid_mask) + 1e-8
+                mean_loss = jnp.sum(masked_loss) / num_valid
+                
+                return mean_loss, {
+                    'proposer_loss': mean_loss,
+                    'proposer_mean_pred_prob': jnp.sum(probs * valid_mask) / num_valid,
+                    'proposer_mean_success_rate': jnp.sum(success_labels * valid_mask) / num_valid,
+                    'proposer_num_valid_samples': num_valid,
+                    'proposer_mean_goal_distance': jnp.sum(goal_distances * valid_mask) / num_valid,
+                }
+            
+            # Compute gradients and update
+            grad_fn = jax.value_and_grad(proposer_loss_fn, has_aux=True)
+            (loss, metrics), grads = grad_fn(training_state.proposer_state.params)
+            
+            new_proposer_state = training_state.proposer_state.apply_gradients(grads=grads)
+            training_state = training_state.replace(proposer_state=new_proposer_state)
+            
+            return training_state, metrics
+
         @jax.jit
         def update_networks(carry, transitions):
             training_state, key = carry
@@ -632,6 +745,13 @@ class CRL:
             training_state, critic_metrics = update_critic(
                 context, networks, transitions, training_state, critic_key
             )
+            
+            # Update proposer network if using learned goal proposer
+            if self.goal_proposer_name == "learned_proposer":
+                training_state = update_proposer(
+                    transitions, training_state, proposer_network
+                )
+            
             training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
 
             metrics = {}
