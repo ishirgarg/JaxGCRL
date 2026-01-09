@@ -420,7 +420,7 @@ class CRL:
         # Goal proposer network (only for learned proposer)
         proposer_network = None
         proposer_state = None
-        if self.goal_proposer_name == "learned_proposal":
+        if self.goal_proposer_name == "learned_proposer":
             key, proposer_key = jax.random.split(key)
             proposer_network = GoalProposerNetwork(
                 network_width=self.proposer_h_dim,
@@ -577,7 +577,7 @@ class CRL:
             key, proposal_key, mix_key = jax.random.split(key, 3)
             
             # For learned proposer, pass the proposer network and params
-            if self.goal_proposer_name == "learned":
+            if self.goal_proposer_name == "learned_proposer":
                 new_goals, buffer_state = goal_proposer.propose_goals(
                     replay_buffer, buffer_state,
                     training_state, train_env, env_state,
