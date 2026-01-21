@@ -43,7 +43,9 @@ class RunConfig:
     total_env_steps: int = 50_000_000
 
     # maximum length of an episode
-    episode_length: int = 1001
+    num_goal_conditioned_steps: int = 100
+    num_exploratory_steps: int = 100
+    episode_length: int = num_goal_conditioned_steps + num_exploratory_steps
 
     # environment to use for evaluation
     eval_env: Optional[Literal[legal_envs]] = None

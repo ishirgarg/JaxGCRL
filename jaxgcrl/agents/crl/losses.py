@@ -164,7 +164,6 @@ def update_critic(config, networks, transitions, training_state, key):
     """Update critic(s). Supports both single critic and ensemble of critics."""
     
     critic_params = training_state.critic_state.params
-    is_ensemble = isinstance(critic_params["sa_encoder"], list)
     
     def single_critic_loss(sa_params, g_params, transitions, key):
         """Loss for a single critic."""
@@ -191,60 +190,21 @@ def update_critic(config, networks, transitions, training_state, key):
 
         return loss, (logsumexp, correct, logits_pos, logits_neg)
     
-    if is_ensemble:
-        # Ensemble case: train each critic independently with the full optimizer
-        num_ensemble = len(critic_params["sa_encoder"])
-        
-        def ensemble_loss(critic_params, transitions, key):
-            """Combined loss for all ensemble members."""
-            total_loss = 0.0
-            all_logsumexp = []
-            all_correct = []
-            all_logits_pos = []
-            all_logits_neg = []
-            
-            for i in range(num_ensemble):
-                sa_params = critic_params["sa_encoder"][i]
-                g_params = critic_params["g_encoder"][i]
-                loss, (logsumexp, correct, logits_pos, logits_neg) = single_critic_loss(
-                    sa_params, g_params, transitions, key
-                )
-                total_loss += loss
-                all_logsumexp.append(logsumexp)
-                all_correct.append(correct)
-                all_logits_pos.append(logits_pos)
-                all_logits_neg.append(logits_neg)
-            
-            avg_loss = total_loss / num_ensemble
-            avg_logsumexp = jnp.mean(jnp.stack(all_logsumexp, axis=0), axis=0)
-            avg_correct = jnp.mean(jnp.stack(all_correct, axis=0), axis=0)
-            avg_logits_pos = jnp.mean(jnp.array(all_logits_pos))
-            avg_logits_neg = jnp.mean(jnp.array(all_logits_neg))
-            
-            return avg_loss, (avg_logsumexp, avg_correct, avg_logits_pos, avg_logits_neg)
-        
-        (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
-            ensemble_loss, has_aux=True
-        )(training_state.critic_state.params, transitions, key)
-        new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
-        training_state = training_state.replace(critic_state=new_critic_state)
-        logsumexp_mean = logsumexp.mean()
-    else:
-        # Single critic case (original implementation)
-        def critic_loss(critic_params, transitions, key):
-            return single_critic_loss(
-                critic_params["sa_encoder"], 
-                critic_params["g_encoder"], 
-                transitions, 
-                key
-            )
+    # Single critic case (original implementation)
+    def critic_loss(critic_params, transitions, key):
+        return single_critic_loss(
+            critic_params["sa_encoder"], 
+            critic_params["g_encoder"], 
+            transitions, 
+            key
+        )
 
-        (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
-            critic_loss, has_aux=True
-        )(training_state.critic_state.params, transitions, key)
-        new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
-        training_state = training_state.replace(critic_state=new_critic_state)
-        logsumexp_mean = logsumexp.mean()
+    (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
+        critic_loss, has_aux=True
+    )(training_state.critic_state.params, transitions, key)
+    new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
+    training_state = training_state.replace(critic_state=new_critic_state)
+    logsumexp_mean = logsumexp.mean()
 
     metrics = {
         "categorical_accuracy": jnp.mean(correct),
