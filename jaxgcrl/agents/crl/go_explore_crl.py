@@ -1233,12 +1233,16 @@ class GoExploreCRL:
             ep_proposed_goals_flat = ep_proposed_goals.reshape(-1, len(train_env.goal_indices))
             traj_ids_flat = traj_ids.reshape(-1)
             
+            # Debug: Check how many unique trajectory IDs we have
+            unique_traj_ids = np.unique(traj_ids_flat)
+            logging.info(f"Visualization: Found {len(unique_traj_ids)} unique trajectory IDs out of {len(traj_ids_flat)} total transitions")
+            logging.info(f"Transition shapes: obs={obs.shape}, traj_ids={traj_ids.shape}, traj_ids_flat={traj_ids_flat.shape}")
+            
             # Flatten intermediate trajectories to shape (total_samples, num_intermediate_states, obs_dim)
             intermediate_traj_flat = intermediate_traj.reshape(-1, intermediate_traj.shape[-2], intermediate_traj.shape[-1])
             
             # Extract GC and EP final states for each trajectory
             # For each unique trajectory, find the last GC and EP states
-            unique_traj_ids = np.unique(traj_ids_flat)
             gc_final_states = []
             ep_final_states = []
             start_states = []
@@ -1465,9 +1469,19 @@ class GoExploreCRL:
             
             viz_key = jax.random.PRNGKey(0)  # Use fixed key for deterministic visualization
             num_envs = collected_transitions.observation.shape[1]
+            logging.info(f"Visualization: collected_transitions shape: {collected_transitions.observation.shape}, num_envs: {num_envs}")
+            
+            # Check trajectory IDs in raw collected_transitions before processing
+            raw_traj_ids = np.array(collected_transitions.extras["state_extras"]["traj_id"])
+            raw_traj_ids_flat = raw_traj_ids.reshape(-1)
+            raw_unique_traj_ids = np.unique(raw_traj_ids_flat)
+            logging.info(f"Visualization: Raw collected_transitions has {len(raw_unique_traj_ids)} unique trajectory IDs out of {len(raw_traj_ids_flat)} total transitions")
+            
             viz_batch_keys = jax.random.split(viz_key, num_envs)
             
             processed_transitions = process_for_viz(collected_transitions, viz_batch_keys)
+            
+            logging.info(f"Visualization: processed_transitions shape: {processed_transitions.observation.shape}")
             
             visualize_goals(train_env, processed_transitions, wandb_key="training")
 
