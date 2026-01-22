@@ -86,6 +86,25 @@ def main(config: Config):
         "training/critic_loss",
         "training/entropy",
         "training/sps",
+        # Go-Explore CRL specific metrics
+        "training/gcp_entropy",
+        "training/gcp_actor_loss",
+        "training/gcp_alpha_loss",
+        "training/gcp_log_alpha",
+        "training/gcp_categorical_accuracy",
+        "training/gcp_logits_pos",
+        "training/gcp_logits_neg",
+        "training/gcp_logsumexp",
+        "training/gcp_critic_loss",
+        "training/ep_entropy",
+        "training/ep_actor_loss",
+        "training/ep_alpha_loss",
+        "training/ep_log_alpha",
+        "training/ep_categorical_accuracy",
+        "training/ep_logits_pos",
+        "training/ep_logits_neg",
+        "training/ep_logsumexp",
+        "training/ep_critic_loss",
     ]
 
     metrics_recorder = MetricsRecorder(
