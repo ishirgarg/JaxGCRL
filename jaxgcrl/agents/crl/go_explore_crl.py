@@ -1132,13 +1132,21 @@ class GoExploreCRL:
                 (gcp_last_batch, ep_last_batch)
             )
 
+            # Combine GCP and EP transitions into a single transition object
+            # Concatenate along the batch dimension (axis=1)
+            combined_last_batch = jax.tree_util.tree_map(
+                lambda gcp, ep: jnp.concatenate([gcp, ep], axis=1),
+                gcp_last_batch,
+                ep_last_batch
+            )
+
             return (
                 training_state,
                 env_state,
                 main_buffer_state,
                 gcp_buffer_state,
                 ep_buffer_state,
-                (gcp_last_batch, ep_last_batch)
+                combined_last_batch
             ), metrics
 
         @jax.jit
@@ -1191,19 +1199,20 @@ class GoExploreCRL:
         
         def visualize_goals(train_env, transitions, wandb_key):
             # Shape is now (episode_len-1, batch_size, ...) since we only keep the last training step's batch
-            obs = transitions.observation # (episode_len-1, batch_size, obs_dim)
-            last_traj_state = transitions.extras["last_traj_state"][:, :, :state_size] # (episode_len-1, batch_size, state_size)
+            # Convert JAX arrays to numpy for processing
+            obs = np.array(transitions.observation) # (episode_len-1, batch_size, obs_dim)
+            last_traj_state = np.array(transitions.extras["last_traj_state"][:, :, :state_size]) # (episode_len-1, batch_size, state_size)
             last_traj_state_flat = last_traj_state.reshape(-1, state_size)
-            intermediate_traj = transitions.extras["intermediate_traj"] # (episode_len-1, batch_size, num_intermediate_states, obs_dim)
+            intermediate_traj = np.array(transitions.extras["intermediate_traj"]) # (episode_len-1, batch_size, num_intermediate_states, obs_dim)
             
             states = obs[:, :, :state_size].reshape(-1, state_size)
             
             # Extract GC and EP specific data
-            in_gc_phase = transitions.extras["state_extras"]["in_gc_phase"] # (episode_len-1, batch_size)
-            in_ep_phase = transitions.extras["state_extras"]["in_ep_phase"] # (episode_len-1, batch_size)
-            gc_proposed_goals = transitions.extras["state_extras"]["gc_proposed_goals"] # (episode_len-1, batch_size, goal_dim)
-            ep_proposed_goals = transitions.extras["state_extras"]["ep_proposed_goals"] # (episode_len-1, batch_size, goal_dim)
-            traj_ids = transitions.extras["state_extras"]["traj_id"] # (episode_len-1, batch_size)
+            in_gc_phase = np.array(transitions.extras["state_extras"]["in_gc_phase"]) # (episode_len-1, batch_size)
+            in_ep_phase = np.array(transitions.extras["state_extras"]["in_ep_phase"]) # (episode_len-1, batch_size)
+            gc_proposed_goals = np.array(transitions.extras["state_extras"]["gc_proposed_goals"]) # (episode_len-1, batch_size, goal_dim)
+            ep_proposed_goals = np.array(transitions.extras["state_extras"]["ep_proposed_goals"]) # (episode_len-1, batch_size, goal_dim)
+            traj_ids = np.array(transitions.extras["state_extras"]["traj_id"]) # (episode_len-1, batch_size)
             
             # Reshape to (total_samples, ...)
             in_gc_phase_flat = in_gc_phase.reshape(-1)
@@ -1236,20 +1245,22 @@ class GoExploreCRL:
                 # Find last GC phase transition (where in_gc_phase > 0.5)
                 gc_mask = in_gc_phase_flat[traj_indices] > 0.5
                 gc_indices = traj_indices[gc_mask]
-                gc_final_idx = gc_indices[-1]
-                gc_final_state = states[gc_final_idx, train_env.goal_indices]
-                gc_goal = gc_proposed_goals_flat[gc_final_idx]
-                gc_final_states.append(gc_final_state)
-                gc_goals.append(gc_goal)
+                if len(gc_indices) > 0:
+                    gc_final_idx = gc_indices[-1]
+                    gc_final_state = states[gc_final_idx, train_env.goal_indices]
+                    gc_goal = gc_proposed_goals_flat[gc_final_idx]
+                    gc_final_states.append(gc_final_state)
+                    gc_goals.append(gc_goal)
                 
                 # Find last EP phase transition (where in_ep_phase > 0.5)
                 ep_mask = in_ep_phase_flat[traj_indices] > 0.5
                 ep_indices = traj_indices[ep_mask]
-                ep_final_idx = ep_indices[-1]
-                ep_final_state = states[ep_final_idx, train_env.goal_indices]
-                ep_goal = ep_proposed_goals_flat[ep_final_idx]
-                ep_final_states.append(ep_final_state)
-                ep_goals.append(ep_goal)
+                if len(ep_indices) > 0:
+                    ep_final_idx = ep_indices[-1]
+                    ep_final_state = states[ep_final_idx, train_env.goal_indices]
+                    ep_goal = ep_proposed_goals_flat[ep_final_idx]
+                    ep_final_states.append(ep_final_state)
+                    ep_goals.append(ep_goal)
                 
                 # Get intermediate states for this trajectory
                 # The intermediate states are computed from the first transition and span the full trajectory
