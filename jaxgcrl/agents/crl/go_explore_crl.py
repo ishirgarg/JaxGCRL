@@ -712,6 +712,12 @@ class GoExploreCRL:
                 }
                 transition = transition._replace(extras={"state_extras": transition_extras})
                 
+                # Assert: proposed goals should match the last len(goal_indices) entries in observation
+                obs_goals = transition.observation[:, -len(train_env.goal_indices):]
+                goals_match = jnp.allclose(obs_goals, gc_proposed_goals, atol=1e-5, rtol=1e-5)
+                # Enforce assertion: if goals don't match, divide by zero to cause error
+                _ = 1.0 / jnp.where(goals_match, 1.0, 0.0)
+                
                 return (env_state, gcp_actor_state, next_key), transition
             
             # Log before GC rollout
@@ -818,6 +824,15 @@ class GoExploreCRL:
                     "terminated": terminated.astype(jnp.float32),
                 }
                 transition = transition._replace(extras={"state_extras": transition_extras})
+                
+
+                ## REMOVE LATER START
+                # Assert: proposed goals should match the last len(goal_indices) entries in observation
+                obs_goals = transition.observation[:, -len(train_env.goal_indices):]
+                goals_match = jnp.allclose(obs_goals, ep_proposed_goals, atol=1e-5, rtol=1e-5)
+                # Enforce assertion: if goals don't match, divide by zero to cause error
+                _ = 1.0 / jnp.where(goals_match, 1.0, 0.0)
+                ## REMOVE LATER END
                 
                 return (env_state, ep_actor_state, next_key), transition
             
