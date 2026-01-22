@@ -701,6 +701,7 @@ class GoExploreCRL:
                     "in_gc_phase": jnp.ones((num_envs,), dtype=jnp.float32),
                     "in_ep_phase": jnp.zeros((num_envs,), dtype=jnp.float32),
                     "gc_proposed_goals": gc_proposed_goals,
+                    "ep_proposed_goals": gc_proposed_goals,  # Use GC goals as placeholder (EP goals not set yet)
                     "terminated": terminated.astype(jnp.float32),
                 }
                 transition = transition._replace(extras={"state_extras": transition_extras})
@@ -754,9 +755,8 @@ class GoExploreCRL:
             # Update env_state with EP goals
             new_info = dict(env_state.info)
             new_info["ep_proposed_goals"] = ep_proposed_goals
-            # Preserve GC proposed goals from previous phase
-            if "gc_proposed_goals" in env_state.info:
-                new_info["gc_proposed_goals"] = env_state.info["gc_proposed_goals"]
+            # Preserve GC proposed goals from previous phase (should always exist)
+            new_info["gc_proposed_goals"] = env_state.info.get("gc_proposed_goals", ep_proposed_goals)
             env_state = env_state.replace(
                 obs=env_state.obs.at[:, -len(train_env.goal_indices):].set(ep_proposed_goals),
                 info=new_info
@@ -794,23 +794,23 @@ class GoExploreCRL:
                 # Update env_state (environment already handles termination correctly)
                 new_info = dict(nstate.info)
                 new_info["ep_proposed_goals"] = ep_proposed_goals
-                # Preserve GC proposed goals if they exist
-                if "gc_proposed_goals" in env_state.info:
-                    new_info["gc_proposed_goals"] = env_state.info["gc_proposed_goals"]
+                # Preserve GC proposed goals if they exist (should always exist)
+                new_info["gc_proposed_goals"] = env_state.info.get("gc_proposed_goals", ep_proposed_goals)
                 env_state = nstate.replace(info=new_info)
                 
                 # Mark transition as EP phase and include proposed goals and termination info
                 # Preserve existing state_extras and add new fields
                 existing_state_extras = transition.extras["state_extras"]
+                # Get GC proposed goals (should always exist since GC phase sets them)
+                gc_proposed_goals_for_transition = env_state.info.get("gc_proposed_goals", ep_proposed_goals)
                 transition_extras = {
                     **existing_state_extras,
                     "in_gc_phase": jnp.zeros((num_envs,), dtype=jnp.float32),
                     "in_ep_phase": jnp.ones((num_envs,), dtype=jnp.float32),
+                    "gc_proposed_goals": gc_proposed_goals_for_transition,
                     "ep_proposed_goals": ep_proposed_goals,
                     "terminated": terminated.astype(jnp.float32),
                 }
-                # Also include GC proposed goals if available
-                transition_extras["gc_proposed_goals"] = env_state.info["gc_proposed_goals"]
                 transition = transition._replace(extras={"state_extras": transition_extras})
                 
                 return (env_state, ep_actor_state, next_key), transition
