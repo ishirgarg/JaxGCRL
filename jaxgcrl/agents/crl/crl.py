@@ -41,14 +41,16 @@ class TrainingState:
     optimal_goal_proposal_prob: jnp.ndarray
     env_steps: jnp.ndarray
     gradient_steps: jnp.ndarray
-    actor_state: TrainState
-    critic_state: TrainState
-    alpha_state: TrainState
+    gcp_actor_state: TrainState
+    gcp_critic_state: TrainState
+    ep_actor_state: TrainState
+    ep_critic_state: TrainState
+    gcp_alpha_state: TrainState
+    ep_alpha_state: TrainState
 
 
 class Transition(NamedTuple):
     """Container for a transition"""
-
     observation: jnp.ndarray
     action: jnp.ndarray
     reward: jnp.ndarray
@@ -198,7 +200,6 @@ def save_params(path: str, params: Any):
 @dataclass
 class CRL:
     """Contrastive Reinforcement Learning (CRL) agent."""
-
     policy_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
@@ -233,20 +234,8 @@ class CRL:
 
     # Proportion of proposed goals coming from the goal proposal algorithm
     goal_proposal_prob: float = 0.0
-    # If fraction of goals from the replay buffer should be computed adaptiveally; note that this causes goal_proposal_prob to be ignored
-    use_adaptive_mixing: bool = False
-    # Adaptive mixing momentum term
-    adaptive_mixing_momentum: float = 0.0
-    # Number of env steps to wait before starting adaptive mixing
-    adaptive_mixing_warmup_steps: int = 0 
-    # Number of env steps to wait before proposing goals from the goal proposal algorithm
-    goal_proposal_warmup_steps: int = 0
-    # Whether we should interpolate to 100% environment goals during training
-    interpolate_to_env_goals: bool = False
-    # What goal selection percentile to use for MediumEnergyGoalProposal
-    goal_selection_percentile: float = 0.5
-    # Which goal proposer to use
-    goal_proposer_name: Literal["quantile", "replay_buffer", "metric", "metric_one_env_goal", "waypoint_ratio", "waypoint_ratio_one_env_goal", "max_waypoint_ratio", "fisher_trace", "fisher_trace_actor", "fisher_trace_combined", "q_epistemic", "mega", "omega", "ucgr", "discover"] = "replay_buffer"
+
+    goal_proposer_name: Literal[""] = "replay_buffer"
     # For metric proposal whether to use KDE correction term
     use_kde_correction: bool = False
     # Whether to zero out the goals in metric proposal
@@ -703,13 +692,20 @@ class CRL:
                 g_encoder=g_encoder,
             )
 
-            training_state, actor_metrics = update_actor_and_alpha(
-                context, networks, transitions, training_state, actor_key
+            new_actor_state, new_alpha_state, actor_metrics = update_actor_and_alpha(
+                context, networks, transitions, 
+                training_state.actor_state, training_state.critic_state, training_state.alpha_state,
+                actor_key
             )
-            training_state, critic_metrics = update_critic(
-                context, networks, transitions, training_state, critic_key
+            new_critic_state, critic_metrics = update_critic(
+                context, networks, transitions, training_state.critic_state, critic_key
             )
-            training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
+            training_state = training_state.replace(
+                actor_state=new_actor_state,
+                critic_state=new_critic_state,
+                alpha_state=new_alpha_state,
+                gradient_steps=training_state.gradient_steps + 1,
+            )
 
             metrics = {}
             metrics.update(actor_metrics)

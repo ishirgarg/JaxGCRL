@@ -32,7 +32,8 @@ def contrastive_loss_fn(name, logits):
     return critic_loss
 
 
-def update_actor_and_alpha(config, networks, transitions, training_state, key):
+def update_actor_and_alpha(config, networks, transitions, actor_state, critic_state, alpha_state, key):
+    """Update actor and alpha. Accepts states directly for flexibility."""
     def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
         obs = transitions.observation  # expected_shape = self.batch_size, obs_size + goal_size
         state = obs[:, : config["state_size"]]
@@ -87,26 +88,24 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
     sample_keys = jax.random.split(subkey, batch_size)
 
     (batch_actor_loss, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
-        training_state.actor_state.params,
-        training_state.critic_state.params,
-        training_state.alpha_state.params["log_alpha"],
+        actor_state.params,
+        critic_state.params,
+        alpha_state.params["log_alpha"],
         transitions,
         key,
     )
 
     # Update actor
-    new_actor_state = training_state.actor_state.apply_gradients(grads=actor_grad)
+    new_actor_state = actor_state.apply_gradients(grads=actor_grad)
 
-    batch_alpha_loss, alpha_grad = jax.value_and_grad(alpha_loss)(training_state.alpha_state.params, log_prob)
-    new_alpha_state = training_state.alpha_state.apply_gradients(grads=alpha_grad)
-
-    training_state = training_state.replace(actor_state=new_actor_state, alpha_state=new_alpha_state)
+    batch_alpha_loss, alpha_grad = jax.value_and_grad(alpha_loss)(alpha_state.params, log_prob)
+    new_alpha_state = alpha_state.apply_gradients(grads=alpha_grad)
 
     metrics = {
         "entropy": -log_prob,
         "actor_loss": batch_actor_loss,
         "alpha_loss": batch_alpha_loss,
-        "log_alpha": training_state.alpha_state.params["log_alpha"],
+        "log_alpha": new_alpha_state.params["log_alpha"],
     }
 
     # Only compute per-sample gradient statistics if adaptive mixing is enabled
@@ -117,9 +116,9 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
 
             grad_fn = jax.grad(actor_loss, has_aux=True)
             return grad_fn(
-                training_state.actor_state.params,
-                training_state.critic_state.params,
-                training_state.alpha_state.params["log_alpha"],
+                actor_state.params,
+                critic_state.params,
+                alpha_state.params["log_alpha"],
                 single_transition,
                 key
             )
@@ -157,13 +156,13 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
             "adaptive_mixing/num_env_samples": num_env,
         })
 
-    return training_state, metrics
+    return new_actor_state, new_alpha_state, metrics
 
 
-def update_critic(config, networks, transitions, training_state, key):
-    """Update critic(s). Supports both single critic and ensemble of critics."""
+def update_critic(config, networks, transitions, critic_state, key):
+    """Update critic(s). Supports both single critic and ensemble of critics. Accepts critic_state directly for flexibility."""
     
-    critic_params = training_state.critic_state.params
+    critic_params = critic_state.params
     
     def single_critic_loss(sa_params, g_params, transitions, key):
         """Loss for a single critic."""
@@ -201,9 +200,8 @@ def update_critic(config, networks, transitions, training_state, key):
 
     (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
         critic_loss, has_aux=True
-    )(training_state.critic_state.params, transitions, key)
-    new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
-    training_state = training_state.replace(critic_state=new_critic_state)
+    )(critic_state.params, transitions, key)
+    new_critic_state = critic_state.apply_gradients(grads=grad)
     logsumexp_mean = logsumexp.mean()
 
     metrics = {
@@ -214,4 +212,4 @@ def update_critic(config, networks, transitions, training_state, key):
         "critic_loss": loss,
     }
 
-    return training_state, metrics
+    return new_critic_state, metrics

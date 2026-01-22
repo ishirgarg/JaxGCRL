@@ -825,15 +825,6 @@ class GoExploreCRL:
                 }
                 transition = transition._replace(extras={"state_extras": transition_extras})
                 
-
-                ## REMOVE LATER START
-                # Assert: proposed goals should match the last len(goal_indices) entries in observation
-                obs_goals = transition.observation[:, -len(train_env.goal_indices):]
-                goals_match = jnp.allclose(obs_goals, ep_proposed_goals, atol=1e-5, rtol=1e-5)
-                # Enforce assertion: if goals don't match, divide by zero to cause error
-                _ = 1.0 / jnp.where(goals_match, 1.0, 0.0)
-                ## REMOVE LATER END
-                
                 return (env_state, ep_actor_state, next_key), transition
             
             # Log before EP rollout
@@ -996,19 +987,36 @@ class GoExploreCRL:
                 g_encoder=ep_g_encoder,
             )
 
-            training_state, gcp_actor_metrics = update_actor_and_alpha(
-                context, gcp_networks, gcp_transitions, training_state, gcp_actor_key
+            # Update GCP networks
+            new_gcp_actor_state, new_gcp_alpha_state, gcp_actor_metrics = update_actor_and_alpha(
+                context, gcp_networks, gcp_transitions, 
+                training_state.gcp_actor_state, training_state.gcp_critic_state, training_state.gcp_alpha_state,
+                gcp_actor_key
             )
-            training_state, gcp_critic_metrics = update_critic(
-                context, gcp_networks, gcp_transitions, training_state, gcp_critic_key
+            new_gcp_critic_state, gcp_critic_metrics = update_critic(
+                context, gcp_networks, gcp_transitions, training_state.gcp_critic_state, gcp_critic_key
             )
-            training_state, ep_actor_metrics = update_actor_and_alpha(
-                context, ep_networks, ep_transitions, training_state, ep_actor_key
+            
+            # Update EP networks
+            new_ep_actor_state, new_ep_alpha_state, ep_actor_metrics = update_actor_and_alpha(
+                context, ep_networks, ep_transitions,
+                training_state.ep_actor_state, training_state.ep_critic_state, training_state.ep_alpha_state,
+                ep_actor_key
             )
-            training_state, ep_critic_metrics = update_critic(
-                context, ep_networks, ep_transitions, training_state, ep_critic_key
+            new_ep_critic_state, ep_critic_metrics = update_critic(
+                context, ep_networks, ep_transitions, training_state.ep_critic_state, ep_critic_key
             )
-            training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
+            
+            # Update training state with new states
+            training_state = training_state.replace(
+                gcp_actor_state=new_gcp_actor_state,
+                gcp_critic_state=new_gcp_critic_state,
+                gcp_alpha_state=new_gcp_alpha_state,
+                ep_actor_state=new_ep_actor_state,
+                ep_critic_state=new_ep_critic_state,
+                ep_alpha_state=new_ep_alpha_state,
+                gradient_steps=training_state.gradient_steps + 1,
+            )
 
             metrics = {}
             for key, value in gcp_actor_metrics.items():
