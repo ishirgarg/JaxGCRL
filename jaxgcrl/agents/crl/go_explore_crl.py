@@ -165,7 +165,6 @@ def flatten_batch(buffer_config, transition, sample_key):
         "state_extras": {
             "truncation": jnp.squeeze(transition.extras["state_extras"]["truncation"][:-1]),
             "traj_id": jnp.squeeze(transition.extras["state_extras"]["traj_id"][:-1]),
-            "was_proposed_goal_mask": jnp.squeeze(transition.extras["state_extras"]["was_proposed_goal_mask"][:-1]),
         },
         "state": state,
         "future_state": future_state,
@@ -312,7 +311,6 @@ class GoExploreCRL:
         
         # Initialize info dict (proposed goals will be set by goal proposers in get_experience)
         initial_info = dict(env_state.info)
-        initial_info["was_proposed_goal_mask"] = jnp.zeros((config.num_envs,))
         env_state = env_state.replace(info=initial_info)
 
         # Dimensions definitions and sanity checks
@@ -444,7 +442,6 @@ class GoExploreCRL:
                 "state_extras": {
                     "truncation": 0.0,
                     "traj_id": 0.0,
-                    "was_proposed_goal_mask": 0.0,
                     "in_gc_phase": 0.0,
                     "in_ep_phase": 0.0,
                     "gc_proposed_goals": dummy_goal,
@@ -929,7 +926,6 @@ class GoExploreCRL:
                 env_state = jax.jit(train_env.reset)(reset_keys)
                 # Initialize info dict (proposed goals will be set by goal proposers in get_experience)
                 initial_info = dict(env_state.info)
-                initial_info["was_proposed_goal_mask"] = jnp.zeros((config.num_envs,))
                 env_state = env_state.replace(info=initial_info)
                 
                 training_state = training_state.replace(
@@ -1075,7 +1071,6 @@ class GoExploreCRL:
             env_state = jax.jit(train_env.reset)(reset_keys)
             # Initialize info dict (proposed goals will be set by goal proposers in get_experience)
             initial_info = dict(env_state.info)
-            initial_info["was_proposed_goal_mask"] = jnp.zeros((config.num_envs,))
             env_state = env_state.replace(info=initial_info)
 
             training_state = training_state.replace(
