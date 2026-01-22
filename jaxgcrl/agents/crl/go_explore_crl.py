@@ -1018,15 +1018,27 @@ class GoExploreCRL:
                 gradient_steps=training_state.gradient_steps + 1,
             )
 
-            metrics = {}
-            for key, value in gcp_actor_metrics.items():
-                metrics[f"gcp_{key}"] = value
-            for key, value in gcp_critic_metrics.items():
-                metrics[f"gcp_{key}"] = value
-            for key, value in ep_actor_metrics.items():
-                metrics[f"ep_{key}"] = value
-            for key, value in ep_critic_metrics.items():
-                metrics[f"ep_{key}"] = value
+            # Construct metrics dictionary directly to avoid JAX tracing issues with .items()
+            metrics = {
+                "gcp_entropy": gcp_actor_metrics["entropy"],
+                "gcp_actor_loss": gcp_actor_metrics["actor_loss"],
+                "gcp_alpha_loss": gcp_actor_metrics["alpha_loss"],
+                "gcp_log_alpha": gcp_actor_metrics["log_alpha"],
+                "gcp_categorical_accuracy": gcp_critic_metrics["categorical_accuracy"],
+                "gcp_logits_pos": gcp_critic_metrics["logits_pos"],
+                "gcp_logits_neg": gcp_critic_metrics["logits_neg"],
+                "gcp_logsumexp": gcp_critic_metrics["logsumexp"],
+                "gcp_critic_loss": gcp_critic_metrics["critic_loss"],
+                "ep_entropy": ep_actor_metrics["entropy"],
+                "ep_actor_loss": ep_actor_metrics["actor_loss"],
+                "ep_alpha_loss": ep_actor_metrics["alpha_loss"],
+                "ep_log_alpha": ep_actor_metrics["log_alpha"],
+                "ep_categorical_accuracy": ep_critic_metrics["categorical_accuracy"],
+                "ep_logits_pos": ep_critic_metrics["logits_pos"],
+                "ep_logits_neg": ep_critic_metrics["logits_neg"],
+                "ep_logsumexp": ep_critic_metrics["logsumexp"],
+                "ep_critic_loss": ep_critic_metrics["critic_loss"],
+            }
             
             # Log update_networks end
             jax.experimental.io_callback(

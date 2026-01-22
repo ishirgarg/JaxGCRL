@@ -131,30 +131,8 @@ def update_actor_and_alpha(config, networks, transitions, actor_state, critic_st
             flat, _ = jax.flatten_util.ravel_pytree(single_grad)
             return flat
         
-        all_grads_flat = jax.vmap(flatten_single_grad)(jnp.arange(batch_size))  # (batch_size, total_params)
-        
-        num_env = jnp.sum(1 - was_proposed_mask)
-        num_rb = jnp.sum(was_proposed_mask)
-        env_mask = (1 - was_proposed_mask)[:, None]  # (batch_size, 1)
-        proposed_mask = was_proposed_mask[:, None]
 
-        d_env_grad_mean = jnp.sum(all_grads_flat * env_mask, axis=0) / (num_env + 1e-8)
-        d_rb_grad_mean = jnp.sum(all_grads_flat * proposed_mask, axis=0) / (num_rb + 1e-8)
 
-        env_grads_centered = all_grads_flat - d_env_grad_mean[None, :]
-        d_env_grad_var = jnp.sum((env_grads_centered**2 * env_mask).sum(axis=0)) / (num_env + 1e-8)  # tr Var(d_env)
-        rb_grads_centered = all_grads_flat - d_rb_grad_mean[None, :]
-        d_rb_grad_var = jnp.sum((rb_grads_centered**2 * proposed_mask).sum(axis=0)) / (num_rb + 1e-8)  # tr Var(d_rb)
-
-        metrics.update({
-            "adaptive_mixing/rb_grad_trvar": d_rb_grad_var,
-            "adaptive_mixing/env_grad_trvar": d_env_grad_var,
-            "adaptive_mixing/rb_grad_mean_norm": jnp.linalg.norm(d_rb_grad_mean),
-            "adaptive_mixing/env_grad_mean_norm": jnp.linalg.norm(d_env_grad_mean),
-            "adaptive_mixing/env_rb_bias_squared": jnp.sum((d_env_grad_mean - d_rb_grad_mean) ** 2),
-            "adaptive_mixing/num_rb_samples": num_rb,
-            "adaptive_mixing/num_env_samples": num_env,
-        })
 
     return new_actor_state, new_alpha_state, metrics
 
