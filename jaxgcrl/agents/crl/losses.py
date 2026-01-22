@@ -171,65 +171,41 @@ def update_critic(config, networks, transitions, critic_state, key):
     is_ensemble = isinstance(critic_params["sa_encoder"], list)
     
     if is_ensemble:
-        # Ensemble case: update each critic independently and average metrics
+        # Ensemble case: train each critic independently with the full optimizer
         num_ensemble = len(critic_params["sa_encoder"])
-        ensemble_keys = jax.random.split(key, num_ensemble)
         
-        def update_single_critic(sa_params, g_params, crit_key):
-            """Update a single critic in the ensemble."""
-            def critic_loss_fn(sa_p, g_p):
-                return single_critic_loss(sa_p, g_p, transitions, crit_key)
+        def ensemble_loss(critic_params, transitions, key):
+            """Combined loss for all ensemble members."""
+            total_loss = 0.0
+            all_logsumexp = []
+            all_correct = []
+            all_logits_pos = []
+            all_logits_neg = []
             
-            (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
-                critic_loss_fn, has_aux=True
-            )(sa_params, g_params)
+            for i in range(num_ensemble):
+                sa_params = critic_params["sa_encoder"][i]
+                g_params = critic_params["g_encoder"][i]
+                loss, (logsumexp, correct, logits_pos, logits_neg) = single_critic_loss(
+                    sa_params, g_params, transitions, key
+                )
+                total_loss += loss
+                all_logsumexp.append(logsumexp)
+                all_correct.append(correct)
+                all_logits_pos.append(logits_pos)
+                all_logits_neg.append(logits_neg)
             
-            # Apply gradients using the optimizer from critic_state
-            # Create a temporary single-critic state for this ensemble member
-            from flax.training.train_state import TrainState
-            import optax
-            temp_state = TrainState.create(
-                apply_fn=None,
-                params={"sa_encoder": sa_params, "g_encoder": g_params},
-                tx=optax.adam(learning_rate=config.get("critic_lr", 3e-4)),
-            )
-            new_temp_state = temp_state.apply_gradients(grads={"sa_encoder": grad[0], "g_encoder": grad[1]})
+            avg_loss = total_loss / num_ensemble
+            avg_logsumexp = jnp.mean(jnp.stack(all_logsumexp, axis=0), axis=0)
+            avg_correct = jnp.mean(jnp.stack(all_correct, axis=0), axis=0)
+            avg_logits_pos = jnp.mean(jnp.array(all_logits_pos))
+            avg_logits_neg = jnp.mean(jnp.array(all_logits_neg))
             
-            return (new_temp_state.params["sa_encoder"], new_temp_state.params["g_encoder"], 
-                   loss, logsumexp, correct, logits_pos, logits_neg)
+            return avg_loss, (avg_logsumexp, avg_correct, avg_logits_pos, avg_logits_neg)
         
-        # Update each critic - use scan to handle list of params
-        def scan_fn(carry, i):
-            sa_params = critic_params["sa_encoder"][i]
-            g_params = critic_params["g_encoder"][i]
-            crit_key = ensemble_keys[i]
-            
-            new_sa, new_g, loss, logsumexp, correct, logits_pos, logits_neg = update_single_critic(
-                sa_params, g_params, crit_key
-            )
-            
-            return carry, (new_sa, new_g, loss, logsumexp, correct, logits_pos, logits_neg)
-        
-        _, results = jax.lax.scan(scan_fn, None, jnp.arange(num_ensemble))
-        
-        new_sa_params_list = [results[0][i] for i in range(num_ensemble)]
-        new_g_params_list = [results[1][i] for i in range(num_ensemble)]
-        all_losses = results[2]
-        all_logsumexps = results[3]
-        all_corrects = results[4]
-        all_logits_pos = results[5]
-        all_logits_neg = results[6]
-        
-        # Average metrics across ensemble
-        loss = jnp.mean(all_losses)
-        logsumexp = jnp.mean(all_logsumexps, axis=0)  # Average across ensemble, keep batch dimension
-        correct = jnp.mean(all_corrects, axis=0)  # Average across ensemble, keep batch dimension
-        logits_pos = jnp.mean(all_logits_pos)
-        logits_neg = jnp.mean(all_logits_neg)
-        
-        new_critic_state = critic_state.replace(
-            params={"sa_encoder": new_sa_params_list, "g_encoder": new_g_params_list}
-        )
+        (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
+            ensemble_loss, has_aux=True
+        )(critic_state.params, transitions, key)
+        new_critic_state = critic_state.apply_gradients(grads=grad)
     else:
         # Single critic case (original implementation)
         def critic_loss(critic_params, transitions, key):

@@ -221,17 +221,18 @@ def visualize_dual_crl_trajectories_2d(start_xy, gc_final_xy, ep_final_xy, gc_pr
             hoverinfo='skip'
         ), row=row, col=col)
         
-        # Line from EP final state to EP proposed goal
-        fig.add_trace(go.Scatter(
-            x=[ep_final_xy[i, 0], ep_proposed_goals_xy[i, 0]],
-            y=[ep_final_xy[i, 1], ep_proposed_goals_xy[i, 1]],
-            mode='lines',
-            line=dict(color='red', width=1.5, dash='dash'),
-            opacity=0.6,
-            showlegend=(i == 0),
-            name='EP Goal' if i == 0 else '',
-            hoverinfo='skip'
-        ), row=row, col=col)
+        # Line from EP final state to EP proposed goal (only if EP goals are non-zero)
+        if np.any(ep_proposed_goals_xy[i] != 0):
+            fig.add_trace(go.Scatter(
+                x=[ep_final_xy[i, 0], ep_proposed_goals_xy[i, 0]],
+                y=[ep_final_xy[i, 1], ep_proposed_goals_xy[i, 1]],
+                mode='lines',
+                line=dict(color='red', width=1.5, dash='dash'),
+                opacity=0.6,
+                showlegend=(i == 0),
+                name='EP Goal' if i == 0 else '',
+                hoverinfo='skip'
+            ), row=row, col=col)
         
         # GC intermediate states as markers
         if len(gc_intermediate) > 0:

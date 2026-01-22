@@ -193,7 +193,7 @@ class GoExploreSAC:
     
     # Critic ensemble for Q-epistemic goal proposal (GCP only)
     use_gcp_critic_ensemble: bool = False
-    gcp_num_critic_ensemble: int = 1
+    gcp_num_critic_ensemble: int = 5
     
     # EP reward computation
     ep_reward_name: str = "placeholder"  # Will be used to compute rewards from trajectories
@@ -425,8 +425,8 @@ class GoExploreSAC:
             },
         )
         
-        # EP transition (no goals)
-        dummy_ep_obs = jnp.zeros((ep_obs_size,))
+        # EP transition (no goals, but pad with zeros to match obs_size)
+        dummy_ep_obs = jnp.concatenate([jnp.zeros((ep_obs_size,)), jnp.zeros((goal_size,))], axis=0)  # (obs_size,)
         dummy_ep_transition = Transition(
             observation=dummy_ep_obs,
             action=dummy_action,
@@ -559,13 +559,17 @@ class GoExploreSAC:
         # Actor step functions
         def deterministic_actor_step_with_proposals(actor_state, env, env_state, proposed_goals, extra_fields):
             """Deterministic actor step for GCP with proposed goals."""
+            # Overwrite goals in observation
+            new_obs = env_state.obs.at[:, -len(env.goal_indices):].set(proposed_goals)
+            env_state = env_state.replace(obs=new_obs)
+
             means, _ = gcp_actor.apply(actor_state.params, env_state.obs)
             actions = nn.tanh(means)
 
             nstate = env.step(env_state, actions)
             state_extras = {x: nstate.info[x] for x in extra_fields}
             return nstate, Transition(
-                observation=env_state.obs,
+                observation=new_obs,
                 action=actions,
                 reward=nstate.reward,
                 discount=1 - nstate.done,
@@ -604,14 +608,18 @@ class GoExploreSAC:
                 unwrapped_env
             )
             
+            # Pad observation with zeros to match obs_size (for replay buffer consistency)
+            obs_padded = jnp.concatenate([state_only, jnp.zeros((state_only.shape[0], goal_size))], axis=-1)  # (batch_size, obs_size)
+            next_obs_padded = jnp.concatenate([next_state_only, jnp.zeros((next_state_only.shape[0], goal_size))], axis=-1)  # (batch_size, obs_size)
+            
             return nstate, Transition(
-                observation=state_only,
+                observation=obs_padded,
                 action=actions,
                 reward=computed_reward,
                 discount=1 - nstate.done,
                 extras={
                     "state_extras": state_extras,
-                    "next_observation": next_state_only,
+                    "next_observation": next_obs_padded,
                 },
             )
 
@@ -1102,8 +1110,137 @@ class GoExploreSAC:
             )
             return training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, metrics, collected_transitions
         
-        # Visualization and training loop (similar to go_explore_crl)
-        # TODO: Add visualization function for go_explore_sac
+        def visualize_goals(train_env, transitions, wandb_key):
+            """Visualize trajectories and goals for go_explore_sac.
+            Note: EP does not have goals, so we only visualize GC goals."""
+            # Shape is (episode_len-1, batch_size, ...) since we only keep the last training step's batch
+            obs = np.array(transitions.observation)  # (episode_len-1, batch_size, obs_dim)
+            last_traj_state = np.array(transitions.extras["last_traj_state"][:, :, :state_size])  # (episode_len-1, batch_size, state_size)
+            last_traj_state_flat = last_traj_state.reshape(-1, state_size)
+            intermediate_traj = np.array(transitions.extras["intermediate_traj"])  # (episode_len-1, batch_size, num_intermediate_states, obs_dim)
+            
+            obs_flat = obs.reshape(-1, obs.shape[-1])  # (total_samples, obs_dim)
+            
+            # Extract GC and EP specific data
+            in_gc_phase = np.array(transitions.extras["state_extras"]["in_gc_phase"])  # (episode_len-1, batch_size)
+            in_ep_phase = np.array(transitions.extras["state_extras"]["in_ep_phase"])  # (episode_len-1, batch_size)
+            gc_proposed_goals = np.array(transitions.extras["state_extras"]["gc_proposed_goals"])  # (episode_len-1, batch_size, goal_dim)
+            traj_ids = np.array(transitions.extras["state_extras"]["traj_id"])  # (episode_len-1, batch_size)
+            
+            in_gc_phase_flat = in_gc_phase.reshape(-1)
+            in_ep_phase_flat = in_ep_phase.reshape(-1)
+            gc_proposed_goals_flat = gc_proposed_goals.reshape(-1, len(train_env.goal_indices))
+            traj_ids_flat = traj_ids.reshape(-1)
+            
+            intermediate_traj_flat = intermediate_traj.reshape(-1, intermediate_traj.shape[-2], intermediate_traj.shape[-1])
+            
+            # Extract GC and EP final states for each trajectory
+            gc_final_states = []
+            ep_final_states = []
+            start_states = []
+            gc_goals = []
+            gc_intermediate_states_list = []
+            ep_intermediate_states_list = []
+            
+            unique_traj_ids = np.unique(traj_ids_flat)
+            
+            for traj_id in unique_traj_ids:
+                traj_mask = traj_ids_flat == traj_id
+                traj_indices = np.sort(np.where(traj_mask)[0])
+                
+                start_state = obs_flat[traj_indices[0]][train_env.goal_indices]
+                start_states.append(start_state)
+                
+                # Find last GC phase transition
+                gc_mask = in_gc_phase_flat[traj_indices] > 0.5
+                gc_indices = traj_indices[gc_mask]
+                if len(gc_indices) > 0:
+                    gc_final_idx = gc_indices[-1]
+                    gc_final_state = obs_flat[gc_final_idx][train_env.goal_indices]
+                    gc_goal = gc_proposed_goals_flat[gc_final_idx]
+                    gc_final_states.append(gc_final_state)
+                    gc_goals.append(gc_goal)
+                
+                # Find last EP phase transition
+                ep_mask = in_ep_phase_flat[traj_indices] > 0.5
+                ep_indices = traj_indices[ep_mask]
+                if len(ep_indices) > 0:
+                    ep_final_idx = ep_indices[-1]
+                    ep_final_state = obs_flat[ep_final_idx][train_env.goal_indices]
+                    ep_final_states.append(ep_final_state)
+                
+                # Get intermediate states
+                first_transition_intermediates = intermediate_traj_flat[traj_indices[0], :, train_env.goal_indices]
+                num_gc_steps = np.sum(in_gc_phase_flat[traj_indices] > 0.5)
+                num_ep_steps = np.sum(in_ep_phase_flat[traj_indices] > 0.5)
+                total_steps = len(traj_indices)
+                
+                num_intermediate = first_transition_intermediates.shape[0]
+                if total_steps > 0:
+                    gc_intermediate_count = int(num_intermediate * num_gc_steps / total_steps)
+                else:
+                    gc_intermediate_count = num_intermediate // 2
+                gc_intermediate = first_transition_intermediates[:gc_intermediate_count]
+                ep_intermediate = first_transition_intermediates[gc_intermediate_count:]
+                
+                gc_intermediate_states_list.append(gc_intermediate)
+                ep_intermediate_states_list.append(ep_intermediate)
+            
+            # Convert to numpy arrays
+            start_states = np.array(start_states)
+            gc_final_states = np.array(gc_final_states)
+            ep_final_states = np.array(ep_final_states)
+            gc_goals = np.array(gc_goals)
+            
+            goal_dim = len(train_env.goal_indices)
+            if start_states.ndim == 1:
+                start_states = start_states.reshape(-1, goal_dim)
+            if gc_final_states.ndim == 1:
+                gc_final_states = gc_final_states.reshape(-1, goal_dim)
+            if ep_final_states.ndim == 1:
+                ep_final_states = ep_final_states.reshape(-1, goal_dim)
+            if gc_goals.ndim == 1:
+                gc_goals = gc_goals.reshape(-1, goal_dim)
+            
+            # Sample exactly 4 trajectories for 2x2 grid visualization
+            num_trajs = start_states.shape[0]
+            num_viz_trajs = min(4, num_trajs)
+            sample_indices = np.random.choice(num_trajs, num_viz_trajs, replace=False)
+            
+            start_xy = start_states[sample_indices]
+            gc_final_xy = gc_final_states[sample_indices]
+            ep_final_xy = ep_final_states[sample_indices]
+            gc_proposed_goals_xy = gc_goals[sample_indices]
+            
+            # Extract GC and EP intermediate states for sampled trajectories
+            gc_intermediate_xy_list = [gc_intermediate_states_list[i] for i in sample_indices]
+            ep_intermediate_xy_list = [ep_intermediate_states_list[i] for i in sample_indices]
+            
+            # Visualize trajectories (without EP goals - pass zeros as placeholder)
+            ep_proposed_goals_xy_placeholder = np.zeros_like(gc_proposed_goals_xy)  # Placeholder, won't be plotted
+            visualize_dual_crl_trajectories_2d(
+                start_xy, gc_final_xy, ep_final_xy, gc_proposed_goals_xy, ep_proposed_goals_xy_placeholder,
+                gc_intermediate_xy_list, ep_intermediate_xy_list, f"{wandb_key}/dual_crl_trajectories",
+                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
+            )
+            
+            # Heatmaps (no EP goal proposals heatmap)
+            visualize_kde_heatmap(
+                gc_final_states, "GC Final States", f"{wandb_key}/gc_final_states_heatmap",
+                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
+            )
+            
+            visualize_kde_heatmap(
+                ep_final_states, "EP Final States", f"{wandb_key}/ep_final_states_heatmap",
+                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
+            )
+            
+            visualize_kde_heatmap(
+                gc_goals, "GC Goal Proposals", f"{wandb_key}/gc_goal_proposals_heatmap",
+                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
+            )
+            
+            logging.info(f"Plotted visualizations at env step {training_state.env_steps.item()}")
         
         key, prefill_key = jax.random.split(key, 2)
 
@@ -1129,6 +1266,29 @@ class GoExploreSAC:
             training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, metrics, collected_transitions = training_epoch(
                 training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, epoch_key
             )
+
+            # Process collected_transitions for visualization
+            @jax.jit
+            def process_for_viz(transitions, batch_keys):
+                # Process transitions through flatten_batch (vmap over environments)
+                processed = jax.vmap(flatten_batch, in_axes=(None, 1, 0))(
+                    (self.discounting, state_size, tuple(train_env.goal_indices)),
+                    transitions,
+                    batch_keys,
+                )
+                # processed now has shape (num_envs, episode_length-1, obs_dim)
+                # Reshape to (episode_length-1, num_envs, ...) for visualization
+                processed = jax.tree_util.tree_map(
+                    lambda x: jnp.transpose(x, (1, 0) + tuple(range(2, len(x.shape)))),
+                    processed
+                )
+                return processed
+            
+            viz_key = jax.random.PRNGKey(0)
+            num_envs = collected_transitions.observation.shape[1]
+            viz_batch_keys = jax.random.split(viz_key, num_envs)
+            processed_transitions = process_for_viz(collected_transitions, viz_batch_keys)
+            visualize_goals(train_env, processed_transitions, wandb_key="training")
 
             training_walltime += time.time() - t
 
