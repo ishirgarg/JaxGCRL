@@ -38,6 +38,7 @@ from .proposers import (
     MaxWaypointRatioOneEnvProposer,
     QEpistemicProposer,
 )
+from .goals_utils import compute_min_critic_mean_reward
 from brax.training.agents.sac import networks as sac_networks
 
 Metrics = types.Metrics
@@ -136,11 +137,17 @@ def compute_ep_reward(reward_name: str, transitions: Transition, env) -> jnp.nda
     Returns:
         rewards: (batch_size,) array of computed rewards
     """
-    # TODO: Implement different reward functions based on reward_name
-    # For now, return zero rewards as placeholder
-    # This will be implemented later based on the reward_name flag
     batch_size = transitions.observation.shape[0]
-    return jnp.zeros((batch_size,))
+    
+    if reward_name == "mean_max_critic":
+        # mean_max_critic reward needs the full trajectory to compute,
+        # so return zeros here. It will be computed after the rollout is complete.
+        return jnp.zeros((batch_size,))
+    elif reward_name == "placeholder":
+        # Placeholder: return zero rewards
+        return jnp.zeros((batch_size,))
+    else:
+        raise ValueError(f"Unknown reward_name: {reward_name}")
 
 
 def save_params(path: str, params: Any):
@@ -660,9 +667,9 @@ class GoExploreSAC:
             ep_actor_loss_fn, ep_policy_optimizer, pmap_axis_name=None
         )
 
-        @jax.jit
+        @functools.partial(jax.jit, static_argnames=("ep_reward_name",))
         def get_experience(gcp_actor_state, ep_actor_state, env_state, training_state, 
-                          main_buffer_state, gcp_buffer_state, ep_buffer_state, key):
+                          main_buffer_state, gcp_buffer_state, ep_buffer_state, key, ep_reward_name):
             """Collect experience with two sequential rollouts.
             
             First: GC policy (deterministic) for num_goal_conditioned_steps
@@ -764,6 +771,42 @@ class GoExploreSAC:
                 length=num_exploratory_steps
             )
             
+            # ===== COMPUTE MEAN_MAX_CRITIC REWARD FOR EP TRANSITIONS =====
+            # Compute reward: mean over (s,a) of max_g f(s, a, g) for each environment
+            if ep_reward_name == "mean_max_critic" and hasattr(train_env, 'possible_goals') and train_env.possible_goals is not None:
+                # Extract states and actions from EP transitions
+                # ep_transitions shape: (num_exploratory_steps, num_envs, ...)
+                ep_states = ep_transitions.observation[:, :, :state_size]  # (num_exploratory_steps, num_envs, state_dim)
+                ep_actions = ep_transitions.action  # (num_exploratory_steps, num_envs, action_dim)
+                env_goals = train_env.possible_goals  # (num_env_goals, goal_dim)
+                
+                # Compute reward for each environment's trajectory
+                def compute_reward_for_env(env_idx):
+                    """Compute min_critic_mean reward for a single environment's EP trajectory."""
+                    env_states = ep_states[:, env_idx, :]  # (num_exploratory_steps, state_dim)
+                    env_actions = ep_actions[:, env_idx, :]  # (num_exploratory_steps, action_dim)
+                    
+                    reward = compute_min_critic_mean_reward(
+                        env_states, env_actions, env_goals,
+                        gcp_actor, training_state.gcp_actor_state.params,
+                        training_state.gcp_critic_state.params,
+                        gcp_sa_encoder, gcp_g_encoder, self.energy_fn
+                    )
+                    return reward
+                
+                # Compute reward for all environments
+                min_critic_mean_rewards = jax.vmap(compute_reward_for_env)(jnp.arange(num_envs))  # (num_envs,)
+                
+                # Add reward to each transition in the EP trajectory
+                # Broadcast reward to all time steps for each environment
+                reward_broadcast = min_critic_mean_rewards[None, :]  # (1, num_envs)
+                reward_broadcast = jnp.broadcast_to(reward_broadcast, (num_exploratory_steps, num_envs))  # (num_exploratory_steps, num_envs)
+                
+                # Add to existing reward
+                ep_transitions = ep_transitions._replace(
+                    reward=ep_transitions.reward + reward_broadcast
+            )
+            
             # Combine transitions
             combined_transitions = jax.tree_util.tree_map(
                 lambda gc, ep: jnp.concatenate([gc, ep], axis=0),
@@ -797,6 +840,7 @@ class GoExploreSAC:
                     gcp_buffer_state,
                     ep_buffer_state,
                     key,
+                    self.ep_reward_name
                 )
                 
                 reset_keys = jax.random.split(reset_key, config.num_envs)
@@ -987,6 +1031,7 @@ class GoExploreSAC:
                 gcp_buffer_state,
                 ep_buffer_state,
                 experience_key1,
+                self.ep_reward_name
             )
             
             reset_keys = jax.random.split(reset_key, config.num_envs)

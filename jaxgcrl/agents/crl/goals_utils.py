@@ -321,6 +321,64 @@ def compute_energy_for_state_goal_pairs(
     return energies
 
 
+def compute_min_critic_mean_reward(
+    states, actions, env_goals, actor, actor_params, critic_params,
+    sa_encoder, g_encoder, energy_fn_name
+):
+    """Compute min_critic_mean reward: mean over (s,a) of max_g f(s, a, g).
+    
+    For each (s, a) in the exploratory trajectory, computes f(s, a, g) for all
+    environment goals g using the GCP critic, takes the max over g, then takes
+    the mean over all (s, a) pairs.
+    
+    Args:
+        states: (num_transitions, state_dim) state vectors from exploratory trajectory
+        actions: (num_transitions, action_dim) action vectors from exploratory trajectory
+        env_goals: (num_env_goals, goal_dim) environment goals
+        actor: Actor network (GCP actor)
+        actor_params: Actor parameters (GCP actor)
+        critic_params: Critic parameters (GCP critic, can be single or ensemble)
+        sa_encoder: State-action encoder network (GCP)
+        g_encoder: Goal encoder network (GCP)
+        energy_fn_name: Name of energy function
+        
+    Returns:
+        reward: Scalar reward value (mean of max critic values)
+    """
+    num_transitions = states.shape[0]
+    num_env_goals = env_goals.shape[0]
+    
+    # Handle ensemble vs single critic
+    
+    # Single critic case
+    def compute_max_critic_for_sa(state, action):
+        """For a single (s, a), compute max_g f(s, a, g)."""
+        # Expand (s, a) to match number of env goals
+        state_expanded = jnp.tile(state, (num_env_goals, 1))  # (num_env_goals, state_dim)
+        action_expanded = jnp.tile(action, (num_env_goals, 1))  # (num_env_goals, action_dim)
+        
+        # Compute Q-values for all (s, a, g) pairs
+        sa_pairs = jnp.concatenate([state_expanded, action_expanded], axis=1)  # (num_env_goals, state_dim + action_dim)
+        
+        # Compute Q-values
+        phi_sa = sa_encoder.apply(critic_params['sa_encoder'], sa_pairs)
+        psi_g = g_encoder.apply(critic_params['g_encoder'], env_goals)
+        q_values = energy_fn(energy_fn_name, phi_sa, psi_g)  # (num_env_goals,)
+        
+        # Take max over env goals
+        max_q = jnp.max(q_values)  # Scalar
+        
+        return max_q
+    
+    # Compute max critic value for each (s, a) pair
+    max_critic_values = jax.vmap(compute_max_critic_for_sa)(states, actions)  # (num_transitions,)
+    
+    # Take mean over all (s, a) pairs
+    reward = jnp.mean(max_critic_values)  # Scalar
+    
+    return reward
+
+
 # ============================================================================
 # Visualization Utilities
 # ============================================================================
