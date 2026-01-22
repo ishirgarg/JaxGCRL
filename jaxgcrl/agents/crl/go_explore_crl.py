@@ -539,7 +539,23 @@ class GoExploreCRL:
         else:
             raise ValueError(f"Unknown ep_goal_proposer_name: {self.ep_goal_proposer_name}")
 
-        def deterministic_actor_step(actor_state, env, env_state, proposed_goals, extra_fields):
+        # Used for evaluation
+        def deterministic_actor_step(training_state, env, env_state, extra_fields):
+            means, _ = gcp_actor.apply(training_state.gcp_actor_state.params, env_state.obs)
+            actions = nn.tanh(means)
+
+            nstate = env.step(env_state, actions)
+            state_extras = {x: nstate.info[x] for x in extra_fields}
+
+            return nstate, Transition(
+                observation=env_state.obs,
+                action=actions,
+                reward=nstate.reward,
+                discount=1 - nstate.done,
+                extras={"state_extras": state_extras},
+            )
+
+        def deterministic_actor_step_with_proposals(actor_state, env, env_state, proposed_goals, extra_fields):
             new_obs = env_state.obs.at[:, -len(env.goal_indices):].set(proposed_goals)
             env_state = env_state.replace(obs=new_obs)
 
@@ -679,7 +695,7 @@ class GoExploreCRL:
                 gc_proposed_goals = env_state.info.get("gc_proposed_goals", env_state.obs[:, -len(train_env.goal_indices):])
                 
                 # Use deterministic actor step
-                nstate, transition = deterministic_actor_step(
+                nstate, transition = deterministic_actor_step_with_proposals(
                     gcp_actor_state, train_env, env_state, gc_proposed_goals, ("truncation", "traj_id")
                 )
                 
