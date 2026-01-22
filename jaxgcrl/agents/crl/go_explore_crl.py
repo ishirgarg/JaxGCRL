@@ -317,8 +317,13 @@ class GoExploreCRL:
         env_state = jax.jit(train_env.reset)(env_keys)
         train_env.step = jax.jit(train_env.step)
         
-        # Initialize info dict (proposed goals will be set by goal proposers in get_experience)
+        # Assign unique trajectory IDs per environment (environment index * large_number)
+        # This ensures each environment has a different trajectory ID even if they reset together
+        # Use a large multiplier so increments from episode endings don't cause collisions
+        TRAJ_ID_MULTIPLIER = 100000
+        env_indices = jnp.arange(config.num_envs, dtype=jnp.int32)
         initial_info = dict(env_state.info)
+        initial_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
         env_state = env_state.replace(info=initial_info)
 
         # Dimensions definitions and sanity checks
@@ -948,8 +953,13 @@ class GoExploreCRL:
                 # Reset environments after collecting experience
                 reset_keys = jax.random.split(reset_key, config.num_envs)
                 env_state = jax.jit(train_env.reset)(reset_keys)
-                # Initialize info dict (proposed goals will be set by goal proposers in get_experience)
+                # Assign unique trajectory IDs per environment (environment index * large_number)
+                # This ensures each environment has a different trajectory ID even if they reset together
+                # Use a large multiplier so increments from episode endings don't cause collisions
+                TRAJ_ID_MULTIPLIER = 100000
+                env_indices = jnp.arange(config.num_envs, dtype=jnp.int32)
                 initial_info = dict(env_state.info)
+                initial_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
                 env_state = env_state.replace(info=initial_info)
                 
                 training_state = training_state.replace(
@@ -1093,8 +1103,13 @@ class GoExploreCRL:
             # Reset environments after collecting experience
             reset_keys = jax.random.split(reset_key, config.num_envs)
             env_state = jax.jit(train_env.reset)(reset_keys)
-            # Initialize info dict (proposed goals will be set by goal proposers in get_experience)
+            # Assign unique trajectory IDs per environment (environment index * large_number)
+            # This ensures each environment has a different trajectory ID even if they reset together
+            # Use a large multiplier so increments from episode endings don't cause collisions
+            TRAJ_ID_MULTIPLIER = 100000
+            env_indices = jnp.arange(config.num_envs, dtype=jnp.int32)
             initial_info = dict(env_state.info)
+            initial_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
             env_state = env_state.replace(info=initial_info)
 
             training_state = training_state.replace(
