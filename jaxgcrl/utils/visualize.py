@@ -167,10 +167,25 @@ def visualize_dual_crl_trajectories_2d(start_xy, gc_final_xy, ep_final_xy, gc_pr
         gc_intermediate = np.array(gc_intermediate_xy_list[i])  # (num_gc_intermediate, 2)
         ep_intermediate = np.array(ep_intermediate_xy_list[i])  # (num_ep_intermediate, 2)
         
-        # Ensure all arrays are 2D with shape (N, 2)
-        start_point = start_xy[i:i+1]  # (1, 2)
-        gc_final_point = gc_final_xy[i:i+1]  # (1, 2)
-        ep_final_point = ep_final_xy[i:i+1]  # (1, 2)
+        # Ensure all arrays are 2D with shape (N, 2) - extract single row and ensure 2D
+        start_point = start_xy[i:i+1] if start_xy.ndim == 2 else np.array([start_xy[i]])  # (1, 2)
+        gc_final_point = gc_final_xy[i:i+1] if gc_final_xy.ndim == 2 else np.array([gc_final_xy[i]])  # (1, 2)
+        ep_final_point = ep_final_xy[i:i+1] if ep_final_xy.ndim == 2 else np.array([ep_final_xy[i]])  # (1, 2)
+        
+        # Ensure intermediate arrays are 2D
+        if gc_intermediate.ndim == 1:
+            gc_intermediate = gc_intermediate.reshape(1, -1)
+        if ep_intermediate.ndim == 1:
+            ep_intermediate = ep_intermediate.reshape(1, -1)
+        
+        # Ensure all points have shape (N, 2) before vstacking
+        start_point = start_point.reshape(-1, 2)
+        gc_final_point = gc_final_point.reshape(-1, 2)
+        ep_final_point = ep_final_point.reshape(-1, 2)
+        if len(gc_intermediate) > 0:
+            gc_intermediate = gc_intermediate.reshape(-1, 2)
+        if len(ep_intermediate) > 0:
+            ep_intermediate = ep_intermediate.reshape(-1, 2)
         
         # Full trajectory line: start → GC intermediate → GC final → EP intermediate → EP final
         full_traj_points = [start_point]

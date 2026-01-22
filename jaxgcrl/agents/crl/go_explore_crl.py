@@ -1236,7 +1236,7 @@ class GoExploreCRL:
                 traj_indices = np.sort(np.where(traj_mask)[0])
                 
                 # Get start state goal coordinates (from observation, not state)
-                start_state = obs_flat[traj_indices[0], train_env.goal_indices]  # (len(goal_indices),)
+                start_state = obs_flat[traj_indices[0]][train_env.goal_indices]  # (len(goal_indices),)
                 start_states.append(start_state)
                 
                 # Find last GC phase transition (where in_gc_phase > 0.5)
@@ -1244,7 +1244,7 @@ class GoExploreCRL:
                 gc_indices = traj_indices[gc_mask]
                 if len(gc_indices) > 0:
                     gc_final_idx = gc_indices[-1]
-                    gc_final_state = obs_flat[gc_final_idx, train_env.goal_indices]  # (len(goal_indices),)
+                    gc_final_state = obs_flat[gc_final_idx][train_env.goal_indices]  # (len(goal_indices),)
                     gc_goal = gc_proposed_goals_flat[gc_final_idx]
                     gc_final_states.append(gc_final_state)
                     gc_goals.append(gc_goal)
@@ -1254,7 +1254,7 @@ class GoExploreCRL:
                 ep_indices = traj_indices[ep_mask]
                 if len(ep_indices) > 0:
                     ep_final_idx = ep_indices[-1]
-                    ep_final_state = obs_flat[ep_final_idx, train_env.goal_indices]  # (len(goal_indices),)
+                    ep_final_state = obs_flat[ep_final_idx][train_env.goal_indices]  # (len(goal_indices),)
                     ep_goal = ep_proposed_goals_flat[ep_final_idx]
                     ep_final_states.append(ep_final_state)
                     ep_goals.append(ep_goal)
@@ -1282,12 +1282,25 @@ class GoExploreCRL:
                 gc_intermediate_states_list.append(gc_intermediate)
                 ep_intermediate_states_list.append(ep_intermediate)
             
-            # Convert to numpy arrays
-            start_states = np.array(start_states) # (num_trajs, len(goal_indices))
-            gc_final_states = np.array(gc_final_states) # (num_trajs, len(goal_indices))
-            ep_final_states = np.array(ep_final_states) # (num_trajs, len(goal_indices))
-            gc_goals = np.array(gc_goals) # (num_trajs, len(goal_indices))
-            ep_goals = np.array(ep_goals) # (num_trajs, len(goal_indices))
+            # Convert to numpy arrays and ensure correct shape
+            start_states = np.array(start_states)
+            gc_final_states = np.array(gc_final_states)
+            ep_final_states = np.array(ep_final_states)
+            gc_goals = np.array(gc_goals)
+            ep_goals = np.array(ep_goals)
+            
+            # Ensure all arrays have shape (num_trajs, len(goal_indices))
+            goal_dim = len(train_env.goal_indices)
+            if start_states.ndim == 1:
+                start_states = start_states.reshape(-1, goal_dim)
+            if gc_final_states.ndim == 1:
+                gc_final_states = gc_final_states.reshape(-1, goal_dim)
+            if ep_final_states.ndim == 1:
+                ep_final_states = ep_final_states.reshape(-1, goal_dim)
+            if gc_goals.ndim == 1:
+                gc_goals = gc_goals.reshape(-1, goal_dim)
+            if ep_goals.ndim == 1:
+                ep_goals = ep_goals.reshape(-1, goal_dim)
             
             # Sample exactly 4 trajectories for 2x2 grid visualization
             num_trajs = start_states.shape[0]
