@@ -905,7 +905,7 @@ class GoExploreCRL:
                 training_state.env_steps
             )
             
-            return env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state
+            return env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, combined_transitions
 
         def prefill_replay_buffer(training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, key):
             @jax.jit
@@ -913,7 +913,7 @@ class GoExploreCRL:
                 del unused
                 training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, key = carry
                 key, reset_key, new_key = jax.random.split(key, 3)
-                env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state = get_experience(
+                env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, _ = get_experience(
                     training_state.gcp_actor_state,
                     training_state.ep_actor_state,
                     env_state,
@@ -1059,7 +1059,7 @@ class GoExploreCRL:
             experience_key1, reset_key, sampling_key, permute_key, training_key = jax.random.split(key, 5)
 
             # update buffer
-            env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state = get_experience(
+            env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, collected_transitions = get_experience(
                 training_state.gcp_actor_state,
                 training_state.ep_actor_state,
                 env_state,
@@ -1132,21 +1132,13 @@ class GoExploreCRL:
                 (gcp_last_batch, ep_last_batch)
             )
 
-            # Combine GCP and EP transitions into a single transition object
-            # Concatenate along the batch dimension (axis=1)
-            combined_last_batch = jax.tree_util.tree_map(
-                lambda gcp, ep: jnp.concatenate([gcp, ep], axis=1),
-                gcp_last_batch,
-                ep_last_batch
-            )
-
             return (
                 training_state,
                 env_state,
                 main_buffer_state,
                 gcp_buffer_state,
                 ep_buffer_state,
-                combined_last_batch
+                collected_transitions
             ), metrics
 
         @jax.jit
@@ -1169,22 +1161,22 @@ class GoExploreCRL:
                         mbs,
                         gcbs,
                         ebs,
-                        last_batch
+                        collected_transitions
                     ),
                     metrics,
                 ) = training_step(ts, es, mbs, gcbs, ebs, train_key)
-                # Keep last_batch in carry to avoid stacking all batches in memory
-                return (ts, es, mbs, gcbs, ebs, k, last_batch), metrics
+                # Keep collected_transitions in carry to avoid stacking all batches in memory
+                return (ts, es, mbs, gcbs, ebs, k, collected_transitions), metrics
 
-            # Run one step to get initial last_batch structure for carry
+            # Run one step to get initial structures for carry
             key, first_key = jax.random.split(key)
-            ((training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, init_batch), first_metrics) = training_step(
+            ((training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, init_collected), first_metrics) = training_step(
                 training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, first_key
             )
 
-            (training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, _, last_batch), rest_metrics = jax.lax.scan(
+            (training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, _, collected_transitions), rest_metrics = jax.lax.scan(
                 f,
-                (training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, key, init_batch),
+                (training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, key, init_collected),
                 (),
                 length=num_training_steps_per_epoch - 1,
             )
@@ -1195,7 +1187,7 @@ class GoExploreCRL:
                 first_metrics,
                 rest_metrics,
             )
-            return training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, metrics, last_batch
+            return training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, metrics, collected_transitions
         
         def visualize_goals(train_env, transitions, wandb_key):
             # Shape is now (episode_len-1, batch_size, ...) since we only keep the last training step's batch
@@ -1339,6 +1331,56 @@ class GoExploreCRL:
                 ep_goals, "EP Goal Proposals", f"{wandb_key}/ep_goal_proposals_heatmap",
                 x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
             )
+            
+            # 5. Debug: GC proposed goals extracted from observation states (sanity check)
+            # Extract goals from the last len(goal_indices) entries of observations for GC phase transitions
+            # Only extract one goal per trajectory (from the first GC transition, since all GC transitions use the same goal)
+            # obs has shape (episode_len-1, batch_size, obs_dim), flatten to (total_samples, obs_dim)
+            obs_flat = obs.reshape(-1, obs.shape[-1])  # (total_samples, obs_dim)
+            gc_debug_goals = []
+            for traj_id in unique_traj_ids:
+                traj_mask = traj_ids_flat == traj_id
+                traj_indices = np.sort(np.where(traj_mask)[0])
+                
+                # Find GC phase transitions
+                gc_mask = in_gc_phase_flat[traj_indices] > 0.5
+                gc_indices = traj_indices[gc_mask]
+                if len(gc_indices) > 0:
+                    # Extract goal from the first GC transition (all GC transitions in a trajectory use the same goal)
+                    gc_first_idx = gc_indices[0]
+                    obs_goal = obs_flat[gc_first_idx, -len(train_env.goal_indices):]
+                    gc_debug_goals.append(obs_goal)
+            
+            if len(gc_debug_goals) > 0:
+                gc_debug_goals = np.array(gc_debug_goals)
+                visualize_kde_heatmap(
+                    gc_debug_goals, "GC Proposed Goals (Debug - from observations)", f"{wandb_key}/gc_goal_proposals_debug_heatmap",
+                    x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
+                )
+            
+            # 6. Debug: EP proposed goals extracted from observation states (sanity check)
+            # Extract goals from the last len(goal_indices) entries of observations for EP phase transitions
+            # Only extract one goal per trajectory (from the first EP transition, since all EP transitions use the same goal)
+            ep_debug_goals = []
+            for traj_id in unique_traj_ids:
+                traj_mask = traj_ids_flat == traj_id
+                traj_indices = np.sort(np.where(traj_mask)[0])
+                
+                # Find EP phase transitions
+                ep_mask = in_ep_phase_flat[traj_indices] > 0.5
+                ep_indices = traj_indices[ep_mask]
+                if len(ep_indices) > 0:
+                    # Extract goal from the first EP transition (all EP transitions in a trajectory use the same goal)
+                    ep_first_idx = ep_indices[0]
+                    obs_goal = obs_flat[ep_first_idx, -len(train_env.goal_indices):]
+                    ep_debug_goals.append(obs_goal)
+            
+            if len(ep_debug_goals) > 0:
+                ep_debug_goals = np.array(ep_debug_goals)
+                visualize_kde_heatmap(
+                    ep_debug_goals, "EP Proposed Goals (Debug - from observations)", f"{wandb_key}/ep_goal_proposals_debug_heatmap",
+                    x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
+                )
 
             logging.info(f"Plotted visualizations at env step {training_state.env_steps.item()}")
             
@@ -1364,11 +1406,31 @@ class GoExploreCRL:
 
             key, epoch_key = jax.random.split(key)
 
-            training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, metrics, last_batch = training_epoch(
+            training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, metrics, collected_transitions = training_epoch(
                 training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, epoch_key
             )
 
-            visualize_goals(train_env, last_batch, wandb_key="training")
+            # Process collected_transitions for visualization (similar to process_transitions in training_step)
+            # collected_transitions has shape (unroll_length, num_envs, ...)
+            # We need to process each trajectory through flatten_batch
+            viz_key = jax.random.PRNGKey(0)  # Use fixed key for deterministic visualization
+            num_envs = collected_transitions.observation.shape[1]
+            viz_batch_keys = jax.random.split(viz_key, num_envs)
+            
+            # Process transitions through flatten_batch (vmap over environments)
+            processed_transitions = jax.vmap(flatten_batch, in_axes=(None, 1, 0))(
+                (self.discounting, state_size, tuple(train_env.goal_indices)),
+                collected_transitions,
+                viz_batch_keys,
+            )
+            # processed_transitions now has shape (num_envs, episode_length-1, obs_dim)
+            # Reshape to (episode_length-1, num_envs, ...) for visualization
+            processed_transitions = jax.tree_util.tree_map(
+                lambda x: jnp.transpose(x, (1, 0) + tuple(range(2, len(x.shape)))),
+                processed_transitions
+            )
+            
+            visualize_goals(train_env, processed_transitions, wandb_key="training")
 
             metrics = jax.tree_util.tree_map(jnp.mean, metrics)
             metrics = jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
