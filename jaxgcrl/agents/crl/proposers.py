@@ -885,6 +885,11 @@ class QEpistemicProposer:
         
         num_candidates = candidate_goals.shape[0]
         
+        # Check if we have an ensemble
+        is_ensemble = isinstance(critic_params["sa_encoder"], list)
+        if not is_ensemble:
+            raise ValueError("QEpistemicProposer requires an ensemble of critics. Set use_gcp_critic_ensemble=True.")
+        
         # Stack ensemble parameters into arrays for JAX-compatible indexing
         stacked_sa_params, stacked_g_params = stack_ensemble_params(critic_params)
         

@@ -169,6 +169,18 @@ def stack_ensemble_params(critic_params):
         stacked_sa_params: Stacked sa_encoder parameters
         stacked_g_params: Stacked g_encoder parameters
     """
+    # Ensure we have the expected structure
+    if not isinstance(critic_params, dict):
+        raise ValueError(f"critic_params must be a dict, got {type(critic_params)}")
+    if 'sa_encoder' not in critic_params or 'g_encoder' not in critic_params:
+        raise ValueError(f"critic_params must have 'sa_encoder' and 'g_encoder' keys, got keys: {list(critic_params.keys())}")
+    if not isinstance(critic_params['sa_encoder'], list):
+        raise ValueError(f"critic_params['sa_encoder'] must be a list, got {type(critic_params['sa_encoder'])}")
+    if not isinstance(critic_params['g_encoder'], list):
+        raise ValueError(f"critic_params['g_encoder'] must be a list, got {type(critic_params['g_encoder'])}")
+    if len(critic_params['sa_encoder']) != len(critic_params['g_encoder']):
+        raise ValueError(f"sa_encoder and g_encoder lists must have same length, got {len(critic_params['sa_encoder'])} and {len(critic_params['g_encoder'])}")
+    
     stacked_sa_params = jax.tree_util.tree_map(
         lambda *xs: jnp.stack(xs, axis=0),
         *critic_params['sa_encoder']

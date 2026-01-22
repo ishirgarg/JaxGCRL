@@ -247,7 +247,7 @@ class GoExploreCRL:
     
     # Critic ensemble for Q-epistemic goal proposal
     use_gcp_critic_ensemble: bool = False
-    gcp_num_critic_ensemble: int = 1
+    gcp_num_critic_ensemble: int = 5
 
     def check_config(self, config):
         """

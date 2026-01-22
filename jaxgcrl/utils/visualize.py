@@ -157,8 +157,7 @@ def visualize_dual_crl_trajectories_2d(start_xy, gc_final_xy, ep_final_xy, gc_pr
         rows=2, cols=2,
         subplot_titles=('Trajectory 1', 'Trajectory 2', 'Trajectory 3', 'Trajectory 4'),
         horizontal_spacing=0.15,
-        vertical_spacing=0.15,
-        subplot_titles_font_size=14
+        vertical_spacing=0.15
     )
     
     # Helper function to plot a single trajectory in a subplot
