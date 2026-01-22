@@ -572,21 +572,46 @@ class GoExploreCRL:
         # and filtering them out when inserting into replay buffers, but still completing
         # the rollout for all environments.
 
-        # Debug logging callback
-        def debug_log(*args):
-            """Log debug message with values from JIT-compiled code."""
-            msg = args[0] if len(args) > 0 else "DEBUG"
-            values = args[1:] if len(args) > 1 else []
+        # Debug logging callback - message codes map to log messages
+        # Only accepts JAX arrays (message code as int, then values)
+        MESSAGE_CODES = {
+            0: "=== GET_EXPERIENCE START ===",
+            1: "=== GET_EXPERIENCE END ===",
+            2: "GC Goal Proposal",
+            3: "EP Goal Proposal",
+            4: "Starting GC Rollout",
+            5: "GC Rollout Complete",
+            6: "GC Rollout Step",
+            7: "Starting EP Rollout",
+            8: "EP Rollout Complete",
+            9: "EP Rollout Step",
+            10: "Trajectory Filtering",
+            11: "Buffer Insertion Complete",
+            12: "=== TRAINING STEP START ===",
+            13: "=== TRAINING STEP END ===",
+            14: "After Experience Collection",
+            15: "After Sampling Transitions",
+            16: "Before Policy Updates",
+            17: "After GC Policy Update",
+            18: "After EP Policy Update",
+            19: "=== UPDATE_NETWORKS START ===",
+            20: "=== UPDATE_NETWORKS END ===",
+        }
+        
+        def debug_log(msg_code, *values):
+            """Log debug message with values from JIT-compiled code.
+            msg_code: int array (scalar) - message code
+            values: JAX arrays to log
+            """
+            msg_code_int = int(np.array(msg_code))
+            msg = MESSAGE_CODES.get(msg_code_int, f"UNKNOWN MESSAGE CODE {msg_code_int}")
             logging.info(f"[JAX DEBUG] {msg}")
             for i, val in enumerate(values):
-                if isinstance(val, (jnp.ndarray, np.ndarray)):
-                    val_np = np.array(val)
-                    if val_np.size <= 10:
-                        logging.info(f"  Value {i}: shape={val_np.shape}, value={val_np}")
-                    else:
-                        logging.info(f"  Value {i}: shape={val_np.shape}, min={np.min(val_np):.4f}, max={np.max(val_np):.4f}, mean={np.mean(val_np):.4f}")
+                val_np = np.array(val)
+                if val_np.size <= 10:
+                    logging.info(f"  Value {i}: shape={val_np.shape}, value={val_np}")
                 else:
-                    logging.info(f"  Value {i}: {val}")
+                    logging.info(f"  Value {i}: shape={val_np.shape}, min={np.min(val_np):.4f}, max={np.max(val_np):.4f}, mean={np.mean(val_np):.4f}")
         
         @jax.jit
         def get_experience(gcp_actor_state, ep_actor_state, env_state, training_state, 
@@ -605,9 +630,8 @@ class GoExploreCRL:
             jax.experimental.io_callback(
                 debug_log,
                 None,
-                "=== GET_EXPERIENCE START ===",
-                training_state.env_steps,
-                jnp.sum(terminated_mask) if 'terminated_mask' in locals() else jnp.array(0)
+                jnp.array(0, dtype=jnp.int32),  # Message code 0
+                training_state.env_steps
             )
             
             # ===== FIRST ROLLOUT: Goal-Conditioned Policy (Deterministic) =====
@@ -621,7 +645,7 @@ class GoExploreCRL:
             jax.experimental.io_callback(
                 debug_log,
                 None,
-                "GC Goal Proposal",
+                jnp.array(2, dtype=jnp.int32),  # Message code 2
                 gc_proposed_goals,
                 jnp.mean(gc_proposed_goals, axis=0),
                 jnp.std(gc_proposed_goals, axis=0)
@@ -656,7 +680,7 @@ class GoExploreCRL:
                 jax.experimental.io_callback(
                     debug_log,
                     None,
-                    "GC Rollout Step",
+                    jnp.array(6, dtype=jnp.int32),  # Message code 6
                     jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],  # First 2 state dims
                     jnp.mean(gc_proposed_goals, axis=0),
                     jnp.sum(terminated),
@@ -702,8 +726,8 @@ class GoExploreCRL:
             jax.experimental.io_callback(
                 debug_log,
                 None,
-                "Starting GC Rollout",
-                num_goal_conditioned_steps,
+                jnp.array(4, dtype=jnp.int32),  # Message code 4
+                jnp.array(num_goal_conditioned_steps, dtype=jnp.int32),
                 jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2]
             )
             
@@ -719,10 +743,11 @@ class GoExploreCRL:
             jax.experimental.io_callback(
                 debug_log,
                 None,
-                "GC Rollout Complete",
+                jnp.array(5, dtype=jnp.int32),  # Message code 5
                 jnp.sum(terminated_mask),
                 jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],
-                gc_transitions.observation.shape,
+                jnp.array(gc_transitions.observation.shape[0], dtype=jnp.int32),  # num_steps
+                jnp.array(gc_transitions.observation.shape[1], dtype=jnp.int32),  # num_envs
                 jnp.mean(gc_transitions.reward)
             )
             
@@ -736,7 +761,7 @@ class GoExploreCRL:
             jax.experimental.io_callback(
                 debug_log,
                 None,
-                "EP Goal Proposal",
+                jnp.array(3, dtype=jnp.int32),  # Message code 3
                 ep_proposed_goals,
                 jnp.mean(ep_proposed_goals, axis=0),
                 jnp.std(ep_proposed_goals, axis=0)
@@ -775,7 +800,7 @@ class GoExploreCRL:
                 jax.experimental.io_callback(
                     debug_log,
                     None,
-                    "EP Rollout Step",
+                    jnp.array(9, dtype=jnp.int32),  # Message code 9
                     jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],  # First 2 state dims
                     jnp.mean(ep_proposed_goals, axis=0),
                     jnp.sum(terminated),
@@ -823,8 +848,8 @@ class GoExploreCRL:
             jax.experimental.io_callback(
                 debug_log,
                 None,
-                "Starting EP Rollout",
-                num_exploratory_steps,
+                jnp.array(7, dtype=jnp.int32),  # Message code 7
+                jnp.array(num_exploratory_steps, dtype=jnp.int32),
                 jnp.sum(terminated_mask),
                 jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2]
             )
@@ -841,10 +866,11 @@ class GoExploreCRL:
             jax.experimental.io_callback(
                 debug_log,
                 None,
-                "EP Rollout Complete",
+                jnp.array(8, dtype=jnp.int32),  # Message code 8
                 jnp.sum(terminated_mask),
                 jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],
-                ep_transitions.observation.shape,
+                jnp.array(ep_transitions.observation.shape[0], dtype=jnp.int32),  # num_steps
+                jnp.array(ep_transitions.observation.shape[1], dtype=jnp.int32),  # num_envs
                 jnp.mean(ep_transitions.reward)
             )
             
@@ -884,10 +910,10 @@ class GoExploreCRL:
             jax.experimental.io_callback(
                 debug_log,
                 None,
-                "Trajectory Filtering",
+                jnp.array(10, dtype=jnp.int32),  # Message code 10
                 jnp.sum(terminated_mask),
                 num_non_terminated,
-                num_envs
+                jnp.array(num_envs, dtype=jnp.int32)
             )
             
             # Filter transitions to only include non-terminated trajectories
@@ -956,7 +982,7 @@ class GoExploreCRL:
             jax.experimental.io_callback(
                 debug_log,
                 None,
-                "Buffer Insertion Complete",
+                jnp.array(11, dtype=jnp.int32),  # Message code 11
                 main_replay_buffer.size(main_buffer_state),
                 gcp_replay_buffer.size(gcp_buffer_state),
                 ep_replay_buffer.size(ep_buffer_state),
@@ -967,7 +993,7 @@ class GoExploreCRL:
             jax.experimental.io_callback(
                 debug_log,
                 None,
-                "=== GET_EXPERIENCE END ===",
+                jnp.array(1, dtype=jnp.int32),  # Message code 1
                 training_state.env_steps
             )
             
@@ -1006,12 +1032,18 @@ class GoExploreCRL:
             training_state, key = carry
             
             # Log update_networks start
+            gcp_shape_0 = jnp.array(gcp_transitions.observation.shape[0] if hasattr(gcp_transitions, 'observation') else 0, dtype=jnp.int32)
+            gcp_shape_1 = jnp.array(gcp_transitions.observation.shape[1] if hasattr(gcp_transitions, 'observation') and len(gcp_transitions.observation.shape) > 1 else 0, dtype=jnp.int32)
+            ep_shape_0 = jnp.array(ep_transitions.observation.shape[0] if hasattr(ep_transitions, 'observation') else 0, dtype=jnp.int32)
+            ep_shape_1 = jnp.array(ep_transitions.observation.shape[1] if hasattr(ep_transitions, 'observation') and len(ep_transitions.observation.shape) > 1 else 0, dtype=jnp.int32)
             jax.experimental.io_callback(
                 debug_log,
                 None,
-                "=== UPDATE_NETWORKS START ===",
-                gcp_transitions.observation.shape if hasattr(gcp_transitions, 'observation') else (0,),
-                ep_transitions.observation.shape if hasattr(ep_transitions, 'observation') else (0,)
+                jnp.array(19, dtype=jnp.int32),  # Message code 19
+                gcp_shape_0,
+                gcp_shape_1,
+                ep_shape_0,
+                ep_shape_1
             )
             
             key, gcp_critic_key, gcp_actor_key, ep_actor_key, ep_critic_key = jax.random.split(key, 5)
@@ -1061,6 +1093,15 @@ class GoExploreCRL:
                 metrics[f"ep_{key}"] = value
             for key, value in ep_critic_metrics.items():
                 metrics[f"ep_{key}"] = value
+            
+            # Log update_networks end
+            jax.experimental.io_callback(
+                debug_log,
+                None,
+                jnp.array(20, dtype=jnp.int32),  # Message code 20
+                training_state.gradient_steps,
+                jnp.array(len(metrics), dtype=jnp.int32)
+            )
 
             return (
                 training_state,
