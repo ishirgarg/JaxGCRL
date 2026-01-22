@@ -241,9 +241,13 @@ class GoExploreCRL:
     goal_proposer_name = "dual_crl"
 
     # Goal proposer names for go-explore style algorithms
-    gcp_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "ucgr", "maxwaypointratio_one_env"] = "gcp_final_rb"
+    gcp_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "ucgr", "maxwaypointratio_one_env", "q_epistemic"] = "gcp_final_rb"
     ep_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals"] = "ep_final_rb"
     goal_sampling_temperature: float = 1.0
+    
+    # Critic ensemble for Q-epistemic goal proposal
+    use_gcp_critic_ensemble: bool = False
+    gcp_num_critic_ensemble: int = 1
 
     def check_config(self, config):
         """
@@ -400,8 +404,18 @@ class GoExploreCRL:
             use_ln=self.use_ln,
         )
         
-        gcp_sa_encoder_params = gcp_sa_encoder.init(gcp_sa_key, np.ones([1, state_size + action_size]))
-        gcp_g_encoder_params = gcp_g_encoder.init(gcp_g_key, np.ones([1, goal_size]))
+        # Initialize GCP critic params - use ensemble if q_epistemic, otherwise single critic
+        if self.use_gcp_critic_ensemble:
+            # Initialize ensemble of critics with different random keys
+            gcp_sa_keys = jax.random.split(gcp_sa_key, self.gcp_num_critic_ensemble)
+            gcp_g_keys = jax.random.split(gcp_g_key, self.gcp_num_critic_ensemble)
+            gcp_sa_encoder_params = [gcp_sa_encoder.init(k, np.ones([1, state_size + action_size])) for k in gcp_sa_keys]
+            gcp_g_encoder_params = [gcp_g_encoder.init(k, np.ones([1, goal_size])) for k in gcp_g_keys]
+        else:
+            # Single critic
+            gcp_sa_encoder_params = gcp_sa_encoder.init(gcp_sa_key, np.ones([1, state_size + action_size]))
+            gcp_g_encoder_params = gcp_g_encoder.init(gcp_g_key, np.ones([1, goal_size]))
+        
         ep_sa_encoder_params = ep_sa_encoder.init(ep_sa_key, np.ones([1, state_size + action_size]))
         ep_g_encoder_params = ep_g_encoder.init(ep_g_key, np.ones([1, goal_size]))
         
@@ -508,6 +522,7 @@ class GoExploreCRL:
             RandomEnvironmentGoalProposer,
             UCGRProposer,
             MaxWaypointRatioOneEnvProposer,
+            QEpistemicProposer,
         )
         
         # Initialize goal proposer instances
@@ -518,6 +533,12 @@ class GoExploreCRL:
         maxwaypointratio_one_env_proposer = MaxWaypointRatioOneEnvProposer(
             energy_fn_name=self.energy_fn,
             goal_sampling_temperature=self.goal_sampling_temperature
+        )
+        q_epistemic_proposer = QEpistemicProposer(
+            energy_fn_name=self.energy_fn,
+            num_ensemble=self.gcp_num_critic_ensemble,
+            use_env_goals=False,
+            zero_center=False
         )
         
         # Create goal proposer functions that select the right buffer based on name
@@ -563,6 +584,16 @@ class GoExploreCRL:
             def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
                 # MaxWaypointRatioOneEnv uses EP buffer but GCP actor/critic
                 proposed_goals, updated_ep = maxwaypointratio_one_env_proposer.propose_goals(
+                    ep_replay_buffer, ep_buffer_state, env, env_state, key,
+                    gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
+                    gcp_sa_encoder, gcp_g_encoder, training_state
+                )
+                return proposed_goals, gcp_buffer_state, updated_ep
+        elif self.gcp_goal_proposer_name == "q_epistemic":
+            def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                # QEpistemic uses EP buffer but GCP actor/critic ensemble
+                # Note: requires use_gcp_critic_ensemble=True
+                proposed_goals, updated_ep = q_epistemic_proposer.propose_goals(
                     ep_replay_buffer, ep_buffer_state, env, env_state, key,
                     gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
                     gcp_sa_encoder, gcp_g_encoder, training_state

@@ -14,6 +14,9 @@ from jaxgcrl.agents.crl.goals_utils import (
     should_log_at_interval,
     create_goal_selection_plot,
     create_env_goal_ranking_plot,
+    stack_ensemble_params,
+    compute_q_values_ensemble,
+    create_2x2_scatter_plot,
 )
 from jaxgcrl.agents.crl.losses import energy_fn
 
@@ -125,9 +128,11 @@ class UCGRProposer:
     Attributes:
         energy_fn_name: Energy function to use ("dot" for inner product)
         num_samples: Number of (s, a) pairs to sample for MinLSE computation
+        LOG_INTERVAL_STEPS: Log visualizations every N environment steps
     """
     energy_fn_name: str = "dot"  # Energy function: f(s,a,g) = φ(s,a)^T ψ(g)
     num_samples: int = 256  # Number of (s, a) pairs to sample
+    LOG_INTERVAL_STEPS: int = 1000000  # Log visualizations every N environment steps
     
     def propose_goals(self, replay_buffer, buffer_state, env, env_state, key,
                      actor, actor_params, critic_params, sa_encoder, g_encoder, training_state=None):
@@ -150,7 +155,6 @@ class UCGRProposer:
             proposed_goals: (batch_size, goal_dim) array of proposed goals
             buffer_state: Updated buffer state
         """
-        
         batch_size = env_state.obs.shape[0]
         goal_indices = env.goal_indices
         state_size = env.state_dim
@@ -229,7 +233,80 @@ class UCGRProposer:
             axis=0,
         )
 
+        # Log UCGR statistics
+        env_steps = training_state.env_steps
+            
+        jax.experimental.io_callback(
+            UCGRProposer._log_ucgr_statistics,
+            None,
+            candidate_goals,
+            scores,
+            min_idx,
+            env.goal_indices,
+            env_steps,
+            self.LOG_INTERVAL_STEPS
+        )
+
         return proposed_goals, buffer_state
+    
+    @staticmethod
+    def _log_ucgr_statistics(candidate_goals, scores, min_idx, goal_indices, env_steps, log_interval_steps):
+        """Log UCGR goal selection statistics."""
+        # Only log if enough steps have passed since last log
+        if not should_log_at_interval(env_steps, log_interval_steps, 'ucgr'):
+            return
+        
+        # candidate_goals: (K, goal_dim) - already contains goal coordinates
+        # scores: (K,) MinLSE scores
+        # min_idx: index of selected goal
+        
+        # Create visualization
+        import matplotlib.pyplot as plt
+        from PIL import Image
+        import io
+        
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Plot all candidate goals colored by their scores
+        # candidate_goals already has shape (K, len(goal_indices))
+        scatter = ax.scatter(
+            candidate_goals[:, 0], candidate_goals[:, 1],
+            c=scores, cmap='viridis_r', s=150, alpha=0.7,
+            edgecolors='black', linewidths=0.5, label='Candidate Goals'
+        )
+        plt.colorbar(scatter, ax=ax, label='MinLSE Score (lower is better)')
+        
+        # Highlight the selected goal
+        selected_goal = candidate_goals[min_idx]
+        ax.scatter(
+            selected_goal[0], selected_goal[1],
+            s=300, marker='*', color='red', edgecolors='black',
+            linewidths=1.5, label='Selected Goal', zorder=10
+        )
+        
+        ax.set_xlabel('Goal X')
+        ax.set_ylabel('Goal Y')
+        ax.set_title(f'UCGR Goal Selection (Step {int(env_steps)})\n'
+                    f'Selected goal score: {float(scores[min_idx]):.4f}, '
+                    f'Min score: {float(jnp.min(scores)):.4f}, '
+                    f'Max score: {float(jnp.max(scores)):.4f}')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Convert to PIL Image
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+        pil_image = Image.open(buf)
+        pil_image.load()
+        buf.close()
+        plt.close(fig)
+        
+        metrics = {
+            'ucgr/goal_selection_viz': wandb.Image(pil_image),
+        }
+        
+        wandb.log(metrics, step=int(env_steps))
 
 
 @dataclass
@@ -740,3 +817,192 @@ class MaxWaypointRatioOneEnvProposer:
             proposed_goals = candidate_goals[best_g_indices]      # (batch, goal_dim)
 
         return proposed_goals, buffer_state
+
+
+@dataclass
+class QEpistemicProposer:
+    """Proposes goals by selecting those with highest epistemic uncertainty.
+    
+    Uses an ensemble of critics to estimate uncertainty. For each state in the batch:
+    1. Sample candidate goals from replay buffer final states or environment goals
+    2. For each (state, candidate_goal) pair, sample an action from the policy
+    3. Compute Q-values for the triplet (state, action, goal) across the ensemble
+    4. Select the goal with highest standard deviation across the ensemble
+    
+    This encourages exploration by selecting goals where the agent is most uncertain.
+    
+    Attributes:
+        energy_fn_name: Energy function name
+        num_ensemble: Number of critics in the ensemble
+        use_env_goals: If True, use environment goals; if False, use replay buffer final states
+        zero_center: If True, center each critic's predictions before computing std
+        LOG_INTERVAL_STEPS: Log visualizations every N environment steps
+    """
+    energy_fn_name: str
+    num_ensemble: int = 5
+    use_env_goals: bool = False
+    zero_center: bool = False
+    LOG_INTERVAL_STEPS: int = 1000000
+
+    def propose_goals(self, replay_buffer, buffer_state, env, env_state, key,
+                     actor, actor_params, critic_params, sa_encoder, g_encoder, training_state=None):
+        """Propose goals with highest epistemic uncertainty.
+        
+        Args:
+            replay_buffer: Replay buffer to sample from
+            buffer_state: Current buffer state
+            env: Training environment (must have goal_indices, state_dim attributes, and optionally possible_goals)
+            env_state: Current environment state
+            key: JAX random key
+            actor: Actor network
+            actor_params: Actor parameters
+            critic_params: Critic parameters (contains ensemble of sa_encoder and g_encoder params)
+            sa_encoder: State-action encoder network
+            g_encoder: Goal encoder network
+            training_state: Training state (for env_steps logging, optional)
+                
+        Returns:
+            proposed_goals: (batch_size, goal_dim) array of proposed goals
+            buffer_state: Updated buffer state
+        """
+        # Get current states from env_state
+        state_size = env.state_dim
+        current_states = env_state.obs[:, :state_size]  # (batch_size, state_dim)
+        batch_size = current_states.shape[0]
+        
+        # Get candidate goals based on configuration
+        if self.use_env_goals:
+            assert hasattr(env, 'possible_goals'), \
+                "Environment must have 'possible_goals' attribute for QEpistemicProposer with use_env_goals=True."
+            candidate_goals = env.possible_goals  # (num_candidate_goals, goal_size)
+        else:
+            # Sample from replay buffer final states
+            buffer_state, candidate_transitions = replay_buffer.sample(buffer_state)
+            traj_ids = candidate_transitions.extras["state_extras"]["traj_id"]
+            candidate_obs = candidate_transitions.observation
+            last_states = jax.vmap(get_last_state_from_trajectory)(candidate_obs, traj_ids)
+            candidate_goals = last_states[:, env.goal_indices]  # (num_candidates, goal_size)
+        
+        num_candidates = candidate_goals.shape[0]
+        
+        # Stack ensemble parameters into arrays for JAX-compatible indexing
+        stacked_sa_params, stacked_g_params = stack_ensemble_params(critic_params)
+        
+        def compute_q_values_for_state(state):
+            """For a single state, compute Q-values across ensemble for all candidate goals.
+            
+            Args:
+                state: (state_dim,) array
+                
+            Returns:
+                all_q_values: (num_ensemble, num_candidates) array of Q-values
+            """
+            # Expand state to match number of candidates
+            state_expanded = jnp.tile(state, (num_candidates, 1))  # (num_candidates, state_dim)
+            
+            # Compute Q-values using utility function
+            all_q_values = compute_q_values_ensemble(
+                state_expanded, candidate_goals, actor, actor_params,
+                stacked_sa_params, stacked_g_params, sa_encoder, g_encoder,
+                self.energy_fn_name, expand_goals=False
+            )  # (num_ensemble, num_candidates)
+            
+            return all_q_values
+        
+        # Compute Q-values for all states: (batch_size, num_ensemble, num_candidates)
+        all_ensemble_q_values = jax.vmap(compute_q_values_for_state)(current_states)
+        
+        # Optionally center each critic's predictions by subtracting its mean
+        if self.zero_center:
+            # Compute mean for each critic across all states and candidates
+            critic_means = jnp.mean(all_ensemble_q_values, axis=(0, 2), keepdims=True)  # (1, num_ensemble, 1)
+            # Subtract the mean from each critic's predictions to remove translational offset
+            q_values_for_std = all_ensemble_q_values - critic_means  # (batch_size, num_ensemble, num_candidates)
+        else:
+            q_values_for_std = all_ensemble_q_values
+        
+        # Compute standard deviation across ensemble for each (state, candidate) pair
+        all_q_stds = jnp.std(q_values_for_std, axis=1)  # (batch_size, num_candidates)
+        
+        # For each state, select the candidate goal with highest std
+        best_goal_indices = jnp.argmax(all_q_stds, axis=1)  # (batch_size,)
+        proposed_goals = candidate_goals[best_goal_indices]  # (batch_size, goal_size)
+        
+        # Log Q-epistemic statistics
+        if training_state is not None:
+            env_steps = training_state.env_steps
+        else:
+            env_steps = jnp.array(0)
+            
+        jax.experimental.io_callback(
+            QEpistemicProposer._log_q_epistemic_statistics,
+            None,
+            all_q_stds,
+            all_ensemble_q_values,  # Pass raw Q-values for deviation plotting
+            candidate_goals,
+            current_states,
+            env.goal_indices,
+            env_steps,
+            self.LOG_INTERVAL_STEPS
+        )
+        
+        return proposed_goals, buffer_state
+    
+    @staticmethod
+    def _log_q_epistemic_statistics(all_q_stds, all_ensemble_q_values, candidate_goals, current_states, goal_indices, env_steps, log_interval_steps):
+        """Log Q-epistemic uncertainty statistics."""
+        # Only log if enough steps have passed since last log
+        if not should_log_at_interval(env_steps, log_interval_steps, 'q_epistemic'):
+            return
+        
+        # all_q_stds: (batch_size, num_candidates)
+        # all_ensemble_q_values: (batch_size, num_ensemble, num_candidates)
+        max_stds_per_state = jnp.max(all_q_stds, axis=1)  # (batch_size,)
+        
+        metrics = {
+            'q_epistemic/max_std_mean': float(jnp.mean(max_stds_per_state)),
+            'q_epistemic/max_std_std': float(jnp.std(max_stds_per_state)),
+            'q_epistemic/max_std_max': float(jnp.max(max_stds_per_state)),
+            'q_epistemic/max_std_min': float(jnp.min(max_stds_per_state)),
+            'q_epistemic/mean_std_across_candidates': float(jnp.mean(all_q_stds)),
+        }
+        
+        # Compute overall mean across all critics, states, and candidates
+        # all_ensemble_q_values: (batch_size, num_ensemble, num_candidates)
+        overall_mean = jnp.mean(all_ensemble_q_values)  # scalar
+        
+        # For each critic, compute:
+        # 1. Mean absolute deviation from overall mean (scalar)
+        # 2. Mean of that critic's predictions (scalar)
+        # 3. Ratio of deviation to critic mean
+        num_ensemble = all_ensemble_q_values.shape[1]
+        
+        for critic_idx in range(num_ensemble):
+            critic_values = all_ensemble_q_values[:, critic_idx, :]  # (batch_size, num_candidates)
+            
+            # Mean absolute deviation from overall mean
+            deviation = jnp.mean(jnp.abs(critic_values - overall_mean))
+            
+            # Mean of this critic's predictions
+            critic_mean = jnp.mean(critic_values)
+            
+            # Ratio of deviation to critic mean
+            ratio = deviation / (jnp.abs(critic_mean) + 1e-8)  # Add small epsilon to avoid division by zero
+            
+            # Log as scalar metrics
+            metrics[f'q_epistemic/critic_{critic_idx}_deviation'] = float(deviation)
+            metrics[f'q_epistemic/critic_{critic_idx}_mean'] = float(critic_mean)
+            metrics[f'q_epistemic/critic_{critic_idx}_deviation_ratio'] = float(ratio)
+        
+        # Create visualization using shared utility
+        def title_fn(state_idx, max_val, selected_val):
+            max_std_idx = int(np.argmax(all_q_stds[state_idx]))
+            return f'State {state_idx}: Max Q-Std = {max_val:.4f} (Goal {max_std_idx})'
+        
+        pil_image = create_2x2_scatter_plot(
+            candidate_goals, current_states, goal_indices, all_q_stds,
+            title_fn=title_fn, cmap='hot', color_label='Q-Std'
+        )
+        metrics['q_epistemic/q_std_heatmaps'] = wandb.Image(pil_image)
+        
+        wandb.log(metrics, step=int(env_steps))
