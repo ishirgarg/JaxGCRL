@@ -433,6 +433,7 @@ class GoExploreCRL:
         # Replay Buffer
         dummy_obs = jnp.zeros((obs_size,))
         dummy_action = jnp.zeros((action_size,))
+        dummy_goal = jnp.zeros((goal_size,))
 
         dummy_transition = Transition(
             observation=dummy_obs,
@@ -444,6 +445,11 @@ class GoExploreCRL:
                     "truncation": 0.0,
                     "traj_id": 0.0,
                     "was_proposed_goal_mask": 0.0,
+                    "in_gc_phase": 0.0,
+                    "in_ep_phase": 0.0,
+                    "gc_proposed_goals": dummy_goal,
+                    "ep_proposed_goals": dummy_goal,
+                    "terminated": 0.0,
                 }
             },
         )
