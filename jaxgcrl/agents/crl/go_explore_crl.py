@@ -1189,7 +1189,7 @@ class GoExploreCRL:
             )
             return training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, metrics, last_batch
         
-        def visualize_goals(train_env, transitions, actor_state, critic_state, sa_encoder, g_encoder, energy_fn, num_samples, wandb_key):
+        def visualize_goals(train_env, transitions, wandb_key):
             # Shape is now (episode_len-1, batch_size, ...) since we only keep the last training step's batch
             obs = transitions.observation # (episode_len-1, batch_size, obs_dim)
             last_traj_state = transitions.extras["last_traj_state"][:, :, :state_size] # (episode_len-1, batch_size, state_size)
@@ -1357,7 +1357,7 @@ class GoExploreCRL:
                 training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, epoch_key
             )
 
-            visualize_goals(train_env, last_batch, training_state.actor_state, training_state.critic_state, sa_encoder, g_encoder, self.energy_fn, num_samples=5, wandb_key="training")
+            visualize_goals(train_env, last_batch, wandb_key="training")
 
             metrics = jax.tree_util.tree_map(jnp.mean, metrics)
             metrics = jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
