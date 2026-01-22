@@ -1413,22 +1413,28 @@ class GoExploreCRL:
             # Process collected_transitions for visualization (similar to process_transitions in training_step)
             # collected_transitions has shape (unroll_length, num_envs, ...)
             # We need to process each trajectory through flatten_batch
+            # Wrap in JIT to handle static arguments properly
+            @jax.jit
+            def process_for_viz(transitions, batch_keys):
+                # Process transitions through flatten_batch (vmap over environments)
+                processed = jax.vmap(flatten_batch, in_axes=(None, 1, 0))(
+                    (self.discounting, state_size, tuple(train_env.goal_indices)),
+                    transitions,
+                    batch_keys,
+                )
+                # processed now has shape (num_envs, episode_length-1, obs_dim)
+                # Reshape to (episode_length-1, num_envs, ...) for visualization
+                processed = jax.tree_util.tree_map(
+                    lambda x: jnp.transpose(x, (1, 0) + tuple(range(2, len(x.shape)))),
+                    processed
+                )
+                return processed
+            
             viz_key = jax.random.PRNGKey(0)  # Use fixed key for deterministic visualization
             num_envs = collected_transitions.observation.shape[1]
             viz_batch_keys = jax.random.split(viz_key, num_envs)
             
-            # Process transitions through flatten_batch (vmap over environments)
-            processed_transitions = jax.vmap(flatten_batch, in_axes=(None, 1, 0))(
-                (self.discounting, state_size, tuple(train_env.goal_indices)),
-                collected_transitions,
-                viz_batch_keys,
-            )
-            # processed_transitions now has shape (num_envs, episode_length-1, obs_dim)
-            # Reshape to (episode_length-1, num_envs, ...) for visualization
-            processed_transitions = jax.tree_util.tree_map(
-                lambda x: jnp.transpose(x, (1, 0) + tuple(range(2, len(x.shape)))),
-                processed_transitions
-            )
+            processed_transitions = process_for_viz(collected_transitions, viz_batch_keys)
             
             visualize_goals(train_env, processed_transitions, wandb_key="training")
 
