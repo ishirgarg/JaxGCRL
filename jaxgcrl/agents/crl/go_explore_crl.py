@@ -1227,7 +1227,8 @@ class GoExploreCRL:
             start_states = []
             gc_goals = []
             ep_goals = []
-            intermediate_states_list = []
+            gc_intermediate_states_list = []
+            ep_intermediate_states_list = []
             
             for traj_id in unique_traj_ids:
                 traj_mask = traj_ids_flat == traj_id
@@ -1257,31 +1258,28 @@ class GoExploreCRL:
                     ep_final_states.append(ep_final_state)
                     ep_goals.append(ep_goal)
                 
-                # Get intermediate states for this trajectory
-                # The intermediate states are computed from the first transition and span the full trajectory
-                # We need to determine which intermediate states belong to GC vs EP phase
+                # Get intermediate states for this trajectory (from first transition)
+                # Use the intermediate states directly from the first transition in the trajectory
                 first_transition_intermediates = intermediate_traj_flat[traj_indices[0], :, train_env.goal_indices]  # (num_intermediate, 2)
                 
-                # The intermediate states correspond to future states in the trajectory
-                # We need to map them back to actual trajectory indices to check their phase
-                # Since get_intermediate_trajectory_states samples evenly across future trajectory,
-                # we can approximate by checking phases at corresponding positions
-                # For simplicity, we'll split based on the ratio of GC to EP steps in this trajectory
+                # Determine which intermediate states belong to GC vs EP phase
+                # Count GC and EP steps in this trajectory
                 num_gc_steps = np.sum(in_gc_phase_flat[traj_indices] > 0.5)
                 num_ep_steps = np.sum(in_ep_phase_flat[traj_indices] > 0.5)
                 total_steps = len(traj_indices)
                 
-                # Split intermediate states proportionally
+                # Split intermediate states proportionally based on actual phase distribution
                 num_intermediate = first_transition_intermediates.shape[0]
-                gc_intermediate_count = int(num_intermediate * num_gc_steps / total_steps)
+                if total_steps > 0:
+                    gc_intermediate_count = int(num_intermediate * num_gc_steps / total_steps)
+                else:
+                    gc_intermediate_count = num_intermediate // 2
                 gc_intermediate = first_transition_intermediates[:gc_intermediate_count]
                 ep_intermediate = first_transition_intermediates[gc_intermediate_count:]
                 
-                # Store both GC and EP intermediate states
-                intermediate_states_list.append({
-                    'gc': gc_intermediate,
-                    'ep': ep_intermediate
-                })
+                # Store separate GC and EP intermediate states
+                gc_intermediate_states_list.append(gc_intermediate)
+                ep_intermediate_states_list.append(ep_intermediate)
             
             # Convert to numpy arrays
             start_states = np.array(start_states) # (num_trajs, 2)
@@ -1289,7 +1287,6 @@ class GoExploreCRL:
             ep_final_states = np.array(ep_final_states) # (num_trajs, 2)
             gc_goals = np.array(gc_goals) # (num_trajs, 2)
             ep_goals = np.array(ep_goals) # (num_trajs, 2)
-            intermediate_states = np.array(intermediate_states_list) # (num_trajs, num_intermediate, 2)
             
             # Sample exactly 4 trajectories for 2x2 grid visualization
             num_trajs = start_states.shape[0]
@@ -1301,12 +1298,15 @@ class GoExploreCRL:
             ep_final_xy = ep_final_states[sample_indices]
             gc_proposed_goals_xy = gc_goals[sample_indices]
             ep_proposed_goals_xy = ep_goals[sample_indices]
-            intermediate_xy = intermediate_states[sample_indices]
+            
+            # Extract GC and EP intermediate states for sampled trajectories
+            gc_intermediate_xy_list = [gc_intermediate_states_list[i] for i in sample_indices]
+            ep_intermediate_xy_list = [ep_intermediate_states_list[i] for i in sample_indices]
             
             # Visualize trajectories
             visualize_dual_crl_trajectories_2d(
                 start_xy, gc_final_xy, ep_final_xy, gc_proposed_goals_xy, ep_proposed_goals_xy,
-                intermediate_xy, f"{wandb_key}/dual_crl_trajectories",
+                gc_intermediate_xy_list, ep_intermediate_xy_list, f"{wandb_key}/dual_crl_trajectories",
                 x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
             )
             
