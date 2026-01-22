@@ -160,12 +160,20 @@ def flatten_batch(buffer_config, transition, sample_key):
     state = transition.observation[:-1, :state_size]  # all states are considered
     new_obs = jnp.concatenate([state, goal], axis=1)
 
+    # Preserve all state_extras fields, not just truncation and traj_id
+    # Use tree_map to preserve all fields and slice them appropriately
+    original_state_extras = transition.extras["state_extras"]
+    state_extras = jax.tree_util.tree_map(
+        lambda x: x[:-1] if len(x.shape) > 0 else x,
+        original_state_extras
+    )
+    # Ensure truncation and traj_id are squeezed (they might be 1D)
+    state_extras["truncation"] = jnp.squeeze(state_extras["truncation"])
+    state_extras["traj_id"] = jnp.squeeze(state_extras["traj_id"])
+    
     extras = {
         "policy_extras": {},
-        "state_extras": {
-            "truncation": jnp.squeeze(transition.extras["state_extras"]["truncation"][:-1]),
-            "traj_id": jnp.squeeze(transition.extras["state_extras"]["traj_id"][:-1]),
-        },
+        "state_extras": state_extras,
         "state": state,
         "future_state": future_state,
         "future_action": future_action,
