@@ -535,7 +535,7 @@ class GoExploreCRL:
             new_obs = env_state.obs.at[:, -len(env.goal_indices):].set(proposed_goals)
             env_state = env_state.replace(obs=new_obs)
 
-            means, _ = actor_state.apply(actor_state.params, env_state.obs)
+            means, _ = actor_state.apply_fn(actor_state.params, env_state.obs)
             actions = nn.tanh(means)
 
             nstate = env.step(env_state, actions)
@@ -553,7 +553,7 @@ class GoExploreCRL:
             new_obs = env_state.obs.at[:, -len(env.goal_indices):].set(proposed_goals)
             env_state = env_state.replace(obs=new_obs)
 
-            means, log_stds = actor_state.apply(actor_state.params, env_state.obs)
+            means, log_stds = actor_state.apply_fn(actor_state.params, env_state.obs)
             stds = jnp.exp(log_stds)
             actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
             nstate = env.step(env_state, actions)
@@ -1089,7 +1089,7 @@ class GoExploreCRL:
                 metrics[f"gcp_{key}"] = value
             for key, value in gcp_critic_metrics.items():
                 metrics[f"gcp_{key}"] = value
-            for key, value in ep_critic_metrics.items():
+            for key, value in ep_actor_metrics.items():
                 metrics[f"ep_{key}"] = value
             for key, value in ep_critic_metrics.items():
                 metrics[f"ep_{key}"] = value
@@ -1418,7 +1418,7 @@ class GoExploreCRL:
             logging.info("step: %d", current_step)
 
             do_render = ne % config.visualization_interval == 0
-            make_policy = lambda param: lambda obs, rng: actor.apply(param, obs)
+            make_policy = lambda param: lambda obs, rng: gcp_actor_state.apply_fn(param, obs)
 
             progress_fn(
                 current_step,
