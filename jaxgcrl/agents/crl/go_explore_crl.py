@@ -659,13 +659,6 @@ class GoExploreCRL:
             num_goal_conditioned_steps = config.num_goal_conditioned_steps
             num_exploratory_steps = config.num_exploratory_steps
             
-            # Log start of get_experience
-            jax.experimental.io_callback(
-                debug_log,
-                None,
-                jnp.array(0, dtype=jnp.int32),  # Message code 0
-                training_state.env_steps
-            )
             
             # ===== FIRST ROLLOUT: Goal-Conditioned Policy (Deterministic) =====
             # Propose GC goals at start
@@ -673,17 +666,6 @@ class GoExploreCRL:
             gc_proposed_goals, gcp_buffer_state, ep_buffer_state = gcp_propose_goals(
                 gcp_buffer_state, ep_buffer_state, train_env, env_state, gc_key
             )
-            
-            # Log GC goal proposal
-            jax.experimental.io_callback(
-                debug_log,
-                None,
-                jnp.array(2, dtype=jnp.int32),  # Message code 2
-                gc_proposed_goals,
-                jnp.mean(gc_proposed_goals, axis=0),
-                jnp.std(gc_proposed_goals, axis=0)
-            )
-            
             # Update env_state with GC goals
             new_info = dict(env_state.info)
             new_info["gc_proposed_goals"] = gc_proposed_goals
@@ -707,18 +689,6 @@ class GoExploreCRL:
                 # Check for early termination (done or truncation) - for logging only
                 truncation = transition.extras["state_extras"]["truncation"]
                 terminated = (transition.discount < 1.0) | (truncation > 0.5)
-                
-                # Log GC step details
-                jax.experimental.io_callback(
-                    debug_log,
-                    None,
-                    jnp.array(6, dtype=jnp.int32),  # Message code 6
-                    jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],  # First 2 state dims
-                    jnp.mean(gc_proposed_goals, axis=0),
-                    jnp.sum(terminated),
-                    jnp.mean(transition.reward),
-                    jnp.mean(transition.discount)
-                )
                 
                 # Update env_state (environment already handles termination correctly)
                 new_info = dict(nstate.info)
@@ -746,15 +716,6 @@ class GoExploreCRL:
                 
                 return (env_state, gcp_actor_state, next_key), transition
             
-            # Log before GC rollout
-            jax.experimental.io_callback(
-                debug_log,
-                None,
-                jnp.array(4, dtype=jnp.int32),  # Message code 4
-                jnp.array(num_goal_conditioned_steps, dtype=jnp.int32),
-                jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2]
-            )
-            
             # Run GC rollout
             (env_state, _, _), gc_transitions = jax.lax.scan(
                 gc_rollout_step,
@@ -763,31 +724,10 @@ class GoExploreCRL:
                 length=num_goal_conditioned_steps
             )
             
-            # Log after GC rollout
-            jax.experimental.io_callback(
-                debug_log,
-                None,
-                jnp.array(5, dtype=jnp.int32),  # Message code 5
-                jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],
-                jnp.array(gc_transitions.observation.shape[0], dtype=jnp.int32),  # num_steps
-                jnp.array(gc_transitions.observation.shape[1], dtype=jnp.int32),  # num_envs
-                jnp.mean(gc_transitions.reward)
-            )
-            
             # ===== SECOND ROLLOUT: Exploratory Policy (Non-Deterministic) =====
             # Propose EP goals at start of exploratory phase
             ep_proposed_goals, gcp_buffer_state, ep_buffer_state = ep_propose_goals(
                 gcp_buffer_state, ep_buffer_state, train_env, env_state, ep_key
-            )
-            
-            # Log EP goal proposal
-            jax.experimental.io_callback(
-                debug_log,
-                None,
-                jnp.array(3, dtype=jnp.int32),  # Message code 3
-                ep_proposed_goals,
-                jnp.mean(ep_proposed_goals, axis=0),
-                jnp.std(ep_proposed_goals, axis=0)
             )
             
             # Update env_state with EP goals
@@ -817,18 +757,6 @@ class GoExploreCRL:
                 truncation = transition.extras["state_extras"]["truncation"]
                 terminated = (transition.discount < 1.0) | (truncation > 0.5)
                 
-                # Log EP step details
-                jax.experimental.io_callback(
-                    debug_log,
-                    None,
-                    jnp.array(9, dtype=jnp.int32),  # Message code 9
-                    jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],  # First 2 state dims
-                    jnp.mean(ep_proposed_goals, axis=0),
-                    jnp.sum(terminated),
-                    jnp.mean(transition.reward),
-                    jnp.mean(transition.discount)
-                )
-                
                 # Update env_state (environment already handles termination correctly)
                 new_info = dict(nstate.info)
                 new_info["ep_proposed_goals"] = ep_proposed_goals
@@ -853,32 +781,12 @@ class GoExploreCRL:
                 
                 return (env_state, ep_actor_state, next_key), transition
             
-            # Log before EP rollout
-            jax.experimental.io_callback(
-                debug_log,
-                None,
-                jnp.array(7, dtype=jnp.int32),  # Message code 7
-                jnp.array(num_exploratory_steps, dtype=jnp.int32),
-                jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2]
-            )
-            
             # Run EP rollout
             (env_state, _, _), ep_transitions = jax.lax.scan(
                 ep_rollout_step,
                 (env_state, ep_actor_state, ep_key),
                 (),
                 length=num_exploratory_steps
-            )
-            
-            # Log after EP rollout
-            jax.experimental.io_callback(
-                debug_log,
-                None,
-                jnp.array(8, dtype=jnp.int32),  # Message code 8
-                jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],
-                jnp.array(ep_transitions.observation.shape[0], dtype=jnp.int32),  # num_steps
-                jnp.array(ep_transitions.observation.shape[1], dtype=jnp.int32),  # num_envs
-                jnp.mean(ep_transitions.reward)
             )
             
             # ===== COMBINE TRANSITIONS AND INSERT INTO BUFFERS =====
@@ -911,26 +819,7 @@ class GoExploreCRL:
             main_buffer_state = main_replay_buffer.insert(main_buffer_state, combined_transitions)
             gcp_buffer_state = gcp_replay_buffer.insert(gcp_buffer_state, gc_transitions)
             ep_buffer_state = ep_replay_buffer.insert(ep_buffer_state, ep_transitions)
-            
-            # Log buffer insertion
-            jax.experimental.io_callback(
-                debug_log,
-                None,
-                jnp.array(11, dtype=jnp.int32),  # Message code 11
-                main_replay_buffer.size(main_buffer_state),
-                gcp_replay_buffer.size(gcp_buffer_state),
-                ep_replay_buffer.size(ep_buffer_state),
-                jnp.array(num_envs, dtype=jnp.int32)
-            )
-            
-            # Log end of get_experience
-            jax.experimental.io_callback(
-                debug_log,
-                None,
-                jnp.array(1, dtype=jnp.int32),  # Message code 1
-                training_state.env_steps
-            )
-            
+         
             return env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, combined_transitions
 
         def prefill_replay_buffer(training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, key):
@@ -983,15 +872,6 @@ class GoExploreCRL:
             gcp_shape_1 = jnp.array(gcp_transitions.observation.shape[1] if hasattr(gcp_transitions, 'observation') and len(gcp_transitions.observation.shape) > 1 else 0, dtype=jnp.int32)
             ep_shape_0 = jnp.array(ep_transitions.observation.shape[0] if hasattr(ep_transitions, 'observation') else 0, dtype=jnp.int32)
             ep_shape_1 = jnp.array(ep_transitions.observation.shape[1] if hasattr(ep_transitions, 'observation') and len(ep_transitions.observation.shape) > 1 else 0, dtype=jnp.int32)
-            jax.experimental.io_callback(
-                debug_log,
-                None,
-                jnp.array(19, dtype=jnp.int32),  # Message code 19
-                gcp_shape_0,
-                gcp_shape_1,
-                ep_shape_0,
-                ep_shape_1
-            )
             
             key, gcp_critic_key, gcp_actor_key, ep_actor_key, ep_critic_key = jax.random.split(key, 5)
 
@@ -1069,15 +949,6 @@ class GoExploreCRL:
                 "ep_logsumexp": ep_critic_metrics["logsumexp"],
                 "ep_critic_loss": ep_critic_metrics["critic_loss"],
             }
-            
-            # Log update_networks end
-            jax.experimental.io_callback(
-                debug_log,
-                None,
-                jnp.array(20, dtype=jnp.int32),  # Message code 20
-                training_state.gradient_steps,
-                jnp.array(len(metrics), dtype=jnp.int32)
-            )
 
             return (
                 training_state,
@@ -1384,56 +1255,6 @@ class GoExploreCRL:
                 x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
             )
             
-            # 5. Debug: GC proposed goals extracted from observation states (sanity check)
-            # Extract goals from the last len(goal_indices) entries of observations for GC phase transitions
-            # Only extract one goal per trajectory (from the first GC transition, since all GC transitions use the same goal)
-            # obs has shape (episode_len-1, batch_size, obs_dim), flatten to (total_samples, obs_dim)
-            obs_flat = obs.reshape(-1, obs.shape[-1])  # (total_samples, obs_dim)
-            gc_debug_goals = []
-            for traj_id in unique_traj_ids:
-                traj_mask = traj_ids_flat == traj_id
-                traj_indices = np.sort(np.where(traj_mask)[0])
-                
-                # Find GC phase transitions
-                gc_mask = in_gc_phase_flat[traj_indices] > 0.5
-                gc_indices = traj_indices[gc_mask]
-                if len(gc_indices) > 0:
-                    # Extract goal from the first GC transition (all GC transitions in a trajectory use the same goal)
-                    gc_first_idx = gc_indices[0]
-                    obs_goal = obs_flat[gc_first_idx, -len(train_env.goal_indices):]
-                    gc_debug_goals.append(obs_goal)
-            
-            if len(gc_debug_goals) > 0:
-                gc_debug_goals = np.array(gc_debug_goals)
-                visualize_kde_heatmap(
-                    gc_debug_goals, "GC Proposed Goals (Debug - from observations)", f"{wandb_key}/gc_goal_proposals_debug_heatmap",
-                    x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
-                )
-            
-            # 6. Debug: EP proposed goals extracted from observation states (sanity check)
-            # Extract goals from the last len(goal_indices) entries of observations for EP phase transitions
-            # Only extract one goal per trajectory (from the first EP transition, since all EP transitions use the same goal)
-            ep_debug_goals = []
-            for traj_id in unique_traj_ids:
-                traj_mask = traj_ids_flat == traj_id
-                traj_indices = np.sort(np.where(traj_mask)[0])
-                
-                # Find EP phase transitions
-                ep_mask = in_ep_phase_flat[traj_indices] > 0.5
-                ep_indices = traj_indices[ep_mask]
-                if len(ep_indices) > 0:
-                    # Extract goal from the first EP transition (all EP transitions in a trajectory use the same goal)
-                    ep_first_idx = ep_indices[0]
-                    obs_goal = obs_flat[ep_first_idx, -len(train_env.goal_indices):]
-                    ep_debug_goals.append(obs_goal)
-            
-            if len(ep_debug_goals) > 0:
-                ep_debug_goals = np.array(ep_debug_goals)
-                visualize_kde_heatmap(
-                    ep_debug_goals, "EP Proposed Goals (Debug - from observations)", f"{wandb_key}/ep_goal_proposals_debug_heatmap",
-                    x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
-                )
-
             logging.info(f"Plotted visualizations at env step {training_state.env_steps.item()}")
             
         key, prefill_key = jax.random.split(key, 2)
