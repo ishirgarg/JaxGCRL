@@ -310,11 +310,8 @@ class GoExploreCRL:
         env_state = jax.jit(train_env.reset)(env_keys)
         train_env.step = jax.jit(train_env.step)
         
-        # Initialize proposed_goals tracking in env_state.info
-        initial_goals = env_state.obs[:, -len(train_env.goal_indices):]
+        # Initialize info dict (proposed goals will be set by goal proposers in get_experience)
         initial_info = dict(env_state.info)
-        initial_info["gc_proposed_goals"] = initial_goals
-        initial_info["ep_proposed_goals"] = initial_goals
         initial_info["was_proposed_goal_mask"] = jnp.zeros((config.num_envs,))
         env_state = env_state.replace(info=initial_info)
 
@@ -620,9 +617,13 @@ class GoExploreCRL:
             
             First: GC policy (deterministic) for num_goal_conditioned_steps
             Second: EP policy (non-deterministic) for num_exploratory_steps
-            Assumes environments do not reset during rollout.
+            Environments may reset during rollout - we track this for logging.
+            All trajectories (including incomplete ones) are inserted into buffers.
             """
             num_envs = config.num_envs
+            
+            # Track initial traj_ids to detect mid-rollout resets
+            initial_traj_ids = env_state.info["traj_id"]  # shape: (num_envs,)
             num_goal_conditioned_steps = config.num_goal_conditioned_steps
             num_exploratory_steps = config.num_exploratory_steps
             
@@ -660,7 +661,7 @@ class GoExploreCRL:
             )
 
             def gc_rollout_step(carry, unused_t):
-                env_state, gcp_actor_state, terminated_mask, current_key = carry
+                env_state, gcp_actor_state, current_key = carry
                 current_key, next_key = jax.random.split(current_key)
                 
                 # Get GC proposed goals from env_state.info
@@ -671,10 +672,9 @@ class GoExploreCRL:
                     gcp_actor_state, train_env, env_state, gc_proposed_goals, ("truncation", "traj_id")
                 )
                 
-                # Check for early termination (done or truncation)
+                # Check for early termination (done or truncation) - for logging only
                 truncation = transition.extras["state_extras"]["truncation"]
                 terminated = (transition.discount < 1.0) | (truncation > 0.5)
-                terminated_mask = terminated_mask | terminated
                 
                 # Log GC step details
                 jax.experimental.io_callback(
@@ -688,21 +688,10 @@ class GoExploreCRL:
                     jnp.mean(transition.discount)
                 )
                 
-                # For terminated environments, keep their last state (don't update)
-                # Handle info dict separately since it's not a JAX array
+                # Update env_state (environment already handles termination correctly)
                 new_info = dict(nstate.info)
                 new_info["gc_proposed_goals"] = gc_proposed_goals
-                
-                # Update env_state, preserving terminated environments' states
-                env_state = jax.tree_util.tree_map(
-                    lambda new_val, old_val: jnp.where(
-                        terminated_mask[:, None, None],
-                        old_val, new_val
-                    ),
-                    nstate, env_state
-                )
-                # Update info separately
-                env_state = env_state.replace(info=new_info)
+                env_state = nstate.replace(info=new_info)
                 
                 # Mark transition as GC phase and include proposed goals and termination info
                 # Preserve existing state_extras and add new fields
@@ -713,14 +702,10 @@ class GoExploreCRL:
                     "in_ep_phase": jnp.zeros((num_envs,), dtype=jnp.float32),
                     "gc_proposed_goals": gc_proposed_goals,
                     "terminated": terminated.astype(jnp.float32),
-                    "terminated_mask": terminated_mask.astype(jnp.float32),
                 }
                 transition = transition.replace(extras={"state_extras": transition_extras})
                 
-                return (env_state, gcp_actor_state, terminated_mask, next_key), transition
-            
-            # Track which environments have terminated (for filtering later)
-            terminated_mask = jnp.zeros((num_envs,), dtype=jnp.bool_)
+                return (env_state, gcp_actor_state, next_key), transition
             
             # Log before GC rollout
             jax.experimental.io_callback(
@@ -732,9 +717,9 @@ class GoExploreCRL:
             )
             
             # Run GC rollout
-            (env_state, _, terminated_mask, _), gc_transitions = jax.lax.scan(
+            (env_state, _, _), gc_transitions = jax.lax.scan(
                 gc_rollout_step,
-                (env_state, gcp_actor_state, terminated_mask, gc_key),
+                (env_state, gcp_actor_state, gc_key),
                 (),
                 length=num_goal_conditioned_steps
             )
@@ -744,7 +729,6 @@ class GoExploreCRL:
                 debug_log,
                 None,
                 jnp.array(5, dtype=jnp.int32),  # Message code 5
-                jnp.sum(terminated_mask),
                 jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],
                 jnp.array(gc_transitions.observation.shape[0], dtype=jnp.int32),  # num_steps
                 jnp.array(gc_transitions.observation.shape[1], dtype=jnp.int32),  # num_envs
@@ -779,7 +763,7 @@ class GoExploreCRL:
             )
 
             def ep_rollout_step(carry, unused_t):
-                env_state, ep_actor_state, terminated_mask, current_key = carry
+                env_state, ep_actor_state, current_key = carry
                 current_key, next_key = jax.random.split(current_key)
                 
                 # Get EP proposed goals from env_state.info
@@ -791,10 +775,9 @@ class GoExploreCRL:
                     current_key, ("truncation", "traj_id")
                 )
                 
-                # Check for early termination (done or truncation)
+                # Check for early termination (done or truncation) - for logging only
                 truncation = transition.extras["state_extras"]["truncation"]
                 terminated = (transition.discount < 1.0) | (truncation > 0.5)
-                terminated_mask = terminated_mask | terminated
                 
                 # Log EP step details
                 jax.experimental.io_callback(
@@ -808,24 +791,13 @@ class GoExploreCRL:
                     jnp.mean(transition.discount)
                 )
                 
-                # For terminated environments, keep their last state (don't update)
-                # Handle info dict separately since it's not a JAX array
+                # Update env_state (environment already handles termination correctly)
                 new_info = dict(nstate.info)
                 new_info["ep_proposed_goals"] = ep_proposed_goals
                 # Preserve GC proposed goals if they exist
                 if "gc_proposed_goals" in env_state.info:
                     new_info["gc_proposed_goals"] = env_state.info["gc_proposed_goals"]
-                
-                # Update env_state, preserving terminated environments' states
-                env_state = jax.tree_util.tree_map(
-                    lambda new_val, old_val: jnp.where(
-                        terminated_mask[:, None] if new_val.ndim > 1 else terminated_mask,
-                        old_val, new_val
-                    ),
-                    nstate, env_state
-                )
-                # Update info separately
-                env_state = env_state.replace(info=new_info)
+                env_state = nstate.replace(info=new_info)
                 
                 # Mark transition as EP phase and include proposed goals and termination info
                 # Preserve existing state_extras and add new fields
@@ -836,13 +808,12 @@ class GoExploreCRL:
                     "in_ep_phase": jnp.ones((num_envs,), dtype=jnp.float32),
                     "ep_proposed_goals": ep_proposed_goals,
                     "terminated": terminated.astype(jnp.float32),
-                    "terminated_mask": terminated_mask.astype(jnp.float32),
                 }
                 # Also include GC proposed goals if available
                 transition_extras["gc_proposed_goals"] = env_state.info["gc_proposed_goals"]
                 transition = transition.replace(extras={"state_extras": transition_extras})
                 
-                return (env_state, ep_actor_state, terminated_mask, next_key), transition
+                return (env_state, ep_actor_state, next_key), transition
             
             # Log before EP rollout
             jax.experimental.io_callback(
@@ -850,14 +821,13 @@ class GoExploreCRL:
                 None,
                 jnp.array(7, dtype=jnp.int32),  # Message code 7
                 jnp.array(num_exploratory_steps, dtype=jnp.int32),
-                jnp.sum(terminated_mask),
                 jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2]
             )
             
-            # Run EP rollout (continue tracking termination from GC phase)
-            (env_state, _, terminated_mask, _), ep_transitions = jax.lax.scan(
+            # Run EP rollout
+            (env_state, _, _), ep_transitions = jax.lax.scan(
                 ep_rollout_step,
-                (env_state, ep_actor_state, terminated_mask, ep_key),
+                (env_state, ep_actor_state, ep_key),
                 (),
                 length=num_exploratory_steps
             )
@@ -867,7 +837,6 @@ class GoExploreCRL:
                 debug_log,
                 None,
                 jnp.array(8, dtype=jnp.int32),  # Message code 8
-                jnp.sum(terminated_mask),
                 jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],
                 jnp.array(ep_transitions.observation.shape[0], dtype=jnp.int32),  # num_steps
                 jnp.array(ep_transitions.observation.shape[1], dtype=jnp.int32),  # num_envs
@@ -898,85 +867,24 @@ class GoExploreCRL:
                 combined_transitions
             )
             
-            # Filter out trajectories that terminated early
-            # terminated_mask: (num_envs,) - True for environments that terminated at any point
-            # We only want to insert trajectories that completed the full rollout
-            non_terminated_mask = ~terminated_mask  # (num_envs,)
+            # Track mid-rollout resets by comparing initial and final traj_ids
+            final_traj_ids = env_state.info["traj_id"]  # shape: (num_envs,)
+            reset_during_rollout = initial_traj_ids != final_traj_ids  # shape: (num_envs,)
+            num_reset_during_rollout = jnp.sum(reset_during_rollout)
             
-            # Count how many trajectories didn't terminate
-            num_non_terminated = jnp.sum(non_terminated_mask)
-            
-            # Log termination statistics
+            # Log reset statistics
             jax.experimental.io_callback(
                 debug_log,
                 None,
                 jnp.array(10, dtype=jnp.int32),  # Message code 10
-                jnp.sum(terminated_mask),
-                num_non_terminated,
+                num_reset_during_rollout,
                 jnp.array(num_envs, dtype=jnp.int32)
             )
             
-            # Filter transitions to only include non-terminated trajectories
-            def filter_by_mask(transitions, mask):
-                """Filter transitions to keep only non-terminated trajectories."""
-                # Count valid trajectories
-                num_valid = jnp.sum(mask)
-                indices = jnp.arange(num_envs)
-                
-                # If no valid trajectories, return empty (will skip insert)
-                def get_valid(transitions):
-                    def get_empty():
-                        first_elem = jax.tree_util.tree_leaves(transitions)[0]
-                        episode_length = first_elem.shape[1]
-                        return jax.tree_util.tree_map(
-                            lambda x: jnp.zeros((0, episode_length) + x.shape[2:], dtype=x.dtype),
-                            transitions
-                        )
-                    
-                    def get_filtered():
-                        # Build index array: where mask is True, use index; where False, use num_envs (out of bounds)
-                        # Then sort to put valid indices first
-                        valid_indices = jnp.where(mask, indices, num_envs)
-                        sorted_indices = jnp.sort(valid_indices)
-                        # Take first num_valid elements (these are the valid indices, sorted)
-                        valid_indices_sorted = sorted_indices[:num_valid]
-                        return jax.tree_util.tree_map(
-                            lambda x: jnp.take(x, valid_indices_sorted, axis=0),
-                            transitions
-                        )
-                    
-                    return jax.lax.cond(
-                        num_valid > 0,
-                        get_filtered,
-                        get_empty
-                    )
-                
-                return get_valid(transitions)
-            
-            # Filter transitions (only insert non-terminated trajectories)
-            gc_transitions_filtered = filter_by_mask(gc_transitions_reshaped, non_terminated_mask)
-            ep_transitions_filtered = filter_by_mask(ep_transitions_reshaped, non_terminated_mask)
-            combined_transitions_filtered = filter_by_mask(combined_transitions_reshaped, non_terminated_mask)
-            
-            # Only insert if there are non-terminated trajectories
-            def conditional_insert(buffer, buffer_state, transitions, num_valid):
-                """Insert only if there are valid trajectories."""
-                return jax.lax.cond(
-                    num_valid > 0,
-                    lambda: buffer.insert(buffer_state, transitions),
-                    lambda: buffer_state
-                )
-            
-            # Insert into buffers (only non-terminated trajectories)
-            main_buffer_state = conditional_insert(
-                main_replay_buffer, main_buffer_state, combined_transitions_filtered, num_non_terminated
-            )
-            gcp_buffer_state = conditional_insert(
-                gcp_replay_buffer, gcp_buffer_state, gc_transitions_filtered, num_non_terminated
-            )
-            ep_buffer_state = conditional_insert(
-                ep_replay_buffer, ep_buffer_state, ep_transitions_filtered, num_non_terminated
-            )
+            # Insert all trajectories into buffers (including incomplete ones)
+            main_buffer_state = main_replay_buffer.insert(main_buffer_state, combined_transitions_reshaped)
+            gcp_buffer_state = gcp_replay_buffer.insert(gcp_buffer_state, gc_transitions_reshaped)
+            ep_buffer_state = ep_replay_buffer.insert(ep_buffer_state, ep_transitions_reshaped)
             
             # Log buffer insertion
             jax.experimental.io_callback(
@@ -986,7 +894,7 @@ class GoExploreCRL:
                 main_replay_buffer.size(main_buffer_state),
                 gcp_replay_buffer.size(gcp_buffer_state),
                 ep_replay_buffer.size(ep_buffer_state),
-                num_non_terminated
+                jnp.array(num_envs, dtype=jnp.int32)
             )
             
             # Log end of get_experience
@@ -1004,7 +912,7 @@ class GoExploreCRL:
             def f(carry, unused):
                 del unused
                 training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, key = carry
-                key, new_key = jax.random.split(key)
+                key, reset_key, new_key = jax.random.split(key, 3)
                 env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state = get_experience(
                     training_state.gcp_actor_state,
                     training_state.ep_actor_state,
@@ -1015,6 +923,15 @@ class GoExploreCRL:
                     ep_buffer_state,
                     key,
                 )
+                
+                # Reset environments after collecting experience
+                reset_keys = jax.random.split(reset_key, config.num_envs)
+                env_state = jax.jit(train_env.reset)(reset_keys)
+                # Initialize info dict (proposed goals will be set by goal proposers in get_experience)
+                initial_info = dict(env_state.info)
+                initial_info["was_proposed_goal_mask"] = jnp.zeros((config.num_envs,))
+                env_state = env_state.replace(info=initial_info)
+                
                 training_state = training_state.replace(
                     env_steps=training_state.env_steps + env_steps_per_actor_step,
                 )
@@ -1110,7 +1027,7 @@ class GoExploreCRL:
 
         @jax.jit
         def training_step(training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, key):
-            experience_key1, experience_key2, sampling_key, training_key = jax.random.split(key, 4)
+            experience_key1, reset_key, sampling_key, permute_key, training_key = jax.random.split(key, 5)
 
             # update buffer
             env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state = get_experience(
@@ -1123,6 +1040,14 @@ class GoExploreCRL:
                 ep_buffer_state,
                 experience_key1,
             )
+            
+            # Reset environments after collecting experience
+            reset_keys = jax.random.split(reset_key, config.num_envs)
+            env_state = jax.jit(train_env.reset)(reset_keys)
+            # Initialize info dict (proposed goals will be set by goal proposers in get_experience)
+            initial_info = dict(env_state.info)
+            initial_info["was_proposed_goal_mask"] = jnp.zeros((config.num_envs,))
+            env_state = env_state.replace(info=initial_info)
 
             training_state = training_state.replace(
                 env_steps=training_state.env_steps + env_steps_per_actor_step,
@@ -1152,7 +1077,7 @@ class GoExploreCRL:
                 # Shape of obs is (num_envs * episode_length, obs_dim) after flattening
 
                 # permute transitions
-                permutation = jax.random.permutation(experience_key2, len(transitions.observation))
+                permutation = jax.random.permutation(permute_key, len(transitions.observation))
                 transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
                 transitions = jax.tree_util.tree_map(
                     lambda x: jnp.reshape(x, (-1, self.batch_size) + x.shape[1:]),
