@@ -1274,8 +1274,8 @@ class GoExploreCRL:
                     gc_intermediate_count = int(num_intermediate * num_gc_steps / total_steps)
                 else:
                     gc_intermediate_count = num_intermediate // 2
-                gc_intermediate = first_transition_intermediates[:gc_intermediate_count]
-                ep_intermediate = first_transition_intermediates[gc_intermediate_count:]
+                gc_intermediate = first_transition_intermediates[:gc_intermediate_count]  # (num_gc_intermediate, 2)
+                ep_intermediate = first_transition_intermediates[gc_intermediate_count:]  # (num_ep_intermediate, 2)
                 
                 # Store separate GC and EP intermediate states
                 gc_intermediate_states_list.append(gc_intermediate)

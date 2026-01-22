@@ -164,17 +164,22 @@ def visualize_dual_crl_trajectories_2d(start_xy, gc_final_xy, ep_final_xy, gc_pr
     def plot_trajectory_in_subplot(i, row, col):
         """Plot trajectory i in subplot at (row, col)"""
         # Get GC and EP intermediate states for this trajectory
-        gc_intermediate = gc_intermediate_xy_list[i]  # (num_gc_intermediate, 2)
-        ep_intermediate = ep_intermediate_xy_list[i]  # (num_ep_intermediate, 2)
+        gc_intermediate = np.array(gc_intermediate_xy_list[i])  # (num_gc_intermediate, 2)
+        ep_intermediate = np.array(ep_intermediate_xy_list[i])  # (num_ep_intermediate, 2)
+        
+        # Ensure all arrays are 2D with shape (N, 2)
+        start_point = start_xy[i:i+1]  # (1, 2)
+        gc_final_point = gc_final_xy[i:i+1]  # (1, 2)
+        ep_final_point = ep_final_xy[i:i+1]  # (1, 2)
         
         # Full trajectory line: start → GC intermediate → GC final → EP intermediate → EP final
-        full_traj_points = [start_xy[i:i+1]]
+        full_traj_points = [start_point]
         if len(gc_intermediate) > 0:
             full_traj_points.append(gc_intermediate)
-        full_traj_points.append(gc_final_xy[i:i+1])
+        full_traj_points.append(gc_final_point)
         if len(ep_intermediate) > 0:
             full_traj_points.append(ep_intermediate)
-        full_traj_points.append(ep_final_xy[i:i+1])
+        full_traj_points.append(ep_final_point)
         full_traj_xy = np.vstack(full_traj_points)
         
         # Main trajectory line connecting all points
