@@ -848,23 +848,10 @@ class GoExploreCRL:
             # gc_transitions: (num_goal_conditioned_steps, num_envs, ...)
             # ep_transitions: (num_exploratory_steps, num_envs, ...)
             # combined: (num_goal_conditioned_steps + num_exploratory_steps, num_envs, ...)
+            # The replay buffer expects shape (unroll_length, num_envs, ...) - DO NOT reshape!
             combined_transitions = jax.tree_util.tree_map(
                 lambda gc, ep: jnp.concatenate([gc, ep], axis=0),
                 gc_transitions, ep_transitions
-            )
-            
-            # Reshape: (unroll_length, num_envs, ...) -> (num_envs, unroll_length, ...)
-            gc_transitions_reshaped = jax.tree_util.tree_map(
-                lambda x: jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim))),
-                gc_transitions
-            )
-            ep_transitions_reshaped = jax.tree_util.tree_map(
-                lambda x: jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim))),
-                ep_transitions
-            )
-            combined_transitions_reshaped = jax.tree_util.tree_map(
-                lambda x: jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim))),
-                combined_transitions
             )
             
             # Track mid-rollout resets by comparing initial and final traj_ids
@@ -882,9 +869,10 @@ class GoExploreCRL:
             )
             
             # Insert all trajectories into buffers (including incomplete ones)
-            main_buffer_state = main_replay_buffer.insert(main_buffer_state, combined_transitions_reshaped)
-            gcp_buffer_state = gcp_replay_buffer.insert(gcp_buffer_state, gc_transitions_reshaped)
-            ep_buffer_state = ep_replay_buffer.insert(ep_buffer_state, ep_transitions_reshaped)
+            # Data shape should be (unroll_length, num_envs, ...) as expected by replay buffer
+            main_buffer_state = main_replay_buffer.insert(main_buffer_state, combined_transitions)
+            gcp_buffer_state = gcp_replay_buffer.insert(gcp_buffer_state, gc_transitions)
+            ep_buffer_state = ep_replay_buffer.insert(ep_buffer_state, ep_transitions)
             
             # Log buffer insertion
             jax.experimental.io_callback(
