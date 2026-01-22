@@ -232,7 +232,7 @@ class CRL:
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
 
     goal_proposer_name = "dual_crl"
-    
+
     # Goal proposer names for go-explore style algorithms
     gcp_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals"] = "gcp_final_rb"
     ep_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals"] = "ep_final_rb"
@@ -572,6 +572,22 @@ class CRL:
         # and filtering them out when inserting into replay buffers, but still completing
         # the rollout for all environments.
 
+        # Debug logging callback
+        def debug_log(*args):
+            """Log debug message with values from JIT-compiled code."""
+            msg = args[0] if len(args) > 0 else "DEBUG"
+            values = args[1:] if len(args) > 1 else []
+            logging.info(f"[JAX DEBUG] {msg}")
+            for i, val in enumerate(values):
+                if isinstance(val, (jnp.ndarray, np.ndarray)):
+                    val_np = np.array(val)
+                    if val_np.size <= 10:
+                        logging.info(f"  Value {i}: shape={val_np.shape}, value={val_np}")
+                    else:
+                        logging.info(f"  Value {i}: shape={val_np.shape}, min={np.min(val_np):.4f}, max={np.max(val_np):.4f}, mean={np.mean(val_np):.4f}")
+                else:
+                    logging.info(f"  Value {i}: {val}")
+        
         @jax.jit
         def get_experience(gcp_actor_state, ep_actor_state, env_state, training_state, 
                           main_buffer_state, gcp_buffer_state, ep_buffer_state, key):
@@ -585,11 +601,30 @@ class CRL:
             num_goal_conditioned_steps = config.num_goal_conditioned_steps
             num_exploratory_steps = config.num_exploratory_steps
             
+            # Log start of get_experience
+            jax.experimental.io_callback(
+                debug_log,
+                None,
+                "=== GET_EXPERIENCE START ===",
+                training_state.env_steps,
+                jnp.sum(terminated_mask) if 'terminated_mask' in locals() else jnp.array(0)
+            )
+            
             # ===== FIRST ROLLOUT: Goal-Conditioned Policy (Deterministic) =====
             # Propose GC goals at start
             gc_key, ep_key = jax.random.split(key, 2)
             gc_proposed_goals, gcp_buffer_state, ep_buffer_state = gcp_propose_goals(
                 gcp_buffer_state, ep_buffer_state, train_env, env_state, gc_key
+            )
+            
+            # Log GC goal proposal
+            jax.experimental.io_callback(
+                debug_log,
+                None,
+                "GC Goal Proposal",
+                gc_proposed_goals,
+                jnp.mean(gc_proposed_goals, axis=0),
+                jnp.std(gc_proposed_goals, axis=0)
             )
             
             # Update env_state with GC goals
@@ -616,6 +651,18 @@ class CRL:
                 truncation = transition.extras["state_extras"]["truncation"]
                 terminated = (transition.discount < 1.0) | (truncation > 0.5)
                 terminated_mask = terminated_mask | terminated
+                
+                # Log GC step details
+                jax.experimental.io_callback(
+                    debug_log,
+                    None,
+                    "GC Rollout Step",
+                    jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],  # First 2 state dims
+                    jnp.mean(gc_proposed_goals, axis=0),
+                    jnp.sum(terminated),
+                    jnp.mean(transition.reward),
+                    jnp.mean(transition.discount)
+                )
                 
                 # For terminated environments, keep their last state (don't update)
                 # Handle info dict separately since it's not a JAX array
@@ -651,6 +698,15 @@ class CRL:
             # Track which environments have terminated (for filtering later)
             terminated_mask = jnp.zeros((num_envs,), dtype=jnp.bool_)
             
+            # Log before GC rollout
+            jax.experimental.io_callback(
+                debug_log,
+                None,
+                "Starting GC Rollout",
+                num_goal_conditioned_steps,
+                jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2]
+            )
+            
             # Run GC rollout
             (env_state, _, terminated_mask, _), gc_transitions = jax.lax.scan(
                 gc_rollout_step,
@@ -659,10 +715,31 @@ class CRL:
                 length=num_goal_conditioned_steps
             )
             
+            # Log after GC rollout
+            jax.experimental.io_callback(
+                debug_log,
+                None,
+                "GC Rollout Complete",
+                jnp.sum(terminated_mask),
+                jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],
+                gc_transitions.observation.shape,
+                jnp.mean(gc_transitions.reward)
+            )
+            
             # ===== SECOND ROLLOUT: Exploratory Policy (Non-Deterministic) =====
             # Propose EP goals at start of exploratory phase
             ep_proposed_goals, gcp_buffer_state, ep_buffer_state = ep_propose_goals(
                 gcp_buffer_state, ep_buffer_state, train_env, env_state, ep_key
+            )
+            
+            # Log EP goal proposal
+            jax.experimental.io_callback(
+                debug_log,
+                None,
+                "EP Goal Proposal",
+                ep_proposed_goals,
+                jnp.mean(ep_proposed_goals, axis=0),
+                jnp.std(ep_proposed_goals, axis=0)
             )
             
             # Update env_state with EP goals
@@ -693,6 +770,18 @@ class CRL:
                 truncation = transition.extras["state_extras"]["truncation"]
                 terminated = (transition.discount < 1.0) | (truncation > 0.5)
                 terminated_mask = terminated_mask | terminated
+                
+                # Log EP step details
+                jax.experimental.io_callback(
+                    debug_log,
+                    None,
+                    "EP Rollout Step",
+                    jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],  # First 2 state dims
+                    jnp.mean(ep_proposed_goals, axis=0),
+                    jnp.sum(terminated),
+                    jnp.mean(transition.reward),
+                    jnp.mean(transition.discount)
+                )
                 
                 # For terminated environments, keep their last state (don't update)
                 # Handle info dict separately since it's not a JAX array
@@ -730,12 +819,33 @@ class CRL:
                 
                 return (env_state, ep_actor_state, terminated_mask, next_key), transition
             
+            # Log before EP rollout
+            jax.experimental.io_callback(
+                debug_log,
+                None,
+                "Starting EP Rollout",
+                num_exploratory_steps,
+                jnp.sum(terminated_mask),
+                jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2]
+            )
+            
             # Run EP rollout (continue tracking termination from GC phase)
             (env_state, _, terminated_mask, _), ep_transitions = jax.lax.scan(
                 ep_rollout_step,
                 (env_state, ep_actor_state, terminated_mask, ep_key),
                 (),
                 length=num_exploratory_steps
+            )
+            
+            # Log after EP rollout
+            jax.experimental.io_callback(
+                debug_log,
+                None,
+                "EP Rollout Complete",
+                jnp.sum(terminated_mask),
+                jnp.mean(env_state.obs[:, :train_env.state_dim], axis=0)[:2],
+                ep_transitions.observation.shape,
+                jnp.mean(ep_transitions.reward)
             )
             
             # ===== COMBINE TRANSITIONS AND INSERT INTO BUFFERS =====
@@ -769,6 +879,16 @@ class CRL:
             
             # Count how many trajectories didn't terminate
             num_non_terminated = jnp.sum(non_terminated_mask)
+            
+            # Log termination statistics
+            jax.experimental.io_callback(
+                debug_log,
+                None,
+                "Trajectory Filtering",
+                jnp.sum(terminated_mask),
+                num_non_terminated,
+                num_envs
+            )
             
             # Filter transitions to only include non-terminated trajectories
             def filter_by_mask(transitions, mask):
@@ -832,6 +952,25 @@ class CRL:
                 ep_replay_buffer, ep_buffer_state, ep_transitions_filtered, num_non_terminated
             )
             
+            # Log buffer insertion
+            jax.experimental.io_callback(
+                debug_log,
+                None,
+                "Buffer Insertion Complete",
+                main_replay_buffer.size(main_buffer_state),
+                gcp_replay_buffer.size(gcp_buffer_state),
+                ep_replay_buffer.size(ep_buffer_state),
+                num_non_terminated
+            )
+            
+            # Log end of get_experience
+            jax.experimental.io_callback(
+                debug_log,
+                None,
+                "=== GET_EXPERIENCE END ===",
+                training_state.env_steps
+            )
+            
             return env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state
 
         def prefill_replay_buffer(training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, key):
@@ -865,6 +1004,16 @@ class CRL:
         @jax.jit
         def update_networks(carry, gcp_transitions, ep_transitions):
             training_state, key = carry
+            
+            # Log update_networks start
+            jax.experimental.io_callback(
+                debug_log,
+                None,
+                "=== UPDATE_NETWORKS START ===",
+                gcp_transitions.observation.shape if hasattr(gcp_transitions, 'observation') else (0,),
+                ep_transitions.observation.shape if hasattr(ep_transitions, 'observation') else (0,)
+            )
+            
             key, gcp_critic_key, gcp_actor_key, ep_actor_key, ep_critic_key = jax.random.split(key, 5)
 
             context = dict(
