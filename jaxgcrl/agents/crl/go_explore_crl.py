@@ -703,7 +703,7 @@ class GoExploreCRL:
                     "gc_proposed_goals": gc_proposed_goals,
                     "terminated": terminated.astype(jnp.float32),
                 }
-                transition = transition.replace(extras={"state_extras": transition_extras})
+                transition = transition._replace(extras={"state_extras": transition_extras})
                 
                 return (env_state, gcp_actor_state, next_key), transition
             
@@ -811,7 +811,7 @@ class GoExploreCRL:
                 }
                 # Also include GC proposed goals if available
                 transition_extras["gc_proposed_goals"] = env_state.info["gc_proposed_goals"]
-                transition = transition.replace(extras={"state_extras": transition_extras})
+                transition = transition._replace(extras={"state_extras": transition_extras})
                 
                 return (env_state, ep_actor_state, next_key), transition
             
