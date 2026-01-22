@@ -41,7 +41,7 @@ def main(config: Config):
         * config.run.episode_length
         * config.agent.train_step_multiplier
         / config.agent.batch_size
-    ) / (config.run.num_envs * config.agent.unroll_length)
+    ) / (config.run.num_envs * (config.run.num_goal_conditioned_steps + config.run.num_exploratory_steps))
     info["utd_ratio"] = utd_ratio
     info["agent"] = type(config.agent).__name__
 

@@ -43,10 +43,8 @@ class RunConfig:
     total_env_steps: int = 50_000_000
 
     # maximum length of an episode
-    num_goal_conditioned_steps: int = 100
-    num_exploratory_steps: int = 100
-    episode_length: int = num_goal_conditioned_steps + num_exploratory_steps
-
+    num_goal_conditioned_steps: int = 0
+    num_exploratory_steps: int = 0
     # environment to use for evaluation
     eval_env: Optional[Literal[legal_envs]] = None
 
@@ -81,7 +79,10 @@ class RunConfig:
     max_devices_per_host: int = 1
     cuda: bool = True
 
-
+    @property
+    def episode_length(self) -> int:
+        return self.num_goal_conditioned_steps + self.num_exploratory_steps
+        
 @dataclass
 class Config:
     # agent type
