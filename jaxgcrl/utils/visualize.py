@@ -156,8 +156,9 @@ def visualize_dual_crl_trajectories_2d(start_xy, gc_final_xy, ep_final_xy, gc_pr
     fig = make_subplots(
         rows=2, cols=2,
         subplot_titles=('Trajectory 1', 'Trajectory 2', 'Trajectory 3', 'Trajectory 4'),
-        horizontal_spacing=0.1,
-        vertical_spacing=0.1
+        horizontal_spacing=0.15,
+        vertical_spacing=0.15,
+        subplot_titles_font_size=14
     )
     
     # Helper function to plot a single trajectory in a subplot
@@ -330,10 +331,11 @@ def visualize_dual_crl_trajectories_2d(start_xy, gc_final_xy, ep_final_xy, gc_pr
     # Update layout
     fig.update_layout(
         title="Dual CRL Trajectories: GC and EP Phases (2x2 Grid)",
-        width=2100,
-        height=2100,
+        width=2800,
+        height=2800,
         hovermode='closest',
-        showlegend=True
+        showlegend=True,
+        title_font_size=18
     )
     
     # Log to WandB as interactive plot

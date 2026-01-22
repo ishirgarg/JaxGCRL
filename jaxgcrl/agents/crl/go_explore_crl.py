@@ -241,8 +241,9 @@ class GoExploreCRL:
     goal_proposer_name = "dual_crl"
 
     # Goal proposer names for go-explore style algorithms
-    gcp_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals"] = "gcp_final_rb"
+    gcp_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "ucgr", "maxwaypointratio_one_env"] = "gcp_final_rb"
     ep_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals"] = "ep_final_rb"
+    goal_sampling_temperature: float = 1.0
 
     def check_config(self, config):
         """
@@ -502,44 +503,97 @@ class GoExploreCRL:
         )
         ep_buffer_state = jax.jit(ep_replay_buffer.init)(buffer_key)
 
-        from jaxgcrl.agents.crl.proposers import FinalReplayBufferProposer, RandomEnvironmentGoalProposer
+        from jaxgcrl.agents.crl.proposers import (
+            FinalReplayBufferProposer, 
+            RandomEnvironmentGoalProposer,
+            UCGRProposer,
+            MaxWaypointRatioOneEnvProposer,
+        )
         
         # Initialize goal proposer instances
         gcp_final_rb_proposer = FinalReplayBufferProposer()
         ep_final_rb_proposer = FinalReplayBufferProposer()
         env_goals_proposer = RandomEnvironmentGoalProposer()
+        ucgr_proposer = UCGRProposer(energy_fn_name=self.energy_fn, num_samples=256)
+        maxwaypointratio_one_env_proposer = MaxWaypointRatioOneEnvProposer(
+            energy_fn_name=self.energy_fn,
+            goal_sampling_temperature=self.goal_sampling_temperature
+        )
         
         # Create goal proposer functions that select the right buffer based on name
         # These functions are defined here but will be called inside JIT-compiled code
         # The proposer names are known at Python time, so we can use if/else here
         # Functions return (proposed_goals, updated_gcp_buffer_state, updated_ep_buffer_state)
         # to handle cases where one proposer might update the other's buffer
+        # Note: UCGR and maxwaypointratio_one_env use EP buffer but GCP actor/critic
         if self.gcp_goal_proposer_name == "gcp_final_rb":
-            def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key):
-                proposed_goals, updated_gcp = gcp_final_rb_proposer.propose_goals(gcp_replay_buffer, gcp_buffer_state, env, env_state, key)
+            def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                proposed_goals, updated_gcp = gcp_final_rb_proposer.propose_goals(
+                    gcp_replay_buffer, gcp_buffer_state, env, env_state, key,
+                    gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
+                    gcp_sa_encoder, gcp_g_encoder, training_state
+                )
                 return proposed_goals, updated_gcp, ep_buffer_state
         elif self.gcp_goal_proposer_name == "ep_final_rb":
-            def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key):
-                proposed_goals, updated_ep = ep_final_rb_proposer.propose_goals(ep_replay_buffer, ep_buffer_state, env, env_state, key)
+            def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                proposed_goals, updated_ep = ep_final_rb_proposer.propose_goals(
+                    ep_replay_buffer, ep_buffer_state, env, env_state, key,
+                    gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
+                    gcp_sa_encoder, gcp_g_encoder, training_state
+                )
                 return proposed_goals, gcp_buffer_state, updated_ep
         elif self.gcp_goal_proposer_name == "env_goals":
-            def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key):
-                proposed_goals, _ = env_goals_proposer.propose_goals(None, gcp_buffer_state, env, env_state, key)
+            def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                proposed_goals, _ = env_goals_proposer.propose_goals(
+                    None, gcp_buffer_state, env, env_state, key,
+                    gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
+                    gcp_sa_encoder, gcp_g_encoder, training_state
+                )
                 return proposed_goals, gcp_buffer_state, ep_buffer_state
+        elif self.gcp_goal_proposer_name == "ucgr":
+            def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                # UCGR uses EP buffer but GCP actor/critic
+                proposed_goals, updated_ep = ucgr_proposer.propose_goals(
+                    ep_replay_buffer, ep_buffer_state, env, env_state, key,
+                    gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
+                    gcp_sa_encoder, gcp_g_encoder, training_state
+                )
+                return proposed_goals, gcp_buffer_state, updated_ep
+        elif self.gcp_goal_proposer_name == "maxwaypointratio_one_env":
+            def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                # MaxWaypointRatioOneEnv uses EP buffer but GCP actor/critic
+                proposed_goals, updated_ep = maxwaypointratio_one_env_proposer.propose_goals(
+                    ep_replay_buffer, ep_buffer_state, env, env_state, key,
+                    gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
+                    gcp_sa_encoder, gcp_g_encoder, training_state
+                )
+                return proposed_goals, gcp_buffer_state, updated_ep
         else:
             raise ValueError(f"Unknown gcp_goal_proposer_name: {self.gcp_goal_proposer_name}")
         
         if self.ep_goal_proposer_name == "gcp_final_rb":
-            def ep_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key):
-                proposed_goals, updated_gcp = gcp_final_rb_proposer.propose_goals(gcp_replay_buffer, gcp_buffer_state, env, env_state, key)
+            def ep_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                proposed_goals, updated_gcp = gcp_final_rb_proposer.propose_goals(
+                    gcp_replay_buffer, gcp_buffer_state, env, env_state, key,
+                    ep_actor, training_state.ep_actor_state.params, training_state.ep_critic_state.params,
+                    ep_sa_encoder, ep_g_encoder, training_state
+                )
                 return proposed_goals, updated_gcp, ep_buffer_state
         elif self.ep_goal_proposer_name == "ep_final_rb":
-            def ep_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key):
-                proposed_goals, updated_ep = ep_final_rb_proposer.propose_goals(ep_replay_buffer, ep_buffer_state, env, env_state, key)
+            def ep_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                proposed_goals, updated_ep = ep_final_rb_proposer.propose_goals(
+                    ep_replay_buffer, ep_buffer_state, env, env_state, key,
+                    ep_actor, training_state.ep_actor_state.params, training_state.ep_critic_state.params,
+                    ep_sa_encoder, ep_g_encoder, training_state
+                )
                 return proposed_goals, gcp_buffer_state, updated_ep
         elif self.ep_goal_proposer_name == "env_goals":
-            def ep_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key):
-                proposed_goals, _ = env_goals_proposer.propose_goals(None, ep_buffer_state, env, env_state, key)
+            def ep_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                proposed_goals, _ = env_goals_proposer.propose_goals(
+                    None, ep_buffer_state, env, env_state, key,
+                    ep_actor, training_state.ep_actor_state.params, training_state.ep_critic_state.params,
+                    ep_sa_encoder, ep_g_encoder, training_state
+                )
                 return proposed_goals, gcp_buffer_state, ep_buffer_state
         else:
             raise ValueError(f"Unknown ep_goal_proposer_name: {self.ep_goal_proposer_name}")
@@ -664,7 +718,7 @@ class GoExploreCRL:
             # Propose GC goals at start
             gc_key, ep_key = jax.random.split(key, 2)
             gc_proposed_goals, gcp_buffer_state, ep_buffer_state = gcp_propose_goals(
-                gcp_buffer_state, ep_buffer_state, train_env, env_state, gc_key
+                gcp_buffer_state, ep_buffer_state, train_env, env_state, gc_key, training_state
             )
             # Update env_state with GC goals
             new_info = dict(env_state.info)
@@ -727,7 +781,7 @@ class GoExploreCRL:
             # ===== SECOND ROLLOUT: Exploratory Policy (Non-Deterministic) =====
             # Propose EP goals at start of exploratory phase
             ep_proposed_goals, gcp_buffer_state, ep_buffer_state = ep_propose_goals(
-                gcp_buffer_state, ep_buffer_state, train_env, env_state, ep_key
+                gcp_buffer_state, ep_buffer_state, train_env, env_state, ep_key, training_state
             )
             
             # Update env_state with EP goals
