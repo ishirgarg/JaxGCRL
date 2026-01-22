@@ -1,6 +1,7 @@
 import wandb
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import matplotlib.pyplot as plt
 import seaborn as sns
 import jax
@@ -9,12 +10,11 @@ import io
 from PIL import Image
 from jaxgcrl.agents.crl.losses import energy_fn
 
-def visualize_goals_2d(start_xy, contrastive_goals_xy, proposed_goals_xy, 
+def visualize_goals_2d(start_xy, proposed_goals_xy, 
                        last_traj_states_xy, intermediate_traj_states_xy, wandb_key,
                        x_bounds=None, y_bounds=None):
-    '''Visualize 2D goals and trajectories with interactive Plotly.
+    '''Visualize 2D goals and trajectories with interactive Plotly (simplified version).
     - start_xy: (num_samples, 2) array of start states
-    - contrastive_goals_xy: (num_samples, 2) array of contrastive goals
     - proposed_goals_xy: (num_samples, 2) array of proposed goals
     - last_traj_states_xy: (num_samples, 2) array of last trajectory states
     - intermediate_traj_states_xy: (num_samples, num_intermediate_states, 2) array of intermediate trajectory states
@@ -23,7 +23,6 @@ def visualize_goals_2d(start_xy, contrastive_goals_xy, proposed_goals_xy,
     - y_bounds: tuple (min, max) for y-axis range, or None for auto
     '''
     assert start_xy.shape[1] == 2, "Goal visualization only supported for 2D goals"
-    assert contrastive_goals_xy.shape[1] == 2, "Goal visualization only supported for 2D goals"
     assert proposed_goals_xy.shape[1] == 2, "Goal visualization only supported for 2D goals"
     assert last_traj_states_xy.shape[1] == 2, "Goal visualization only supported for 2D goals"
     assert intermediate_traj_states_xy.shape[2] == 2, "Goal visualization only supported for 2D goals"
@@ -34,17 +33,6 @@ def visualize_goals_2d(start_xy, contrastive_goals_xy, proposed_goals_xy,
     
     # Plot trajectories and arrows first (so points appear on top)
     for i in range(num_samples):
-        # Arrow from start state to contrastive goal
-        fig.add_trace(go.Scatter(
-            x=[start_xy[i, 0], contrastive_goals_xy[i, 0]],
-            y=[start_xy[i, 1], contrastive_goals_xy[i, 1]],
-            mode='lines',
-            line=dict(color='red', width=1),
-            opacity=0.3,
-            showlegend=False,
-            hoverinfo='skip'
-        ))
-        
         # Intermediate trajectory states
         fig.add_trace(go.Scatter(
             x=intermediate_traj_states_xy[i, :, 0],
@@ -95,15 +83,6 @@ def visualize_goals_2d(start_xy, contrastive_goals_xy, proposed_goals_xy,
     ))
     
     fig.add_trace(go.Scatter(
-        x=contrastive_goals_xy[:, 0],
-        y=contrastive_goals_xy[:, 1],
-        mode='markers',
-        marker=dict(color='red', size=4, opacity=0.6),
-        name='Contrastive Goals',
-        hovertemplate='Contrastive Goal<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
-    ))
-    
-    fig.add_trace(go.Scatter(
         x=proposed_goals_xy[:, 0],
         y=proposed_goals_xy[:, 1],
         mode='markers',
@@ -142,6 +121,234 @@ def visualize_goals_2d(start_xy, contrastive_goals_xy, proposed_goals_xy,
         showlegend=True,
         xaxis=xaxis_config,
         yaxis=yaxis_config
+    )
+    
+    # Log to WandB as interactive plot
+    wandb.log({wandb_key: fig})
+
+
+def visualize_dual_crl_trajectories_2d(start_xy, gc_final_xy, ep_final_xy, gc_proposed_goals_xy, ep_proposed_goals_xy,
+                                       intermediate_traj_states_xy, wandb_key,
+                                       x_bounds=None, y_bounds=None):
+    '''Visualize 2D trajectories for dual CRL with GC and EP phases in a 2x2 grid.
+    - start_xy: (num_samples, 2) array of start states (should be 4 trajectories)
+    - gc_final_xy: (num_samples, 2) array of final states from GC rollout
+    - ep_final_xy: (num_samples, 2) array of final states from EP rollout
+    - gc_proposed_goals_xy: (num_samples, 2) array of GC proposed goals
+    - ep_proposed_goals_xy: (num_samples, 2) array of EP proposed goals
+    - intermediate_traj_states_xy: (num_samples, num_intermediate_states, 2) array of intermediate trajectory states
+    - wandb_key: str, key to log the plot in WandB
+    - x_bounds: tuple (min, max) for x-axis range, or None for auto
+    - y_bounds: tuple (min, max) for y-axis range, or None for auto
+    '''
+    assert start_xy.shape[1] == 2, "Goal visualization only supported for 2D goals"
+    assert gc_final_xy.shape[1] == 2, "Goal visualization only supported for 2D goals"
+    assert ep_final_xy.shape[1] == 2, "Goal visualization only supported for 2D goals"
+    assert gc_proposed_goals_xy.shape[1] == 2, "Goal visualization only supported for 2D goals"
+    assert ep_proposed_goals_xy.shape[1] == 2, "Goal visualization only supported for 2D goals"
+    assert intermediate_traj_states_xy.shape[2] == 2, "Goal visualization only supported for 2D goals"
+    
+    num_samples = start_xy.shape[0]
+    num_trajectories = min(4, num_samples)  # Plot up to 4 trajectories
+    
+    # Create 2x2 subplot grid
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=('Trajectory 1', 'Trajectory 2', 'Trajectory 3', 'Trajectory 4'),
+        horizontal_spacing=0.1,
+        vertical_spacing=0.1
+    )
+    
+    # Helper function to plot a single trajectory in a subplot
+    def plot_trajectory_in_subplot(i, row, col):
+        """Plot trajectory i in subplot at (row, col)"""
+        # Line from start to GC final state
+        fig.add_trace(go.Scatter(
+            x=[start_xy[i, 0], gc_final_xy[i, 0]],
+            y=[start_xy[i, 1], gc_final_xy[i, 1]],
+            mode='lines',
+            line=dict(color='blue', width=2),
+            opacity=0.5,
+            showlegend=(i == 0),
+            name='GC Trajectory' if i == 0 else '',
+            hoverinfo='skip'
+        ), row=row, col=col)
+        
+        # Line from GC final to EP final state
+        fig.add_trace(go.Scatter(
+            x=[gc_final_xy[i, 0], ep_final_xy[i, 0]],
+            y=[gc_final_xy[i, 1], ep_final_xy[i, 1]],
+            mode='lines',
+            line=dict(color='purple', width=2),
+            opacity=0.5,
+            showlegend=(i == 0),
+            name='EP Trajectory' if i == 0 else '',
+            hoverinfo='skip'
+        ), row=row, col=col)
+        
+        # Line from GC final state to GC goal
+        fig.add_trace(go.Scatter(
+            x=[gc_final_xy[i, 0], gc_proposed_goals_xy[i, 0]],
+            y=[gc_final_xy[i, 1], gc_proposed_goals_xy[i, 1]],
+            mode='lines',
+            line=dict(color='orange', width=1.5, dash='dash'),
+            opacity=0.4,
+            showlegend=(i == 0),
+            name='GC Goal' if i == 0 else '',
+            hoverinfo='skip'
+        ), row=row, col=col)
+        
+        # Line from EP final state to EP goal
+        fig.add_trace(go.Scatter(
+            x=[ep_final_xy[i, 0], ep_proposed_goals_xy[i, 0]],
+            y=[ep_final_xy[i, 1], ep_proposed_goals_xy[i, 1]],
+            mode='lines',
+            line=dict(color='red', width=1.5, dash='dash'),
+            opacity=0.4,
+            showlegend=(i == 0),
+            name='EP Goal' if i == 0 else '',
+            hoverinfo='skip'
+        ), row=row, col=col)
+        
+        # Intermediate trajectory states
+        num_intermediate = intermediate_traj_states_xy.shape[1]
+        non_zero_mask = np.any(intermediate_traj_states_xy[i] != 0, axis=1)
+        if np.any(non_zero_mask):
+            split_idx = num_intermediate // 2
+            gc_intermediate = intermediate_traj_states_xy[i, :split_idx, :]
+            ep_intermediate = intermediate_traj_states_xy[i, split_idx:, :]
+            # Remove zero-padded rows
+            gc_intermediate = gc_intermediate[np.any(gc_intermediate != 0, axis=1)]
+            ep_intermediate = ep_intermediate[np.any(ep_intermediate != 0, axis=1)]
+        else:
+            gc_intermediate = intermediate_traj_states_xy[i, :num_intermediate//2, :]
+            ep_intermediate = intermediate_traj_states_xy[i, num_intermediate//2:, :]
+        
+        # GC intermediate states
+        if len(gc_intermediate) > 0:
+            fig.add_trace(go.Scatter(
+                x=gc_intermediate[:, 0],
+                y=gc_intermediate[:, 1],
+                mode='markers',
+                marker=dict(color='lightblue', size=3, opacity=0.5),
+                showlegend=(i == 0),
+                name='GC Intermediate' if i == 0 else '',
+                hovertemplate='GC Intermediate<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
+            ), row=row, col=col)
+            
+            # Connect GC intermediate states
+            gc_traj_xy = np.vstack([start_xy[i:i+1], gc_intermediate, gc_final_xy[i:i+1]])
+            fig.add_trace(go.Scatter(
+                x=gc_traj_xy[:, 0],
+                y=gc_traj_xy[:, 1],
+                mode='lines',
+                line=dict(color='lightblue', width=1),
+                opacity=0.3,
+                showlegend=False,
+                hoverinfo='skip'
+            ), row=row, col=col)
+        
+        # EP intermediate states
+        if len(ep_intermediate) > 0:
+            fig.add_trace(go.Scatter(
+                x=ep_intermediate[:, 0],
+                y=ep_intermediate[:, 1],
+                mode='markers',
+                marker=dict(color='pink', size=3, opacity=0.5),
+                showlegend=(i == 0),
+                name='EP Intermediate' if i == 0 else '',
+                hovertemplate='EP Intermediate<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
+            ), row=row, col=col)
+            
+            # Connect EP intermediate states
+            ep_traj_xy = np.vstack([gc_final_xy[i:i+1], ep_intermediate, ep_final_xy[i:i+1]])
+            fig.add_trace(go.Scatter(
+                x=ep_traj_xy[:, 0],
+                y=ep_traj_xy[:, 1],
+                mode='lines',
+                line=dict(color='pink', width=1),
+                opacity=0.3,
+                showlegend=False,
+                hoverinfo='skip'
+            ), row=row, col=col)
+        
+        # Plot main points
+        fig.add_trace(go.Scatter(
+            x=[start_xy[i, 0]],
+            y=[start_xy[i, 1]],
+            mode='markers',
+            marker=dict(color='blue', size=8, opacity=0.8),
+            showlegend=(i == 0),
+            name='Start State' if i == 0 else '',
+            hovertemplate='Start State<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
+        ), row=row, col=col)
+        
+        fig.add_trace(go.Scatter(
+            x=[gc_final_xy[i, 0]],
+            y=[gc_final_xy[i, 1]],
+            mode='markers',
+            marker=dict(color='green', size=8, opacity=0.8),
+            showlegend=(i == 0),
+            name='GC Final' if i == 0 else '',
+            hovertemplate='GC Final<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
+        ), row=row, col=col)
+        
+        fig.add_trace(go.Scatter(
+            x=[ep_final_xy[i, 0]],
+            y=[ep_final_xy[i, 1]],
+            mode='markers',
+            marker=dict(color='purple', size=8, opacity=0.8),
+            showlegend=(i == 0),
+            name='EP Final' if i == 0 else '',
+            hovertemplate='EP Final<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
+        ), row=row, col=col)
+        
+        fig.add_trace(go.Scatter(
+            x=[gc_proposed_goals_xy[i, 0]],
+            y=[gc_proposed_goals_xy[i, 1]],
+            mode='markers',
+            marker=dict(color='orange', size=8, opacity=0.8, symbol='star'),
+            showlegend=(i == 0),
+            name='GC Goal' if i == 0 else '',
+            hovertemplate='GC Goal<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
+        ), row=row, col=col)
+        
+        fig.add_trace(go.Scatter(
+            x=[ep_proposed_goals_xy[i, 0]],
+            y=[ep_proposed_goals_xy[i, 1]],
+            mode='markers',
+            marker=dict(color='red', size=8, opacity=0.8, symbol='star'),
+            showlegend=(i == 0),
+            name='EP Goal' if i == 0 else '',
+            hovertemplate='EP Goal<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
+        ), row=row, col=col)
+    
+    # Plot up to 4 trajectories in 2x2 grid
+    subplot_positions = [(1, 1), (1, 2), (2, 1), (2, 2)]
+    for i in range(num_trajectories):
+        row, col = subplot_positions[i]
+        plot_trajectory_in_subplot(i, row, col)
+    
+    # Configure axis settings for all subplots
+    for row in range(1, 3):
+        for col in range(1, 3):
+            axis_config = {}
+            if x_bounds is not None:
+                axis_config['range'] = list(x_bounds)
+            if y_bounds is not None:
+                axis_config['range'] = list(y_bounds)
+            
+            fig.update_xaxes(axis_config, row=row, col=col)
+            fig.update_yaxes(axis_config, row=row, col=col)
+            fig.update_xaxes(scaleanchor="y", scaleratio=1, row=row, col=col)
+    
+    # Update layout
+    fig.update_layout(
+        title="Dual CRL Trajectories: GC and EP Phases (2x2 Grid)",
+        width=2100,
+        height=2100,
+        hovermode='closest',
+        showlegend=True
     )
     
     # Log to WandB as interactive plot

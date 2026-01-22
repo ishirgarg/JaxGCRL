@@ -25,7 +25,7 @@ from flax.training.train_state import TrainState
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
-from jaxgcrl.utils.visualize import visualize_goals_2d, visualize_kde_heatmap, visualize_q_function_2d
+from jaxgcrl.utils.visualize import visualize_goals_2d, visualize_kde_heatmap, visualize_q_function_2d, visualize_dual_crl_trajectories_2d
 
 from .losses import update_actor_and_alpha, update_critic
 from .networks import Actor, Encoder
@@ -312,9 +312,11 @@ class CRL:
         
         # Initialize proposed_goals tracking in env_state.info
         initial_goals = env_state.obs[:, -len(train_env.goal_indices):]
-        env_state.info["gc_proposed_goals"] = initial_goals
-        env_state.info["ep_proposed_goals"] = initial_goals
-        env_state.info["was_proposed_goal_mask"] = jnp.zeros((config.num_envs,))
+        initial_info = dict(env_state.info)
+        initial_info["gc_proposed_goals"] = initial_goals
+        initial_info["ep_proposed_goals"] = initial_goals
+        initial_info["was_proposed_goal_mask"] = jnp.zeros((config.num_envs,))
+        env_state = env_state.replace(info=initial_info)
 
         # Dimensions definitions and sanity checks
         action_size = train_env.action_size
@@ -566,10 +568,9 @@ class CRL:
                 extras={"state_extras": state_extras},
             )
 
-        # Assert that environments don't terminate when unhealthy (before JIT compilation)
-        assert not getattr(unwrapped_env, '_terminate_when_unhealthy', False), (
-            "Environments must have _terminate_when_unhealthy=False for go_explore rollout"
-        )
+        # Note: We handle early termination by tracking which environments have terminated
+        # and filtering them out when inserting into replay buffers, but still completing
+        # the rollout for all environments.
 
         @jax.jit
         def get_experience(gcp_actor_state, ep_actor_state, env_state, training_state, 
@@ -592,13 +593,15 @@ class CRL:
             )
             
             # Update env_state with GC goals
+            new_info = dict(env_state.info)
+            new_info["gc_proposed_goals"] = gc_proposed_goals
             env_state = env_state.replace(
-                obs=env_state.obs.at[:, -len(train_env.goal_indices):].set(gc_proposed_goals)
+                obs=env_state.obs.at[:, -len(train_env.goal_indices):].set(gc_proposed_goals),
+                info=new_info
             )
-            env_state.info["gc_proposed_goals"] = gc_proposed_goals
 
             def gc_rollout_step(carry, unused_t):
-                env_state, gcp_actor_state, current_key = carry
+                env_state, gcp_actor_state, terminated_mask, current_key = carry
                 current_key, next_key = jax.random.split(current_key)
                 
                 # Get GC proposed goals from env_state.info
@@ -609,24 +612,49 @@ class CRL:
                     gcp_actor_state, train_env, env_state, gc_proposed_goals, ("truncation", "traj_id")
                 )
                 
-                # Preserve GC proposed goals in next state
-                nstate.info["gc_proposed_goals"] = gc_proposed_goals
+                # Check for early termination (done or truncation)
+                truncation = transition.extras["state_extras"]["truncation"]
+                terminated = (transition.discount < 1.0) | (truncation > 0.5)
+                terminated_mask = terminated_mask | terminated
                 
-                # Mark transition as GC phase and include proposed goals
+                # For terminated environments, keep their last state (don't update)
+                # Handle info dict separately since it's not a JAX array
+                new_info = dict(nstate.info)
+                new_info["gc_proposed_goals"] = gc_proposed_goals
+                
+                # Update env_state, preserving terminated environments' states
+                env_state = jax.tree_util.tree_map(
+                    lambda new_val, old_val: jnp.where(
+                        terminated_mask[:, None] if new_val.ndim > 1 else terminated_mask, 
+                        old_val, new_val
+                    ),
+                    nstate, env_state
+                )
+                # Update info separately
+                env_state = env_state.replace(info=new_info)
+                
+                # Mark transition as GC phase and include proposed goals and termination info
+                # Preserve existing state_extras and add new fields
+                existing_state_extras = transition.extras["state_extras"]
                 transition_extras = {
-                    **transition.extras,
+                    **existing_state_extras,
                     "in_gc_phase": jnp.ones((num_envs,), dtype=jnp.float32),
                     "in_ep_phase": jnp.zeros((num_envs,), dtype=jnp.float32),
                     "gc_proposed_goals": gc_proposed_goals,
+                    "terminated": terminated.astype(jnp.float32),
+                    "terminated_mask": terminated_mask.astype(jnp.float32),
                 }
                 transition = transition.replace(extras={"state_extras": transition_extras})
                 
-                return (nstate, gcp_actor_state, next_key), transition
+                return (env_state, gcp_actor_state, terminated_mask, next_key), transition
+            
+            # Track which environments have terminated (for filtering later)
+            terminated_mask = jnp.zeros((num_envs,), dtype=jnp.bool_)
             
             # Run GC rollout
-            (env_state, _, _), gc_transitions = jax.lax.scan(
+            (env_state, _, terminated_mask, _), gc_transitions = jax.lax.scan(
                 gc_rollout_step,
-                (env_state, gcp_actor_state, gc_key),
+                (env_state, gcp_actor_state, terminated_mask, gc_key),
                 (),
                 length=num_goal_conditioned_steps
             )
@@ -638,16 +666,18 @@ class CRL:
             )
             
             # Update env_state with EP goals
-            env_state = env_state.replace(
-                obs=env_state.obs.at[:, -len(train_env.goal_indices):].set(ep_proposed_goals)
-            )
-            env_state.info["ep_proposed_goals"] = ep_proposed_goals
+            new_info = dict(env_state.info)
+            new_info["ep_proposed_goals"] = ep_proposed_goals
             # Preserve GC proposed goals from previous phase
             if "gc_proposed_goals" in env_state.info:
-                env_state.info["gc_proposed_goals"] = env_state.info["gc_proposed_goals"]
+                new_info["gc_proposed_goals"] = env_state.info["gc_proposed_goals"]
+            env_state = env_state.replace(
+                obs=env_state.obs.at[:, -len(train_env.goal_indices):].set(ep_proposed_goals),
+                info=new_info
+            )
 
             def ep_rollout_step(carry, unused_t):
-                env_state, ep_actor_state, current_key = carry
+                env_state, ep_actor_state, terminated_mask, current_key = carry
                 current_key, next_key = jax.random.split(current_key)
                 
                 # Get EP proposed goals from env_state.info
@@ -659,28 +689,51 @@ class CRL:
                     current_key, ("truncation", "traj_id")
                 )
                 
-                # Preserve both GC and EP proposed goals in next state
-                nstate.info["ep_proposed_goals"] = ep_proposed_goals
-                if "gc_proposed_goals" in env_state.info:
-                    nstate.info["gc_proposed_goals"] = env_state.info["gc_proposed_goals"]
+                # Check for early termination (done or truncation)
+                truncation = transition.extras["state_extras"]["truncation"]
+                terminated = (transition.discount < 1.0) | (truncation > 0.5)
+                terminated_mask = terminated_mask | terminated
                 
-                # Mark transition as EP phase and include proposed goals
+                # For terminated environments, keep their last state (don't update)
+                # Handle info dict separately since it's not a JAX array
+                new_info = dict(nstate.info)
+                new_info["ep_proposed_goals"] = ep_proposed_goals
+                # Preserve GC proposed goals if they exist
+                if "gc_proposed_goals" in env_state.info:
+                    new_info["gc_proposed_goals"] = env_state.info["gc_proposed_goals"]
+                
+                # Update env_state, preserving terminated environments' states
+                env_state = jax.tree_util.tree_map(
+                    lambda new_val, old_val: jnp.where(
+                        terminated_mask[:, None] if new_val.ndim > 1 else terminated_mask,
+                        old_val, new_val
+                    ),
+                    nstate, env_state
+                )
+                # Update info separately
+                env_state = env_state.replace(info=new_info)
+                
+                # Mark transition as EP phase and include proposed goals and termination info
+                # Preserve existing state_extras and add new fields
+                existing_state_extras = transition.extras["state_extras"]
                 transition_extras = {
-                    **transition.extras,
+                    **existing_state_extras,
                     "in_gc_phase": jnp.zeros((num_envs,), dtype=jnp.float32),
                     "in_ep_phase": jnp.ones((num_envs,), dtype=jnp.float32),
                     "ep_proposed_goals": ep_proposed_goals,
+                    "terminated": terminated.astype(jnp.float32),
+                    "terminated_mask": terminated_mask.astype(jnp.float32),
                 }
                 # Also include GC proposed goals if available
                 transition_extras["gc_proposed_goals"] = env_state.info["gc_proposed_goals"]
                 transition = transition.replace(extras={"state_extras": transition_extras})
                 
-                return (nstate, ep_actor_state, next_key), transition
+                return (env_state, ep_actor_state, terminated_mask, next_key), transition
             
-            # Run EP rollout
-            (env_state, _, _), ep_transitions = jax.lax.scan(
+            # Run EP rollout (continue tracking termination from GC phase)
+            (env_state, _, terminated_mask, _), ep_transitions = jax.lax.scan(
                 ep_rollout_step,
-                (env_state, ep_actor_state, ep_key),
+                (env_state, ep_actor_state, terminated_mask, ep_key),
                 (),
                 length=num_exploratory_steps
             )
@@ -709,10 +762,75 @@ class CRL:
                 combined_transitions
             )
             
-            # Insert into buffers
-            main_buffer_state = main_replay_buffer.insert(main_buffer_state, combined_transitions_reshaped)
-            gcp_buffer_state = gcp_replay_buffer.insert(gcp_buffer_state, gc_transitions_reshaped)
-            ep_buffer_state = ep_replay_buffer.insert(ep_buffer_state, ep_transitions_reshaped)
+            # Filter out trajectories that terminated early
+            # terminated_mask: (num_envs,) - True for environments that terminated at any point
+            # We only want to insert trajectories that completed the full rollout
+            non_terminated_mask = ~terminated_mask  # (num_envs,)
+            
+            # Count how many trajectories didn't terminate
+            num_non_terminated = jnp.sum(non_terminated_mask)
+            
+            # Filter transitions to only include non-terminated trajectories
+            def filter_by_mask(transitions, mask):
+                """Filter transitions to keep only non-terminated trajectories."""
+                # Count valid trajectories
+                num_valid = jnp.sum(mask)
+                indices = jnp.arange(num_envs)
+                
+                # If no valid trajectories, return empty (will skip insert)
+                def get_valid(transitions):
+                    def get_empty():
+                        first_elem = jax.tree_util.tree_leaves(transitions)[0]
+                        episode_length = first_elem.shape[1]
+                        return jax.tree_util.tree_map(
+                            lambda x: jnp.zeros((0, episode_length) + x.shape[2:], dtype=x.dtype),
+                            transitions
+                        )
+                    
+                    def get_filtered():
+                        # Build index array: where mask is True, use index; where False, use num_envs (out of bounds)
+                        # Then sort to put valid indices first
+                        valid_indices = jnp.where(mask, indices, num_envs)
+                        sorted_indices = jnp.sort(valid_indices)
+                        # Take first num_valid elements (these are the valid indices, sorted)
+                        valid_indices_sorted = sorted_indices[:num_valid]
+                        return jax.tree_util.tree_map(
+                            lambda x: jnp.take(x, valid_indices_sorted, axis=0),
+                            transitions
+                        )
+                    
+                    return jax.lax.cond(
+                        num_valid > 0,
+                        get_filtered,
+                        get_empty
+                    )
+                
+                return get_valid(transitions)
+            
+            # Filter transitions (only insert non-terminated trajectories)
+            gc_transitions_filtered = filter_by_mask(gc_transitions_reshaped, non_terminated_mask)
+            ep_transitions_filtered = filter_by_mask(ep_transitions_reshaped, non_terminated_mask)
+            combined_transitions_filtered = filter_by_mask(combined_transitions_reshaped, non_terminated_mask)
+            
+            # Only insert if there are non-terminated trajectories
+            def conditional_insert(buffer, buffer_state, transitions, num_valid):
+                """Insert only if there are valid trajectories."""
+                return jax.lax.cond(
+                    num_valid > 0,
+                    lambda: buffer.insert(buffer_state, transitions),
+                    lambda: buffer_state
+                )
+            
+            # Insert into buffers (only non-terminated trajectories)
+            main_buffer_state = conditional_insert(
+                main_replay_buffer, main_buffer_state, combined_transitions_filtered, num_non_terminated
+            )
+            gcp_buffer_state = conditional_insert(
+                gcp_replay_buffer, gcp_buffer_state, gc_transitions_filtered, num_non_terminated
+            )
+            ep_buffer_state = conditional_insert(
+                ep_replay_buffer, ep_buffer_state, ep_transitions_filtered, num_non_terminated
+            )
             
             return env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state
 
@@ -924,47 +1042,142 @@ class CRL:
         def visualize_goals(train_env, transitions, actor_state, critic_state, sa_encoder, g_encoder, energy_fn, num_samples, wandb_key):
             # Shape is now (episode_len-1, batch_size, ...) since we only keep the last training step's batch
             obs = transitions.observation # (episode_len-1, batch_size, obs_dim)
-            future_state = transitions.extras["future_state"] # (episode_len-1, batch_size, obs_dim)
             last_traj_state = transitions.extras["last_traj_state"][:, :, :state_size] # (episode_len-1, batch_size, state_size)
             last_traj_state_flat = last_traj_state.reshape(-1, state_size)
             intermediate_traj = transitions.extras["intermediate_traj"] # (episode_len-1, batch_size, num_intermediate_states, obs_dim)
             
             states = obs[:, :, :state_size].reshape(-1, state_size)
-            contrastive_goals = future_state[:, :, train_env.goal_indices].reshape(-1, len(train_env.goal_indices))
-            proposed_goals = transitions.extras["proposed_goals"].reshape(-1, len(train_env.goal_indices))
+            
+            # Extract GC and EP specific data
+            in_gc_phase = transitions.extras["state_extras"]["in_gc_phase"] # (episode_len-1, batch_size)
+            in_ep_phase = transitions.extras["state_extras"]["in_ep_phase"] # (episode_len-1, batch_size)
+            gc_proposed_goals = transitions.extras["state_extras"]["gc_proposed_goals"] # (episode_len-1, batch_size, goal_dim)
+            ep_proposed_goals = transitions.extras["state_extras"]["ep_proposed_goals"] # (episode_len-1, batch_size, goal_dim)
+            traj_ids = transitions.extras["state_extras"]["traj_id"] # (episode_len-1, batch_size)
+            
+            # Reshape to (total_samples, ...)
+            in_gc_phase_flat = in_gc_phase.reshape(-1)
+            in_ep_phase_flat = in_ep_phase.reshape(-1)
+            gc_proposed_goals_flat = gc_proposed_goals.reshape(-1, len(train_env.goal_indices))
+            ep_proposed_goals_flat = ep_proposed_goals.reshape(-1, len(train_env.goal_indices))
+            traj_ids_flat = traj_ids.reshape(-1)
             
             # Flatten intermediate trajectories to shape (total_samples, num_intermediate_states, obs_dim)
             intermediate_traj_flat = intermediate_traj.reshape(-1, intermediate_traj.shape[-2], intermediate_traj.shape[-1])
             
-            total_samples = states.shape[0]
-            if num_samples > total_samples:
-                num_samples = total_samples
+            # Extract GC and EP final states for each trajectory
+            # For each unique trajectory, find the last GC and EP states
+            unique_traj_ids = np.unique(traj_ids_flat)
+            gc_final_states = []
+            ep_final_states = []
+            start_states = []
+            gc_goals = []
+            ep_goals = []
+            intermediate_states_list = []
             
-            sample_indices = np.random.choice(total_samples, num_samples, replace=False)
+            for traj_id in unique_traj_ids:
+                traj_mask = traj_ids_flat == traj_id
+                traj_indices = np.sort(np.where(traj_mask)[0])
+                
+                # Get start state (first observation in trajectory)
+                start_state = states[traj_indices[0], train_env.goal_indices]
+                start_states.append(start_state)
+                
+                # Find last GC phase transition (where in_gc_phase > 0.5)
+                gc_mask = in_gc_phase_flat[traj_indices] > 0.5
+                gc_indices = traj_indices[gc_mask]
+                gc_final_idx = gc_indices[-1]
+                gc_final_state = states[gc_final_idx, train_env.goal_indices]
+                gc_goal = gc_proposed_goals_flat[gc_final_idx]
+                gc_final_states.append(gc_final_state)
+                gc_goals.append(gc_goal)
+                
+                # Find last EP phase transition (where in_ep_phase > 0.5)
+                ep_mask = in_ep_phase_flat[traj_indices] > 0.5
+                ep_indices = traj_indices[ep_mask]
+                ep_final_idx = ep_indices[-1]
+                ep_final_state = states[ep_final_idx, train_env.goal_indices]
+                ep_goal = ep_proposed_goals_flat[ep_final_idx]
+                ep_final_states.append(ep_final_state)
+                ep_goals.append(ep_goal)
+                
+                # Get intermediate states for this trajectory
+                # The intermediate states are computed from the first transition and span the full trajectory
+                # We need to determine which intermediate states belong to GC vs EP phase
+                first_transition_intermediates = intermediate_traj_flat[traj_indices[0], :, train_env.goal_indices]  # (num_intermediate, 2)
+                
+                # The intermediate states correspond to future states in the trajectory
+                # We need to map them back to actual trajectory indices to check their phase
+                # Since get_intermediate_trajectory_states samples evenly across future trajectory,
+                # we can approximate by checking phases at corresponding positions
+                # For simplicity, we'll split based on the ratio of GC to EP steps in this trajectory
+                num_gc_steps = np.sum(in_gc_phase_flat[traj_indices] > 0.5)
+                num_ep_steps = np.sum(in_ep_phase_flat[traj_indices] > 0.5)
+                total_steps = len(traj_indices)
+                
+                # Split intermediate states proportionally
+                num_intermediate = first_transition_intermediates.shape[0]
+                gc_intermediate_count = int(num_intermediate * num_gc_steps / total_steps)
+                gc_intermediate = first_transition_intermediates[:gc_intermediate_count]
+                ep_intermediate = first_transition_intermediates[gc_intermediate_count:]
+                
+                # Store both GC and EP intermediate states
+                intermediate_states_list.append({
+                    'gc': gc_intermediate,
+                    'ep': ep_intermediate
+                })
             
-            start_xy = states[sample_indices][:, train_env.goal_indices]
-            cont_xy = contrastive_goals[sample_indices][:, train_env.goal_indices]
-            prop_xy = proposed_goals[sample_indices]
-            lts_xy = last_traj_state_flat[sample_indices][:, train_env.goal_indices]
-            intermediate_xy = intermediate_traj_flat[sample_indices][:, :, train_env.goal_indices]
-            last_traj_state_mask = transitions.extras["last_traj_state_mask"].reshape(-1)
-
-            visualize_goals_2d(start_xy, cont_xy, prop_xy, lts_xy, intermediate_xy, f"{wandb_key}/state_goal_plot", x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds)
-
-            visualize_kde_heatmap(proposed_goals[last_traj_state_mask], "Proposed Goals", f"{wandb_key}/proposed_goal_heatmap", x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds)
-
-            visualize_kde_heatmap(last_traj_state_flat[last_traj_state_mask][:, train_env.goal_indices], "Final States", f"{wandb_key}/final_states_heatmap", x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds)
-
-            for i in range(min(3, num_samples)):  # Visualize Q-function for up to 3 samples
-                idx = sample_indices[i]
-                visualize_q_function_2d(
-                    actor, sa_encoder, g_encoder, actor_state.params, critic_state.params,
-                    states[idx],
-                    train_env.goal_indices,
-                    train_env.x_bounds, train_env.y_bounds,
-                    f"{wandb_key}/q_function_sample_{i}",
-                    energy_fn
-                )
+            # Convert to numpy arrays
+            start_states = np.array(start_states) # (num_trajs, 2)
+            gc_final_states = np.array(gc_final_states) # (num_trajs, 2)
+            ep_final_states = np.array(ep_final_states) # (num_trajs, 2)
+            gc_goals = np.array(gc_goals) # (num_trajs, 2)
+            ep_goals = np.array(ep_goals) # (num_trajs, 2)
+            intermediate_states = np.array(intermediate_states_list) # (num_trajs, num_intermediate, 2)
+            
+            # Sample exactly 4 trajectories for 2x2 grid visualization
+            num_trajs = start_states.shape[0]
+            num_viz_trajs = min(4, num_trajs)
+            sample_indices = np.random.choice(num_trajs, num_viz_trajs, replace=False)
+            
+            start_xy = start_states[sample_indices]
+            gc_final_xy = gc_final_states[sample_indices]
+            ep_final_xy = ep_final_states[sample_indices]
+            gc_proposed_goals_xy = gc_goals[sample_indices]
+            ep_proposed_goals_xy = ep_goals[sample_indices]
+            intermediate_xy = intermediate_states[sample_indices]
+            
+            # Visualize trajectories
+            visualize_dual_crl_trajectories_2d(
+                start_xy, gc_final_xy, ep_final_xy, gc_proposed_goals_xy, ep_proposed_goals_xy,
+                intermediate_xy, f"{wandb_key}/dual_crl_trajectories",
+                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
+            )
+            
+            # Heatmaps
+            # 1. GC final states
+            visualize_kde_heatmap(
+                gc_final_states, "GC Final States", f"{wandb_key}/gc_final_states_heatmap",
+                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
+            )
+            
+            # 2. EP final states
+            visualize_kde_heatmap(
+                ep_final_states, "EP Final States", f"{wandb_key}/ep_final_states_heatmap",
+                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
+            )
+            
+            # 3. GC goal proposals
+            visualize_kde_heatmap(
+                gc_goals, "GC Goal Proposals", f"{wandb_key}/gc_goal_proposals_heatmap",
+                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
+            )
+            
+            # 4. EP goal proposals
+            visualize_kde_heatmap(
+                ep_goals, "EP Goal Proposals", f"{wandb_key}/ep_goal_proposals_heatmap",
+                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
+            )
 
             logging.info(f"Plotted visualizations at env step {training_state.env_steps.item()}")
             
