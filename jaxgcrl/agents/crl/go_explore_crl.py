@@ -696,7 +696,7 @@ class GoExploreCRL:
                 # Update env_state, preserving terminated environments' states
                 env_state = jax.tree_util.tree_map(
                     lambda new_val, old_val: jnp.where(
-                        terminated_mask[:, None] if new_val.ndim > 1 else terminated_mask, 
+                        terminated_mask[:, None, None],
                         old_val, new_val
                     ),
                     nstate, env_state
