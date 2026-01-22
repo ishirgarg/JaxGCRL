@@ -1083,13 +1083,19 @@ class GoExploreCRL:
             ep_last_batch = process_transitions(ep_transitions, ep_batch_keys)
 
             # take actor-step worth of training-step
+            # jax.lax.scan with multiple xs: when xs is a tuple, function receives unpacked args
+            # Function signature: (carry, x1, x2) when xs=(x1, x2)
             (
                 (
                     training_state,
                     _,
                 ),
                 metrics,
-            ) = jax.lax.scan(update_networks, (training_state, training_key), gcp_last_batch, ep_last_batch)
+            ) = jax.lax.scan(
+                lambda carry, xs: update_networks(carry, xs[0], xs[1]),
+                (training_state, training_key),
+                (gcp_last_batch, ep_last_batch)
+            )
 
             return (
                 training_state,
