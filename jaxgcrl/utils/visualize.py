@@ -152,17 +152,13 @@ def visualize_dual_crl_trajectories_2d(start_xy, gc_final_xy, ep_final_xy, gc_pr
     num_samples = start_xy.shape[0]
     num_trajectories = min(4, num_samples)  # Plot up to 4 trajectories
     
-    # Create 2x2 subplot grid
-    fig = make_subplots(
-        rows=2, cols=2,
-        subplot_titles=('Trajectory 1', 'Trajectory 2', 'Trajectory 3', 'Trajectory 4'),
-        horizontal_spacing=0.15,
-        vertical_spacing=0.15
-    )
+    # Create 2x2 subplot grid using matplotlib
+    fig, axes = plt.subplots(2, 2, figsize=(16, 16))
+    axes = axes.flatten()
     
     # Helper function to plot a single trajectory in a subplot
-    def plot_trajectory_in_subplot(i, row, col):
-        """Plot trajectory i in subplot at (row, col)"""
+    def plot_trajectory_in_subplot(i, ax):
+        """Plot trajectory i in subplot ax"""
         # Get GC and EP intermediate states for this trajectory
         gc_intermediate = np.array(gc_intermediate_xy_list[i])  # (num_gc_intermediate, 2)
         ep_intermediate = np.array(ep_intermediate_xy_list[i])  # (num_ep_intermediate, 2)
@@ -198,148 +194,82 @@ def visualize_dual_crl_trajectories_2d(start_xy, gc_final_xy, ep_final_xy, gc_pr
         full_traj_xy = np.vstack(full_traj_points)
         
         # Main trajectory line connecting all points
-        fig.add_trace(go.Scatter(
-            x=full_traj_xy[:, 0],
-            y=full_traj_xy[:, 1],
-            mode='lines',
-            line=dict(color='blue', width=2),
-            opacity=0.6,
-            showlegend=(i == 0),
-            name='Full Trajectory' if i == 0 else '',
-            hoverinfo='skip'
-        ), row=row, col=col)
+        ax.plot(full_traj_xy[:, 0], full_traj_xy[:, 1], 'b-', linewidth=2, alpha=0.6, label='Full Trajectory' if i == 0 else '')
         
         # Line from GC final state to GC proposed goal
-        fig.add_trace(go.Scatter(
-            x=[gc_final_xy[i, 0], gc_proposed_goals_xy[i, 0]],
-            y=[gc_final_xy[i, 1], gc_proposed_goals_xy[i, 1]],
-            mode='lines',
-            line=dict(color='orange', width=1.5, dash='dash'),
-            opacity=0.6,
-            showlegend=(i == 0),
-            name='GC Goal' if i == 0 else '',
-            hoverinfo='skip'
-        ), row=row, col=col)
+        ax.plot([gc_final_xy[i, 0], gc_proposed_goals_xy[i, 0]], 
+                [gc_final_xy[i, 1], gc_proposed_goals_xy[i, 1]], 
+                'orange', linestyle='--', linewidth=1.5, alpha=0.6, label='GC Goal' if i == 0 else '')
         
         # Line from EP final state to EP proposed goal (only if EP goals are non-zero)
         if np.any(ep_proposed_goals_xy[i] != 0):
-            fig.add_trace(go.Scatter(
-                x=[ep_final_xy[i, 0], ep_proposed_goals_xy[i, 0]],
-                y=[ep_final_xy[i, 1], ep_proposed_goals_xy[i, 1]],
-                mode='lines',
-                line=dict(color='red', width=1.5, dash='dash'),
-                opacity=0.6,
-                showlegend=(i == 0),
-                name='EP Goal' if i == 0 else '',
-                hoverinfo='skip'
-            ), row=row, col=col)
+            ax.plot([ep_final_xy[i, 0], ep_proposed_goals_xy[i, 0]], 
+                    [ep_final_xy[i, 1], ep_proposed_goals_xy[i, 1]], 
+                    'r--', linewidth=1.5, alpha=0.6, label='EP Goal' if i == 0 else '')
         
         # GC intermediate states as markers
         if len(gc_intermediate) > 0:
-            fig.add_trace(go.Scatter(
-                x=gc_intermediate[:, 0],
-                y=gc_intermediate[:, 1],
-                mode='markers',
-                marker=dict(color='lightblue', size=4, opacity=0.7),
-                showlegend=(i == 0),
-                name='GC Intermediate' if i == 0 else '',
-                hovertemplate='GC Intermediate<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
-            ), row=row, col=col)
+            ax.scatter(gc_intermediate[:, 0], gc_intermediate[:, 1], 
+                      c='lightblue', s=20, alpha=0.7, label='GC Intermediate' if i == 0 else '')
         
         # EP intermediate states as markers
         if len(ep_intermediate) > 0:
-            fig.add_trace(go.Scatter(
-                x=ep_intermediate[:, 0],
-                y=ep_intermediate[:, 1],
-                mode='markers',
-                marker=dict(color='pink', size=4, opacity=0.7),
-                showlegend=(i == 0),
-                name='EP Intermediate' if i == 0 else '',
-                hovertemplate='EP Intermediate<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
-            ), row=row, col=col)
+            ax.scatter(ep_intermediate[:, 0], ep_intermediate[:, 1], 
+                      c='pink', s=20, alpha=0.7, label='EP Intermediate' if i == 0 else '')
         
         # Plot main points
-        fig.add_trace(go.Scatter(
-            x=[start_xy[i, 0]],
-            y=[start_xy[i, 1]],
-            mode='markers',
-            marker=dict(color='blue', size=8, opacity=0.8),
-            showlegend=(i == 0),
-            name='Start State' if i == 0 else '',
-            hovertemplate='Start State<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
-        ), row=row, col=col)
+        ax.scatter([start_xy[i, 0]], [start_xy[i, 1]], 
+                  c='blue', s=100, alpha=0.8, marker='o', edgecolors='black', linewidths=1.5, 
+                  label='Start State' if i == 0 else '', zorder=5)
         
-        fig.add_trace(go.Scatter(
-            x=[gc_final_xy[i, 0]],
-            y=[gc_final_xy[i, 1]],
-            mode='markers',
-            marker=dict(color='green', size=8, opacity=0.8),
-            showlegend=(i == 0),
-            name='GC Final' if i == 0 else '',
-            hovertemplate='GC Final<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
-        ), row=row, col=col)
+        ax.scatter([gc_final_xy[i, 0]], [gc_final_xy[i, 1]], 
+                  c='green', s=100, alpha=0.8, marker='o', edgecolors='black', linewidths=1.5, 
+                  label='GC Final' if i == 0 else '', zorder=5)
         
-        fig.add_trace(go.Scatter(
-            x=[ep_final_xy[i, 0]],
-            y=[ep_final_xy[i, 1]],
-            mode='markers',
-            marker=dict(color='purple', size=8, opacity=0.8),
-            showlegend=(i == 0),
-            name='EP Final' if i == 0 else '',
-            hovertemplate='EP Final<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
-        ), row=row, col=col)
+        ax.scatter([ep_final_xy[i, 0]], [ep_final_xy[i, 1]], 
+                  c='purple', s=100, alpha=0.8, marker='o', edgecolors='black', linewidths=1.5, 
+                  label='EP Final' if i == 0 else '', zorder=5)
         
-        fig.add_trace(go.Scatter(
-            x=[gc_proposed_goals_xy[i, 0]],
-            y=[gc_proposed_goals_xy[i, 1]],
-            mode='markers',
-            marker=dict(color='orange', size=8, opacity=0.8, symbol='star'),
-            showlegend=(i == 0),
-            name='GC Goal' if i == 0 else '',
-            hovertemplate='GC Goal<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
-        ), row=row, col=col)
+        ax.scatter([gc_proposed_goals_xy[i, 0]], [gc_proposed_goals_xy[i, 1]], 
+                  c='orange', s=150, alpha=0.8, marker='*', edgecolors='black', linewidths=1.5, 
+                  label='GC Goal' if i == 0 else '', zorder=5)
         
-        fig.add_trace(go.Scatter(
-            x=[ep_proposed_goals_xy[i, 0]],
-            y=[ep_proposed_goals_xy[i, 1]],
-            mode='markers',
-            marker=dict(color='red', size=8, opacity=0.8, symbol='star'),
-            showlegend=(i == 0),
-            name='EP Goal' if i == 0 else '',
-            hovertemplate='EP Goal<br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>'
-        ), row=row, col=col)
+        ax.scatter([ep_proposed_goals_xy[i, 0]], [ep_proposed_goals_xy[i, 1]], 
+                  c='red', s=150, alpha=0.8, marker='*', edgecolors='black', linewidths=1.5, 
+                  label='EP Goal' if i == 0 else '', zorder=5)
+        
+        # Set axis properties
+        if x_bounds is not None:
+            ax.set_xlim(x_bounds)
+        if y_bounds is not None:
+            ax.set_ylim(y_bounds)
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        ax.set_xlabel('x')
+        ax.set_ylabel('y')
+        ax.set_title(f'Trajectory {i+1}')
+        if i == 0:
+            ax.legend(loc='upper right', fontsize=8)
     
     # Plot up to 4 trajectories in 2x2 grid
-    subplot_positions = [(1, 1), (1, 2), (2, 1), (2, 2)]
     for i in range(num_trajectories):
-        row, col = subplot_positions[i]
-        plot_trajectory_in_subplot(i, row, col)
+        plot_trajectory_in_subplot(i, axes[i])
     
-    # Configure axis settings for all subplots
-    for row in range(1, 3):
-        for col in range(1, 3):
-            axis_config = {}
-            if x_bounds is not None:
-                axis_config['range'] = list(x_bounds)
-            if y_bounds is not None:
-                axis_config['range'] = list(y_bounds)
-            
-            fig.update_xaxes(axis_config, row=row, col=col)
-            fig.update_yaxes(axis_config, row=row, col=col)
-            fig.update_xaxes(scaleanchor="y", scaleratio=1, row=row, col=col)
+    # Hide unused subplots
+    for i in range(num_trajectories, 4):
+        axes[i].axis('off')
     
-    # Update layout
-    fig.update_layout(
-        title="Dual CRL Trajectories: GC and EP Phases (2x2 Grid)",
-        width=2800,
-        height=2800,
-        hovermode='closest',
-        showlegend=True,
-        title_font_size=18
-    )
+    plt.suptitle('Dual CRL Trajectories: GC and EP Phases (2x2 Grid)', fontsize=16, y=0.995)
+    plt.tight_layout()
     
-    # Log to WandB as interactive plot
-    wandb.log({wandb_key: fig})
+    # Save to buffer and log to WandB
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    
+    pil_image = Image.open(buf)
+    wandb.log({wandb_key: wandb.Image(pil_image)})
 
 
 def visualize_kde_heatmap(data_xy, plot_title, wandb_key, x_bounds=None, y_bounds=None):
