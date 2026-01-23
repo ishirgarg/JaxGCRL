@@ -238,12 +238,13 @@ class GoExploreCRL:
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
 
-    goal_proposer_name = "dual_crl"
 
     # Goal proposer names for go-explore style algorithms
     gcp_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "ucgr", "maxwaypointratio_one_env", "q_epistemic"] = "gcp_final_rb"
     ep_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals"] = "ep_final_rb"
     goal_sampling_temperature: float = 1.0
+
+    train_ep_on_main_buffer: bool = False
     
     # Critic ensemble for Q-epistemic goal proposal
     use_gcp_critic_ensemble: bool = False
@@ -1074,7 +1075,10 @@ class GoExploreCRL:
 
             # sample actor-step worth of transitions
             main_buffer_state, gcp_transitions = main_replay_buffer.sample(main_buffer_state)
-            ep_buffer_state, ep_transitions = ep_replay_buffer.sample(ep_buffer_state)
+            if self.train_ep_on_main_buffer:
+                ep_transitions = gcp_transitions
+            else:
+                ep_buffer_state, ep_transitions = ep_replay_buffer.sample(ep_buffer_state)
             # transitions.observation has shape (num_envs, episode_length, obs_dim)
 
             # process transitions for training
