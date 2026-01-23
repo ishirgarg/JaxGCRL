@@ -245,6 +245,8 @@ class GoExploreCRL:
     goal_sampling_temperature: float = 1.0
 
     train_ep_on_main_buffer: bool = False
+
+    use_same_policy: bool = False
     
     # Critic ensemble for Q-epistemic goal proposal
     use_gcp_critic_ensemble: bool = False
@@ -833,11 +835,17 @@ class GoExploreCRL:
                 # Get EP proposed goals from env_state.info
                 ep_proposed_goals = env_state.info.get("ep_proposed_goals", env_state.obs[:, -len(train_env.goal_indices):])
                 
-                # Use non-deterministic actor step
-                nstate, transition = actor_step(
-                    ep_actor_state, train_env, env_state, ep_proposed_goals, 
-                    current_key, ("truncation", "traj_id")
-                )
+                if self.use_same_policy:
+                    nstate, transition = actor_step(
+                        gcp_actor_state, train_env, env_state, ep_proposed_goals, 
+                        current_key, ("truncation", "traj_id")
+                    )
+                else:
+                    # Use non-deterministic actor step
+                    nstate, transition = actor_step(
+                        ep_actor_state, train_env, env_state, ep_proposed_goals, 
+                        current_key, ("truncation", "traj_id")
+                    )
                 
                 # Check for early termination (done or truncation) - for logging only
                 truncation = transition.extras["state_extras"]["truncation"]
