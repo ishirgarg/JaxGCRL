@@ -39,7 +39,7 @@ from .proposers import (
     QEpistemicProposer,
 )
 from .goals_utils import compute_min_critic_mean_reward, compute_max_critic_reward_per_transition
-from brax.training.agents.sac import networks as sac_networks
+from jaxgcrl.agents.sac import networks as sac_networks
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -314,16 +314,10 @@ class GoExploreSAC:
         make_ep_policy = sac_networks.make_inference_fn(ep_sac_network)
         
         # Initialize EP networks (same pattern as SAC)
-        # The init function returns just the params (processor_params are handled in apply)
-        dummy_ep_obs = jnp.zeros((ep_obs_size,))
-        dummy_ep_action = jnp.zeros((action_size,))
-        
-        # Q-network initialization (same as SAC)
-        ep_q_params = ep_sac_network.q_network.init(ep_q_key, dummy_ep_obs, dummy_ep_action)
+        # Match SAC's _init_training_state pattern exactly
+        ep_actor_params = ep_sac_network.policy_network.init(ep_actor_key)
+        ep_q_params = ep_sac_network.q_network.init(ep_q_key)
         ep_target_q_params = jax.tree_util.tree_map(lambda x: x, ep_q_params)
-        
-        # Policy network initialization (same as SAC)
-        ep_actor_params = ep_sac_network.policy_network.init(ep_actor_key, dummy_ep_obs)
 
         # GCP Critic (CRL)
         gcp_sa_encoder = Encoder(
