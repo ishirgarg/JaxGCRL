@@ -1250,24 +1250,53 @@ class GoExploreCRL:
                     ep_final_states.append(ep_final_state)
                     ep_goals.append(ep_goal)
                 
-                # Get intermediate states for this trajectory (from first transition)
-                # Use the intermediate states directly from the first transition in the trajectory
-                first_transition_intermediates = intermediate_traj_flat[traj_indices[0], :, train_env.goal_indices]  # (num_intermediate, 2)
+                # Get intermediate states from transitions in their respective phases
+                # Intermediate states are computed per transition as fractions of the remaining trajectory
+                # We use intermediate states from the first transition of each phase and filter to correct phase
                 
-                # Determine which intermediate states belong to GC vs EP phase
-                # Count GC and EP steps in this trajectory
-                num_gc_steps = np.sum(in_gc_phase_flat[traj_indices] > 0.5)
-                num_ep_steps = np.sum(in_ep_phase_flat[traj_indices] > 0.5)
-                total_steps = len(traj_indices)
+                # GC intermediate states: use intermediate states from first GC transition
+                gc_intermediate = np.array([]).reshape(0, len(train_env.goal_indices))
+                if len(gc_indices) > 0:
+                    gc_first_idx = gc_indices[0]  # First GC transition in this trajectory
+                    gc_intermediate_full = intermediate_traj_flat[gc_first_idx, :, train_env.goal_indices]  # (num_intermediate, goal_dim)
+                    # Map each intermediate state back to its actual trajectory position and filter by phase
+                    gc_local_idx = gc_first_idx - traj_indices[0]  # Local index within this trajectory
+                    remaining_length = len(traj_indices) - gc_local_idx
+                    gc_intermediate_list = []
+                    for inter_idx in range(gc_intermediate_full.shape[0]):
+                        if remaining_length > 0:
+                            # Intermediate states are at fractions: [1/(n+1), 2/(n+1), ..., n/(n+1)] of remaining trajectory
+                            fraction = (inter_idx + 1) / (gc_intermediate_full.shape[0] + 1)
+                            target_local_idx = gc_local_idx + int(fraction * remaining_length)
+                            target_local_idx = min(target_local_idx, len(traj_indices) - 1)
+                            target_global_idx = traj_indices[target_local_idx]
+                            # Only include if the target state is actually in GC phase
+                            if target_global_idx < len(in_gc_phase_flat) and in_gc_phase_flat[target_global_idx] > 0.5:
+                                gc_intermediate_list.append(gc_intermediate_full[inter_idx])
+                    if len(gc_intermediate_list) > 0:
+                        gc_intermediate = np.array(gc_intermediate_list)
                 
-                # Split intermediate states proportionally based on actual phase distribution
-                num_intermediate = first_transition_intermediates.shape[0]
-                if total_steps > 0:
-                    gc_intermediate_count = int(num_intermediate * num_gc_steps / total_steps)
-                else:
-                    gc_intermediate_count = num_intermediate // 2
-                gc_intermediate = first_transition_intermediates[:gc_intermediate_count]  # (num_gc_intermediate, 2)
-                ep_intermediate = first_transition_intermediates[gc_intermediate_count:]  # (num_ep_intermediate, 2)
+                # EP intermediate states: use intermediate states from first EP transition
+                ep_intermediate = np.array([]).reshape(0, len(train_env.goal_indices))
+                if len(ep_indices) > 0:
+                    ep_first_idx = ep_indices[0]  # First EP transition in this trajectory
+                    ep_intermediate_full = intermediate_traj_flat[ep_first_idx, :, train_env.goal_indices]  # (num_intermediate, goal_dim)
+                    # Map each intermediate state back to its actual trajectory position and filter by phase
+                    ep_local_idx = ep_first_idx - traj_indices[0]  # Local index within this trajectory
+                    remaining_length = len(traj_indices) - ep_local_idx
+                    ep_intermediate_list = []
+                    for inter_idx in range(ep_intermediate_full.shape[0]):
+                        if remaining_length > 0:
+                            # Intermediate states are at fractions: [1/(n+1), 2/(n+1), ..., n/(n+1)] of remaining trajectory
+                            fraction = (inter_idx + 1) / (ep_intermediate_full.shape[0] + 1)
+                            target_local_idx = ep_local_idx + int(fraction * remaining_length)
+                            target_local_idx = min(target_local_idx, len(traj_indices) - 1)
+                            target_global_idx = traj_indices[target_local_idx]
+                            # Only include if the target state is actually in EP phase
+                            if target_global_idx < len(in_ep_phase_flat) and in_ep_phase_flat[target_global_idx] > 0.5:
+                                ep_intermediate_list.append(ep_intermediate_full[inter_idx])
+                    if len(ep_intermediate_list) > 0:
+                        ep_intermediate = np.array(ep_intermediate_list)
                 
                 # Store separate GC and EP intermediate states
                 gc_intermediate_states_list.append(gc_intermediate)
