@@ -184,7 +184,7 @@ class GoExploreSAC:
     gcp_num_critic_ensemble: int = 5
     
     # EP reward computation
-    ep_reward_name: Literal["max_mean_critic"] = "max_mean_critic"  # Will be used to compute rewards from trajectories
+    ep_reward_name: Literal["mean_max_critic"] = "mean_max_critic"  # Computes max_g f(s, a_g, g) per transition
 
     def check_config(self, config):
         """
@@ -576,25 +576,6 @@ class GoExploreSAC:
                 extras={"state_extras": state_extras},
             )
         
-        @functools.partial(jax.jit, static_argnames=("reward_name",))
-        def compute_ep_reward(reward_name: str, transitions: Transition, env) -> jnp.ndarray:
-            """Compute EP reward based on reward_name.
-            
-            For now, most rewards are computed after the full rollout.
-            This function is a placeholder that returns environment rewards.
-            """
-            batch_size = transitions.observation.shape[0]
-            
-            if reward_name == "mean_max_critic":
-                # mean_max_critic reward needs the full trajectory to compute,
-                # so return zeros here. It will be computed after the rollout is complete.
-                return jnp.zeros((batch_size,))
-            elif reward_name == "placeholder":
-                # Placeholder: return zero rewards
-                return jnp.zeros((batch_size,))
-            else:
-                raise ValueError(f"Unknown reward_name: {reward_name}")
-        
         def ep_actor_step(training_state, env, env_state, key, extra_fields):
             """EP actor step (non-goal-conditioned, uses SAC policy).
             
@@ -618,22 +599,7 @@ class GoExploreSAC:
             # Get next state (state-only)
             next_state_only = nstate.obs[:, :state_size]
             
-            # Compute reward based on reward_name
-            # Create a transition-like structure for reward computation
-            # Note: reward computation will use the full trajectory later
-            # For now, use environment reward as placeholder
-            computed_reward = compute_ep_reward(
-                self.ep_reward_name,
-                Transition(
-                    observation=state_only,
-                    action=actions,
-                    reward=nstate.reward,  # Placeholder
-                    discount=1 - nstate.done,
-                    extras={"state_extras": state_extras, "next_observation": next_state_only}
-                ),
-                unwrapped_env
-            )
-            
+            # Use environment reward (custom rewards are computed after rollout per transition)
             # Pad observation with zeros to match obs_size (for replay buffer consistency)
             obs_padded = jnp.concatenate([state_only, jnp.zeros((state_only.shape[0], goal_size))], axis=-1)  # (batch_size, obs_size)
             next_obs_padded = jnp.concatenate([next_state_only, jnp.zeros((next_state_only.shape[0], goal_size))], axis=-1)  # (batch_size, obs_size)
@@ -641,7 +607,7 @@ class GoExploreSAC:
             return nstate, Transition(
                 observation=obs_padded,
                 action=actions,
-                reward=computed_reward,
+                reward=nstate.reward,  # Environment reward; custom rewards added after rollout
                 discount=1 - nstate.done,
                 extras={
                     "state_extras": state_extras,
@@ -860,7 +826,7 @@ class GoExploreSAC:
                 # Add to existing reward
                 ep_transitions = ep_transitions._replace(
                     reward=ep_transitions.reward + rewards
-                )
+            )
             
             # Combine transitions
             combined_transitions = jax.tree_util.tree_map(
