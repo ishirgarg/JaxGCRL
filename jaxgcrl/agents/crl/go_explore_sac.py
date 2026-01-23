@@ -19,6 +19,7 @@ from brax import base, envs
 from brax.training import types, gradients
 from brax.training.agents.sac import losses as sac_losses
 from brax.training.acme import running_statistics, specs
+from jaxgcrl.agents.sac.sac import Transition as SACTransition
 from brax.v1 import envs as envs_v1
 from etils import epath
 from flax.struct import dataclass
@@ -780,15 +781,7 @@ class GoExploreSAC:
                 # Get next states from EP transitions (the states we reached)
                 # ep_transitions.observation has shape (num_exploratory_steps, num_envs, obs_size)
                 # We need the next states, which are stored in extras["next_observation"]
-                # If not available, use the observation from the next timestep
-                ep_next_obs_full = ep_transitions.extras.get("next_observation", None)
-                if ep_next_obs_full is None:
-                    # Fallback: use observation from next timestep (shifted)
-                    # For last timestep, use the same observation
-                    ep_next_obs_full = jnp.concatenate([
-                        ep_transitions.observation[1:],
-                        ep_transitions.observation[-1:]
-                    ], axis=0)
+                ep_next_obs_full = ep_transitions.extras["next_observation"]  # (num_exploratory_steps, num_envs, obs_size)
                 
                 # Extract state only (remove goal padding)
                 ep_next_states = ep_next_obs_full[:, :, :state_size]  # (num_exploratory_steps, num_envs, state_dim)
@@ -918,12 +911,11 @@ class GoExploreSAC:
             ep_actions = ep_transitions.action  # (batch_size, action_size)
             ep_rewards = ep_transitions.reward  # (batch_size,)
             ep_discounts = ep_transitions.discount  # (batch_size,)
-            ep_next_obs = ep_transitions.extras.get("next_observation", ep_obs)  # (batch_size, state_size)
-            if ep_next_obs.shape[-1] > state_size:
-                ep_next_obs = ep_next_obs[:, :state_size]  # Extract state only
+            # Get next_observation from extras (JAX-compatible access)
+            ep_next_obs_padded = ep_transitions.extras["next_observation"]  # (batch_size, obs_size)
+            ep_next_obs = ep_next_obs_padded[:, :state_size]  # Extract state only (batch_size, state_size)
             
             # Create SAC Transition format
-            from brax.training.agents.sac.sac import Transition as SACTransition
             ep_sac_transitions = SACTransition(
                 observation=ep_obs,
                 next_observation=ep_next_obs,
