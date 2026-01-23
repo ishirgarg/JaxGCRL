@@ -816,7 +816,61 @@ class MaxWaypointRatioOneEnvProposer:
         else:
             proposed_goals = candidate_goals[best_g_indices]      # (batch, goal_dim)
 
+        # Log visualizations only at specified intervals to reduce wandb storage
+        if training_state is not None:
+            env_steps = training_state.env_steps
+        else:
+            env_steps = jnp.array(0)  # Default if not provided
+        
+        # Select a state index for visualization (use first state)
+        viz_state_idx = jnp.array(0)
+        
+        jax.experimental.io_callback(
+            MaxWaypointRatioOneEnvProposer._log_goal_selection_viz,
+            None,
+            current_states,
+            candidate_goals,
+            env_goals,
+            best_g_indices,
+            best_h_indices,
+            energy_mats,
+            viz_state_idx,
+            env_steps,
+            env.goal_indices,
+            env.x_bounds if hasattr(env, 'x_bounds') else None,
+            env.y_bounds if hasattr(env, 'y_bounds') else None,
+            self.LOG_INTERVAL_STEPS
+        )
+
         return proposed_goals, buffer_state
+    
+    @staticmethod
+    def _log_goal_selection_viz(current_states, candidate_goals, env_goals, 
+                              best_g_indices, best_h_indices, energy_mats, 
+                              viz_state_idx, env_steps, goal_indices, x_bounds, y_bounds, log_interval_steps):
+        """Visualize goal selection showing trajectory from current -> candidate -> env goals."""
+        
+        # Only log if enough steps have passed since last log
+        if not should_log_at_interval(env_steps, log_interval_steps, 'max_waypoint_ratio'):
+            return
+        
+        # Use viz_state_idx for env_goal_ranking plot, random for goal_selection plot
+        num_states = current_states.shape[0]
+        random_state_indices = np.random.choice(num_states, size=min(4, num_states), replace=False)
+        # Make sure viz_state_idx is in random_state_indices for consistency
+        random_state_indices[0] = int(viz_state_idx)
+        
+        # Generate visualization using shared utility
+        pil_image = create_goal_selection_plot(
+            current_states, candidate_goals, env_goals, best_g_indices, best_h_indices, energy_mats, 
+            goal_indices, random_state_indices, x_bounds, y_bounds
+        )
+        
+        metrics = {
+            'max_waypoint_ratio/goal_selection_viz': wandb.Image(pil_image),
+        }
+        
+        wandb.log(metrics, step=int(env_steps))
 
 
 @dataclass
