@@ -38,7 +38,7 @@ from .proposers import (
     MaxWaypointRatioOneEnvProposer,
     QEpistemicProposer,
 )
-from .goals_utils import compute_min_critic_mean_reward
+from .goals_utils import compute_min_critic_mean_reward, compute_max_critic_reward_per_transition
 from brax.training.agents.sac import networks as sac_networks
 
 Metrics = types.Metrics
@@ -125,31 +125,6 @@ def flatten_batch(buffer_config, transition, sample_key):
         },
     )
 
-
-def compute_ep_reward(reward_name: str, transitions: Transition, env) -> jnp.ndarray:
-    """Compute rewards for EP transitions based on reward_name.
-    
-    Args:
-        reward_name: Name of the reward function to use
-        transitions: EP transitions (non-goal-conditioned)
-        env: Environment (for accessing state_dim, goal_indices, etc.)
-        
-    Returns:
-        rewards: (batch_size,) array of computed rewards
-    """
-    batch_size = transitions.observation.shape[0]
-    
-    if reward_name == "mean_max_critic":
-        # mean_max_critic reward needs the full trajectory to compute,
-        # so return zeros here. It will be computed after the rollout is complete.
-        return jnp.zeros((batch_size,))
-    elif reward_name == "placeholder":
-        # Placeholder: return zero rewards
-        return jnp.zeros((batch_size,))
-    else:
-        raise ValueError(f"Unknown reward_name: {reward_name}")
-
-
 def save_params(path: str, params: Any):
     """Saves parameters in flax format."""
     with epath.Path(path).open("wb") as fout:
@@ -190,6 +165,12 @@ class GoExploreSAC:
 
     # layer norm
     use_ln: bool = False
+    
+    # EP observation normalization (same as SAC)
+    normalize_observations: bool = False
+    
+    # EP target update rate (same as SAC)
+    tau: float = 0.005
 
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
@@ -203,7 +184,7 @@ class GoExploreSAC:
     gcp_num_critic_ensemble: int = 5
     
     # EP reward computation
-    ep_reward_name: str = "placeholder"  # Will be used to compute rewards from trajectories
+    ep_reward_name: Literal["max_mean_critic"] = "max_mean_critic"  # Will be used to compute rewards from trajectories
 
     def check_config(self, config):
         """
@@ -279,7 +260,7 @@ class GoExploreSAC:
         train_env.step = jax.jit(train_env.step)
         
         # Assign unique trajectory IDs per environment
-        TRAJ_ID_MULTIPLIER = 100000
+        TRAJ_ID_MULTIPLIER = 1000000
         env_indices = jnp.arange(config.num_envs, dtype=jnp.int32)
         initial_info = dict(env_state.info)
         initial_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
@@ -314,27 +295,35 @@ class GoExploreSAC:
         )
 
         # EP Actor (non-goal-conditioned) - uses SAC network
+        # Use same pattern as SAC: create normalize function
+        def normalize_fn(x, y):
+            return x
+        
+        if self.normalize_observations:
+            normalize_fn = running_statistics.normalize
+        
         ep_sac_network = sac_networks.make_sac_networks(
             observation_size=ep_obs_size,
             action_size=action_size,
-            preprocess_observations_fn=lambda x: x,
+            preprocess_observations_fn=normalize_fn,
             layer_norm=self.use_ln,
             hidden_layer_sizes=[self.h_dim] * self.n_hidden,
         )
         
-        # Initialize EP networks
+        # Create policy inference function (same as SAC)
+        make_ep_policy = sac_networks.make_inference_fn(ep_sac_network)
+        
+        # Initialize EP networks (same pattern as SAC)
+        # The init function returns just the params (processor_params are handled in apply)
         dummy_ep_obs = jnp.zeros((ep_obs_size,))
         dummy_ep_action = jnp.zeros((action_size,))
+        
+        # Q-network initialization (same as SAC)
         ep_q_params = ep_sac_network.q_network.init(ep_q_key, dummy_ep_obs, dummy_ep_action)
         ep_target_q_params = jax.tree_util.tree_map(lambda x: x, ep_q_params)
         
-        # EP actor params (from SAC network)
+        # Policy network initialization (same as SAC)
         ep_actor_params = ep_sac_network.policy_network.init(ep_actor_key, dummy_ep_obs)
-        ep_actor_state = TrainState.create(
-            apply_fn=ep_sac_network.policy_network.apply,
-            params=ep_actor_params,
-            tx=optax.adam(learning_rate=self.policy_lr),
-        )
 
         # GCP Critic (CRL)
         gcp_sa_encoder = Encoder(
@@ -379,33 +368,37 @@ class GoExploreSAC:
             tx=optax.adam(learning_rate=self.alpha_lr),
         )
         
-        # EP alpha (SAC)
+        # EP alpha (SAC) - initialize optimizers (will be created later)
         ep_alpha_params = log_alpha
-        ep_alpha_optimizer_state = ep_alpha_optimizer.init(ep_alpha_params)
         
-        # EP optimizer states
-        ep_q_optimizer_state = ep_q_optimizer.init(ep_q_params)
-        ep_actor_optimizer_state = ep_policy_optimizer.init(ep_actor_params)
+        # EP optimizer states (will be initialized after optimizers are created)
+        # Note: optimizers are created later in the code, so we'll initialize states there
         
         # EP normalizer (SAC)
         ep_normalizer_params = running_statistics.init_state(
             specs.Array((ep_obs_size,), jnp.float32)
         )
 
-        # Training state
+        # EP normalizer (SAC)
+        ep_normalizer_params = running_statistics.init_state(
+            specs.Array((ep_obs_size,), jnp.float32)
+        )
+        
+        # Training state (EP optimizer states and actor state will be set after optimizers are created)
+        # Create placeholder values for now
         training_state = TrainingState(
             env_steps=jnp.zeros(()),
             gradient_steps=jnp.zeros(()),
             gcp_actor_state=gcp_actor_state,
             gcp_critic_state=gcp_critic_state,
-            ep_actor_state=ep_actor_state,
+            ep_actor_state=None,  # Will be set after optimizers are created
             ep_q_params=ep_q_params,
             ep_target_q_params=ep_target_q_params,
-            ep_q_optimizer_state=ep_q_optimizer_state,
-            ep_actor_optimizer_state=ep_actor_optimizer_state,
+            ep_q_optimizer_state=None,  # Will be set after optimizers are created
+            ep_actor_optimizer_state=None,  # Will be set after optimizers are created
             gcp_alpha_state=gcp_alpha_state,
             ep_alpha_params=ep_alpha_params,
-            ep_alpha_optimizer_state=ep_alpha_optimizer_state,
+            ep_alpha_optimizer_state=None,  # Will be set after optimizers are created
             ep_normalizer_params=ep_normalizer_params,
         )
 
@@ -583,14 +576,40 @@ class GoExploreSAC:
                 extras={"state_extras": state_extras},
             )
         
-        def ep_actor_step(actor_state, env, env_state, key, extra_fields):
-            """EP actor step (non-goal-conditioned, uses SAC policy)."""
+        @functools.partial(jax.jit, static_argnames=("reward_name",))
+        def compute_ep_reward(reward_name: str, transitions: Transition, env) -> jnp.ndarray:
+            """Compute EP reward based on reward_name.
+            
+            For now, most rewards are computed after the full rollout.
+            This function is a placeholder that returns environment rewards.
+            """
+            batch_size = transitions.observation.shape[0]
+            
+            if reward_name == "mean_max_critic":
+                # mean_max_critic reward needs the full trajectory to compute,
+                # so return zeros here. It will be computed after the rollout is complete.
+                return jnp.zeros((batch_size,))
+            elif reward_name == "placeholder":
+                # Placeholder: return zero rewards
+                return jnp.zeros((batch_size,))
+            else:
+                raise ValueError(f"Unknown reward_name: {reward_name}")
+        
+        def ep_actor_step(training_state, env, env_state, key, extra_fields):
+            """EP actor step (non-goal-conditioned, uses SAC policy).
+            
+            Uses the same pattern as SAC: make_policy with (normalizer_params, policy_params)
+            """
             # Extract state only (no goals) for policy input
             state_only = env_state.obs[:, :state_size]
             
-            # Sample action from SAC policy
-            policy_dist = ep_sac_network.policy_network.apply(actor_state.params, state_only)
-            actions = policy_dist.sample(seed=key)
+            # Create policy function (same as SAC)
+            # make_ep_policy expects (normalizer_params, policy_params) tuple
+            ep_policy_params = (training_state.ep_normalizer_params, training_state.ep_actor_state.params)
+            policy = make_ep_policy(ep_policy_params, deterministic=False)
+            
+            # Sample action from SAC policy (same as SAC actor_step)
+            actions, policy_extras = policy(state_only, key)
             
             # Step environment (uses full obs with goals, but we'll store state-only)
             nstate = env.step(env_state, actions)
@@ -627,6 +646,7 @@ class GoExploreSAC:
                 extras={
                     "state_extras": state_extras,
                     "next_observation": next_obs_padded,
+                    "policy_extras": policy_extras,
                 },
             )
 
@@ -645,7 +665,7 @@ class GoExploreSAC:
             extra_fields=("truncation", "traj_id"),
         )
 
-        # Initialize SAC loss functions for EP
+        # Initialize SAC loss functions for EP (same as SAC)
         ep_alpha_optimizer = optax.adam(learning_rate=self.alpha_lr)
         ep_policy_optimizer = optax.adam(learning_rate=self.policy_lr)
         ep_q_optimizer = optax.adam(learning_rate=self.critic_lr)
@@ -665,6 +685,26 @@ class GoExploreSAC:
         )
         ep_actor_update = gradients.gradient_update_fn(
             ep_actor_loss_fn, ep_policy_optimizer, pmap_axis_name=None
+        )
+
+        # Initialize EP optimizer states and actor state (now that optimizers are created)
+        ep_alpha_optimizer_state = ep_alpha_optimizer.init(ep_alpha_params)
+        ep_q_optimizer_state = ep_q_optimizer.init(ep_q_params)
+        ep_actor_optimizer_state = ep_policy_optimizer.init(ep_actor_params)
+        
+        # Create EP actor TrainState (for compatibility, though we use policy_params directly)
+        ep_actor_state = TrainState.create(
+            apply_fn=None,  # Not used directly, we use make_ep_policy instead
+            params=ep_actor_params,
+            tx=ep_policy_optimizer,
+        )
+        
+        # Update training state with EP optimizer states
+        training_state = training_state.replace(
+            ep_actor_state=ep_actor_state,
+            ep_q_optimizer_state=ep_q_optimizer_state,
+            ep_actor_optimizer_state=ep_actor_optimizer_state,
+            ep_alpha_optimizer_state=ep_alpha_optimizer_state,
         )
 
         @functools.partial(jax.jit, static_argnames=("ep_reward_name",))
@@ -740,12 +780,12 @@ class GoExploreSAC:
             # EP does NOT use goal proposal - it's non-goal-conditioned
             
             def ep_rollout_step(carry, unused_t):
-                env_state, ep_actor_state, current_key = carry
+                env_state, training_state, current_key = carry
                 current_key, next_key = jax.random.split(current_key)
                 
-                # Use ep_actor_step helper function
+                # Use ep_actor_step helper function (passes training_state for normalizer)
                 nstate, transition = ep_actor_step(
-                    ep_actor_state, train_env, env_state, current_key, ("truncation", "traj_id")
+                    training_state, train_env, env_state, current_key, ("truncation", "traj_id")
                 )
                 
                 # Check for early termination
@@ -762,50 +802,65 @@ class GoExploreSAC:
                 }
                 transition = transition._replace(extras={"state_extras": transition_extras})
                 
-                return (nstate, ep_actor_state, next_key), transition
+                return (nstate, training_state, next_key), transition
             
             (env_state, _, _), ep_transitions = jax.lax.scan(
                 ep_rollout_step,
-                (env_state, ep_actor_state, ep_key),
+                (env_state, training_state, ep_key),
                 (),
                 length=num_exploratory_steps
             )
             
             # ===== COMPUTE MEAN_MAX_CRITIC REWARD FOR EP TRANSITIONS =====
-            # Compute reward: mean over (s,a) of max_g f(s, a, g) for each environment
+            # Compute reward: max_g f(s, a_g, g) for each transition
+            # where s is the next state (state we reached), a_g is sampled from GCP policy π(s, g)
             if ep_reward_name == "mean_max_critic" and hasattr(train_env, 'possible_goals') and train_env.possible_goals is not None:
-                # Extract states and actions from EP transitions
-                # ep_transitions shape: (num_exploratory_steps, num_envs, ...)
-                ep_states = ep_transitions.observation[:, :, :state_size]  # (num_exploratory_steps, num_envs, state_dim)
-                ep_actions = ep_transitions.action  # (num_exploratory_steps, num_envs, action_dim)
                 env_goals = train_env.possible_goals  # (num_env_goals, goal_dim)
                 
-                # Compute reward for each environment's trajectory
-                def compute_reward_for_env(env_idx):
-                    """Compute min_critic_mean reward for a single environment's EP trajectory."""
-                    env_states = ep_states[:, env_idx, :]  # (num_exploratory_steps, state_dim)
-                    env_actions = ep_actions[:, env_idx, :]  # (num_exploratory_steps, action_dim)
-                    
-                    reward = compute_min_critic_mean_reward(
-                        env_states, env_actions, env_goals,
+                # Get next states from EP transitions (the states we reached)
+                # ep_transitions.observation has shape (num_exploratory_steps, num_envs, obs_size)
+                # We need the next states, which are stored in extras["next_observation"]
+                # If not available, use the observation from the next timestep
+                ep_next_obs_full = ep_transitions.extras.get("next_observation", None)
+                if ep_next_obs_full is None:
+                    # Fallback: use observation from next timestep (shifted)
+                    # For last timestep, use the same observation
+                    ep_next_obs_full = jnp.concatenate([
+                        ep_transitions.observation[1:],
+                        ep_transitions.observation[-1:]
+                    ], axis=0)
+                
+                # Extract state only (remove goal padding)
+                ep_next_states = ep_next_obs_full[:, :, :state_size]  # (num_exploratory_steps, num_envs, state_dim)
+                
+                # Reshape to (num_transitions, state_dim) for vectorization
+                num_transitions = num_exploratory_steps * num_envs
+                ep_next_states_flat = ep_next_states.reshape(num_transitions, state_size)
+                
+                # Create keys for each transition
+                reward_keys = jax.random.split(ep_key, num_transitions)
+                
+                # Compute reward for each transition
+                def compute_reward_for_transition(next_state, key):
+                    """Compute max_critic reward for a single transition."""
+                    reward = compute_max_critic_reward_per_transition(
+                        next_state, env_goals,
                         gcp_actor, training_state.gcp_actor_state.params,
                         training_state.gcp_critic_state.params,
-                        gcp_sa_encoder, gcp_g_encoder, self.energy_fn
+                        gcp_sa_encoder, gcp_g_encoder, self.energy_fn, key
                     )
                     return reward
                 
-                # Compute reward for all environments
-                min_critic_mean_rewards = jax.vmap(compute_reward_for_env)(jnp.arange(num_envs))  # (num_envs,)
+                # Vectorize over all transitions
+                rewards_flat = jax.vmap(compute_reward_for_transition)(ep_next_states_flat, reward_keys)
                 
-                # Add reward to each transition in the EP trajectory
-                # Broadcast reward to all time steps for each environment
-                reward_broadcast = min_critic_mean_rewards[None, :]  # (1, num_envs)
-                reward_broadcast = jnp.broadcast_to(reward_broadcast, (num_exploratory_steps, num_envs))  # (num_exploratory_steps, num_envs)
+                # Reshape back to (num_exploratory_steps, num_envs)
+                rewards = rewards_flat.reshape(num_exploratory_steps, num_envs)
                 
                 # Add to existing reward
                 ep_transitions = ep_transitions._replace(
-                    reward=ep_transitions.reward + reward_broadcast
-            )
+                    reward=ep_transitions.reward + rewards
+                )
             
             # Combine transitions
             combined_transitions = jax.tree_util.tree_map(
@@ -896,14 +951,16 @@ class GoExploreSAC:
                 context, gcp_networks, gcp_transitions, training_state.gcp_critic_state, gcp_critic_key
             )
             
-            # Update EP networks (SAC)
+            # Update EP networks (SAC) - same pattern as SAC update_step
             # EP transitions have shape (batch_size, ...) with state-only observations
             # Convert to SAC Transition format (with next_observation)
-            ep_obs = ep_transitions.observation  # (batch_size, state_size)
+            ep_obs = ep_transitions.observation[:, :state_size]  # Extract state only (batch_size, state_size)
             ep_actions = ep_transitions.action  # (batch_size, action_size)
             ep_rewards = ep_transitions.reward  # (batch_size,)
             ep_discounts = ep_transitions.discount  # (batch_size,)
             ep_next_obs = ep_transitions.extras.get("next_observation", ep_obs)  # (batch_size, state_size)
+            if ep_next_obs.shape[-1] > state_size:
+                ep_next_obs = ep_next_obs[:, :state_size]  # Extract state only
             
             # Create SAC Transition format
             from brax.training.agents.sac.sac import Transition as SACTransition
@@ -916,19 +973,7 @@ class GoExploreSAC:
                 extras=ep_transitions.extras,
             )
             
-            # Normalize observations for EP
-            ep_normalized_obs = running_statistics.normalize(
-                ep_obs, training_state.ep_normalizer_params
-            )
-            ep_normalized_next_obs = running_statistics.normalize(
-                ep_next_obs, training_state.ep_normalizer_params
-            )
-            ep_sac_transitions = ep_sac_transitions._replace(
-                observation=ep_normalized_obs,
-                next_observation=ep_normalized_next_obs
-            )
-            
-            # Update EP alpha
+            # Update EP alpha (same as SAC)
             ep_alpha = jnp.exp(training_state.ep_alpha_params)
             ep_alpha_loss, ep_alpha_params, ep_alpha_optimizer_state = ep_alpha_update(
                 training_state.ep_alpha_params,
@@ -940,7 +985,7 @@ class GoExploreSAC:
             )
             ep_alpha = jnp.exp(ep_alpha_params)
             
-            # Update EP critic
+            # Update EP critic (same as SAC)
             ep_critic_loss, ep_q_params, ep_q_optimizer_state = ep_critic_update(
                 training_state.ep_q_params,
                 training_state.ep_actor_state.params,
@@ -952,7 +997,7 @@ class GoExploreSAC:
                 optimizer_state=training_state.ep_q_optimizer_state,
             )
             
-            # Update EP actor
+            # Update EP actor (same as SAC)
             ep_actor_loss, ep_actor_params, ep_actor_optimizer_state = ep_actor_update(
                 training_state.ep_actor_state.params,
                 training_state.ep_normalizer_params,
@@ -963,15 +1008,14 @@ class GoExploreSAC:
                 optimizer_state=training_state.ep_actor_optimizer_state,
             )
             
-            # Update EP target Q-network (soft update)
-            tau = 0.005  # Can be made configurable
+            # Update EP target Q-network (soft update, same as SAC)
             new_ep_target_q_params = jax.tree_util.tree_map(
-                lambda x, y: x * (1 - tau) + y * tau,
+                lambda x, y: x * (1 - self.tau) + y * self.tau,
                 training_state.ep_target_q_params,
                 ep_q_params,
             )
             
-            # Update EP normalizer
+            # Update EP normalizer (same as SAC)
             new_ep_normalizer_params = running_statistics.update(
                 training_state.ep_normalizer_params,
                 ep_obs,

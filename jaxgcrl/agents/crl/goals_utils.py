@@ -321,6 +321,80 @@ def compute_energy_for_state_goal_pairs(
     return energies
 
 
+def compute_max_critic_reward_per_transition(
+    next_state, env_goals, actor, actor_params, critic_params,
+    sa_encoder, g_encoder, energy_fn_name, key
+):
+    """Compute max_critic reward for a single transition: max_g f(s, a_g, g).
+    
+    For the reached state s, for each environment goal g:
+    1. Sample action a_g from goal-conditioned policy: a_g ~ π_gcp(s, g)
+    2. Compute f(s, a_g, g) using the GCP critic
+    3. Take max over all environment goals: max_g f(s, a_g, g)
+    
+    Args:
+        next_state: (state_dim,) state vector (the state we reached after transition)
+        env_goals: (num_env_goals, goal_dim) environment goals
+        actor: Actor network (GCP actor)
+        actor_params: Actor parameters (GCP actor)
+        critic_params: Critic parameters (GCP critic, can be single or ensemble)
+        sa_encoder: State-action encoder network (GCP)
+        g_encoder: Goal encoder network (GCP)
+        energy_fn_name: Name of energy function
+        key: JAX random key for sampling actions
+        
+    Returns:
+        reward: Scalar reward value (max over env goals of f(s, a_g, g))
+    """
+    from jaxgcrl.agents.crl.losses import energy_fn
+    
+    num_env_goals = env_goals.shape[0]
+    
+    # Expand state to match number of env goals
+    state_expanded = jnp.tile(next_state, (num_env_goals, 1))  # (num_env_goals, state_dim)
+    
+    # Create observations: concatenate state and goal
+    obs = jnp.concatenate([state_expanded, env_goals], axis=1)  # (num_env_goals, obs_dim)
+    
+    # Sample actions from goal-conditioned policy for each (s, g) pair
+    # Use deterministic action (mean) for consistency
+    means, log_stds = actor.apply(actor_params, obs)  # (num_env_goals, action_dim) each
+    actions = jnp.tanh(means)  # (num_env_goals, action_dim) - deterministic action
+    
+    # Compute state-action pairs
+    sa_pairs = jnp.concatenate([state_expanded, actions], axis=1)  # (num_env_goals, state_dim + action_dim)
+    
+    # Handle ensemble vs single critic
+    is_ensemble = isinstance(critic_params["sa_encoder"], list)
+    
+    if is_ensemble:
+        # Ensemble case: compute Q-values for each critic, then take mean
+        stacked_sa_params, stacked_g_params = stack_ensemble_params(critic_params)
+        
+        def compute_q_for_critic(sa_p, g_p):
+            phi_sa = sa_encoder.apply(sa_p, sa_pairs)  # (num_env_goals, repr_dim)
+            psi_g = g_encoder.apply(g_p, env_goals)  # (num_env_goals, repr_dim)
+            q_values = energy_fn(energy_fn_name, phi_sa, psi_g)  # (num_env_goals,)
+            return q_values
+        
+        # Compute Q-values for all ensemble members
+        all_q_values = jax.vmap(compute_q_for_critic)(stacked_sa_params, stacked_g_params)  # (num_ensemble, num_env_goals)
+        
+        # Take mean over ensemble, then max over env goals
+        mean_q_values = jnp.mean(all_q_values, axis=0)  # (num_env_goals,)
+        max_q = jnp.max(mean_q_values)  # Scalar
+    else:
+        # Single critic case
+        phi_sa = sa_encoder.apply(critic_params['sa_encoder'], sa_pairs)  # (num_env_goals, repr_dim)
+        psi_g = g_encoder.apply(critic_params['g_encoder'], env_goals)  # (num_env_goals, repr_dim)
+        q_values = energy_fn(energy_fn_name, phi_sa, psi_g)  # (num_env_goals,)
+        
+        # Take max over env goals
+        max_q = jnp.max(q_values)  # Scalar
+    
+    return max_q
+
+
 def compute_min_critic_mean_reward(
     states, actions, env_goals, actor, actor_params, critic_params,
     sa_encoder, g_encoder, energy_fn_name
