@@ -5,10 +5,7 @@ import pickle
 import random
 import time
 from typing import Any, Callable, Literal, NamedTuple, Optional, Tuple, Union
-import matplotlib.pyplot as plt
 import wandb
-import io
-from PIL import Image
 
 import flax.linen as nn
 import jax
@@ -25,7 +22,7 @@ from flax.training.train_state import TrainState
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
-from jaxgcrl.utils.visualize import visualize_goals_2d, visualize_kde_heatmap, visualize_q_function_2d, visualize_dual_crl_trajectories_2d
+from jaxgcrl.utils.visualize import visualize_goals_2d, visualize_kde_heatmap, visualize_q_function_2d, visualize_dual_crl_trajectories_2d, visualize_scatter_sample
 
 from .losses import update_actor_and_alpha, update_critic
 from .networks import Actor, Encoder
@@ -1262,53 +1259,35 @@ class GoExploreCRL:
                     ep_final_states.append(ep_final_state)
                     ep_goals.append(ep_goal)
                 
-                # Get intermediate states from transitions in their respective phases
-                # Intermediate states are computed per transition as fractions of the remaining trajectory
-                # We use intermediate states from the first transition of each phase and filter to correct phase
+                # Extract 6 equally spaced states along each policy's rollout path
+                # GC path: from start_state to gc_final_state
+                # EP path: from gc_final_state to ep_final_state
                 
-                # GC intermediate states: use intermediate states from first GC transition
+                # GC intermediate states: 6 equally spaced states along GC rollout
                 gc_intermediate = np.array([]).reshape(0, len(train_env.goal_indices))
                 if len(gc_indices) > 0:
-                    gc_first_idx = gc_indices[0]  # First GC transition in this trajectory
-                    gc_intermediate_full = intermediate_traj_flat[gc_first_idx, :, train_env.goal_indices]  # (num_intermediate, goal_dim)
-                    # Map each intermediate state back to its actual trajectory position and filter by phase
-                    gc_local_idx = gc_first_idx - traj_indices[0]  # Local index within this trajectory
-                    remaining_length = len(traj_indices) - gc_local_idx
-                    gc_intermediate_list = []
-                    for inter_idx in range(gc_intermediate_full.shape[0]):
-                        if remaining_length > 0:
-                            # Intermediate states are at fractions: [1/(n+1), 2/(n+1), ..., n/(n+1)] of remaining trajectory
-                            fraction = (inter_idx + 1) / (gc_intermediate_full.shape[0] + 1)
-                            target_local_idx = gc_local_idx + int(fraction * remaining_length)
-                            target_local_idx = min(target_local_idx, len(traj_indices) - 1)
-                            target_global_idx = traj_indices[target_local_idx]
-                            # Only include if the target state is actually in GC phase
-                            if target_global_idx < len(in_gc_phase_flat) and in_gc_phase_flat[target_global_idx] > 0.5:
-                                gc_intermediate_list.append(gc_intermediate_full[inter_idx])
-                    if len(gc_intermediate_list) > 0:
-                        gc_intermediate = np.array(gc_intermediate_list)
+                    # Get all GC phase states (observations at goal indices)
+                    gc_states = obs_flat[gc_indices][:, train_env.goal_indices]  # (num_gc_steps, goal_dim)
+                    
+                    # Extract 6 equally spaced states along the GC path
+                    num_gc_steps = len(gc_states)
+                    if num_gc_steps > 0:
+                        # Sample 6 equally spaced indices (including endpoints)
+                        indices = np.linspace(0, num_gc_steps - 1, 6).astype(int)
+                        gc_intermediate = gc_states[indices]  # (6, goal_dim)
                 
-                # EP intermediate states: use intermediate states from first EP transition
+                # EP intermediate states: 6 equally spaced states along EP rollout
                 ep_intermediate = np.array([]).reshape(0, len(train_env.goal_indices))
                 if len(ep_indices) > 0:
-                    ep_first_idx = ep_indices[0]  # First EP transition in this trajectory
-                    ep_intermediate_full = intermediate_traj_flat[ep_first_idx, :, train_env.goal_indices]  # (num_intermediate, goal_dim)
-                    # Map each intermediate state back to its actual trajectory position and filter by phase
-                    ep_local_idx = ep_first_idx - traj_indices[0]  # Local index within this trajectory
-                    remaining_length = len(traj_indices) - ep_local_idx
-                    ep_intermediate_list = []
-                    for inter_idx in range(ep_intermediate_full.shape[0]):
-                        if remaining_length > 0:
-                            # Intermediate states are at fractions: [1/(n+1), 2/(n+1), ..., n/(n+1)] of remaining trajectory
-                            fraction = (inter_idx + 1) / (ep_intermediate_full.shape[0] + 1)
-                            target_local_idx = ep_local_idx + int(fraction * remaining_length)
-                            target_local_idx = min(target_local_idx, len(traj_indices) - 1)
-                            target_global_idx = traj_indices[target_local_idx]
-                            # Only include if the target state is actually in EP phase
-                            if target_global_idx < len(in_ep_phase_flat) and in_ep_phase_flat[target_global_idx] > 0.5:
-                                ep_intermediate_list.append(ep_intermediate_full[inter_idx])
-                    if len(ep_intermediate_list) > 0:
-                        ep_intermediate = np.array(ep_intermediate_list)
+                    # Get all EP phase states (observations at goal indices)
+                    ep_states = obs_flat[ep_indices][:, train_env.goal_indices]  # (num_ep_steps, goal_dim)
+                    
+                    # Extract 6 equally spaced states along the EP path
+                    num_ep_steps = len(ep_states)
+                    if num_ep_steps > 0:
+                        # Sample 6 equally spaced indices (including endpoints)
+                        indices = np.linspace(0, num_ep_steps - 1, 6).astype(int)
+                        ep_intermediate = ep_states[indices]  # (6, goal_dim)
                 
                 # Store separate GC and EP intermediate states
                 gc_intermediate_states_list.append(gc_intermediate)
@@ -1356,30 +1335,34 @@ class GoExploreCRL:
                 x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
             )
             
-            # Heatmaps
+            # Scatter plots: 512 randomly sampled points for each
             # 1. GC final states
-            visualize_kde_heatmap(
-                gc_final_states, "GC Final States", f"{wandb_key}/gc_final_states_heatmap",
-                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
-            )
+            if len(gc_final_states) > 0:
+                visualize_scatter_sample(
+                    gc_final_states, "GC Final States", f"{wandb_key}/gc_final_states_scatter",
+                    train_env.x_bounds, train_env.y_bounds
+                )
             
             # 2. EP final states
-            visualize_kde_heatmap(
-                ep_final_states, "EP Final States", f"{wandb_key}/ep_final_states_heatmap",
-                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
-            )
+            if len(ep_final_states) > 0:
+                visualize_scatter_sample(
+                    ep_final_states, "EP Final States", f"{wandb_key}/ep_final_states_scatter",
+                    train_env.x_bounds, train_env.y_bounds
+                )
             
             # 3. GC goal proposals
-            visualize_kde_heatmap(
-                gc_goals, "GC Goal Proposals", f"{wandb_key}/gc_goal_proposals_heatmap",
-                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
-            )
+            if len(gc_goals) > 0:
+                visualize_scatter_sample(
+                    gc_goals, "GC Goal Proposals", f"{wandb_key}/gc_goal_proposals_scatter",
+                    train_env.x_bounds, train_env.y_bounds
+                )
             
             # 4. EP goal proposals
-            visualize_kde_heatmap(
-                ep_goals, "EP Goal Proposals", f"{wandb_key}/ep_goal_proposals_heatmap",
-                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
-            )
+            if len(ep_goals) > 0:
+                visualize_scatter_sample(
+                    ep_goals, "EP Goal Proposals", f"{wandb_key}/ep_goal_proposals_scatter",
+                    train_env.x_bounds, train_env.y_bounds
+                )
             
             logging.info(f"Plotted visualizations at env step {training_state.env_steps.item()}")
             

@@ -315,6 +315,53 @@ def visualize_kde_heatmap(data_xy, plot_title, wandb_key, x_bounds=None, y_bound
     pil_image = Image.open(buf)
     wandb.log({wandb_key: wandb.Image(pil_image)})
 
+
+def visualize_scatter_sample(data_xy, plot_title, wandb_key, x_bounds=None, y_bounds=None, num_samples=512):
+    '''Visualize scatter plot with random sample of points.
+    - data_xy: (num_points, 2) array of xy data
+    - plot_title: str, title for the plot
+    - wandb_key: str, key to log the plot in WandB
+    - x_bounds: tuple (min, max) for x-axis range, or None for auto
+    - y_bounds: tuple (min, max) for y-axis range, or None for auto
+    - num_samples: int, maximum number of points to sample and plot (default: 512)
+    '''
+    if len(data_xy) == 0:
+        return
+    
+    assert data_xy.shape[1] == 2, "Scatter plot visualization only supported for 2D goals"
+    
+    # Sample up to num_samples points
+    num_points = min(num_samples, len(data_xy))
+    if num_points < len(data_xy):
+        sample_indices = np.random.choice(len(data_xy), num_points, replace=False)
+        sampled_data = data_xy[sample_indices]
+    else:
+        sampled_data = data_xy
+    
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.scatter(sampled_data[:, 0], sampled_data[:, 1], 
+              s=20, alpha=0.6, edgecolors='black', linewidths=0.3)
+    
+    if x_bounds is not None:
+        ax.set_xlim(x_bounds)
+    if y_bounds is not None:
+        ax.set_ylim(y_bounds)
+    
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    ax.set_title(f'{plot_title} ({num_points} points)')
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    
+    # Save to buffer and log to WandB
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    
+    pil_image = Image.open(buf)
+    wandb.log({wandb_key: wandb.Image(pil_image)})
+
 def visualize_q_function_2d(actor, sa_encoder, g_encoder, actor_params, critic_params, 
                             state, goal_indices, x_bounds, y_bounds, wandb_key, 
                             energy_fn_name, grid_resolution=50):
