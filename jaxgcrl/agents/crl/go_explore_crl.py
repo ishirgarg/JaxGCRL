@@ -340,6 +340,9 @@ class GoExploreCRL:
         env_indices = jnp.arange(config.num_envs, dtype=jnp.int32)
         initial_info = dict(env_state.info)
         initial_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
+        # Initialize gc_proposed_goals and ep_proposed_goals for consistent PyTree structure
+        initial_info["gc_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+        initial_info["ep_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
         env_state = env_state.replace(info=initial_info)
 
         # Dimensions definitions and sanity checks
@@ -984,6 +987,12 @@ class GoExploreCRL:
             )
 
         def prefill_replay_buffer(training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, key):
+            # Initialize env_state.info with gc_proposed_goals and ep_proposed_goals for consistent PyTree structure
+            initial_info = dict(env_state.info)
+            initial_info["gc_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+            initial_info["ep_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+            env_state = env_state.replace(info=initial_info)
+            
             @jax.jit
             def f(carry, unused):
                 del unused
@@ -1055,9 +1064,12 @@ class GoExploreCRL:
                 env_state_final = jax.jit(train_env.reset)(reset_keys)
                 TRAJ_ID_MULTIPLIER = 10000000
                 env_indices = jnp.arange(config.num_envs, dtype=jnp.int32)
-                initial_info = dict(env_state_final.info)
-                initial_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
-                env_state_final = env_state_final.replace(info=initial_info)
+                final_info = dict(env_state_final.info)
+                final_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
+                # Initialize gc_proposed_goals and ep_proposed_goals for consistent PyTree structure
+                final_info["gc_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+                final_info["ep_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+                env_state_final = env_state_final.replace(info=final_info)
                 
                 training_state = training_state.replace(
                     env_steps=training_state.env_steps + (num_goal_conditioned_steps + num_exploratory_steps) * config.num_envs,
@@ -1287,12 +1299,20 @@ class GoExploreCRL:
             env_state_final = jax.jit(train_env.reset)(reset_keys)
             TRAJ_ID_MULTIPLIER = 100000
             env_indices = jnp.arange(config.num_envs, dtype=jnp.int32)
-            initial_info = dict(env_state_final.info)
-            initial_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
-            env_state_final = env_state_final.replace(info=initial_info)
+            final_info = dict(env_state_final.info)
+            final_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
+            # Initialize gc_proposed_goals and ep_proposed_goals for consistent PyTree structure
+            final_info["gc_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+            final_info["ep_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+            env_state_final = env_state_final.replace(info=final_info)
             
-            # Combine all collected transitions (take last one for visualization)
-            collected_transitions = all_collected[-1] if len(all_collected) > 0 else all_collected[0]
+            # Combine all collected transitions for visualization
+            # all_collected from scan has shape (total_chunks, unroll_length, num_envs, ...)
+            # Reshape to (total_chunks * unroll_length, num_envs, ...) to get all transitions in sequence
+            collected_transitions = jax.tree_util.tree_map(
+                lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
+                all_collected
+            )
             
             # Average metrics across all chunks
             metrics = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), all_metrics)
@@ -1628,11 +1648,11 @@ class GoExploreCRL:
             # Run EP evaluation and add metrics with "ep_eval" prefix
             ep_eval_metrics = ep_evaluator.run_evaluation(training_state, {})
             # Filter and rename EP evaluation metrics
-            for key, value in ep_eval_metrics.items():
-                if key.startswith("eval/"):
+            for metric_key, metric_value in ep_eval_metrics.items():
+                if metric_key.startswith("eval/"):
                     # Rename eval/ to ep_eval/ for EP metrics
-                    new_key = key.replace("eval/", "ep_eval/")
-                    metrics[new_key] = value
+                    new_key = metric_key.replace("eval/", "ep_eval/")
+                    metrics[new_key] = metric_value
             logging.info("step: %d", current_step)
 
             do_render = ne % config.visualization_interval == 0
