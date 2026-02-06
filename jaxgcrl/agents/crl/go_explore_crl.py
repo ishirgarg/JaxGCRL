@@ -655,6 +655,22 @@ class GoExploreCRL:
                 discount=1 - nstate.done,
                 extras={"state_extras": state_extras},
             )
+        
+        # EP policy evaluation - deterministic
+        def deterministic_ep_actor_step(training_state, env, env_state, extra_fields):
+            means, _ = ep_actor.apply(training_state.ep_actor_state.params, env_state.obs)
+            actions = nn.tanh(means)
+
+            nstate = env.step(env_state, actions)
+            state_extras = {x: nstate.info[x] for x in extra_fields}
+
+            return nstate, Transition(
+                observation=env_state.obs,
+                action=actions,
+                reward=nstate.reward,
+                discount=1 - nstate.done,
+                extras={"state_extras": state_extras},
+            )
 
         def deterministic_actor_step_with_proposals(actor_state, env, env_state, proposed_goals, extra_fields):
             new_obs = env_state.obs.at[:, -len(env.goal_indices):].set(proposed_goals)
@@ -1519,13 +1535,24 @@ class GoExploreCRL:
             training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, prefill_key
         )
 
-        """Setting up evaluator"""
-        evaluator = ActorEvaluator(
+        """Setting up evaluators"""
+        # GCP evaluator
+        key, eval_gcp_key, eval_ep_key = jax.random.split(key, 3)
+        gcp_evaluator = ActorEvaluator(
             deterministic_actor_step,
             eval_env,
             num_eval_envs=config.num_eval_envs,
             episode_length=config.episode_length,
-            key=eval_env_key,
+            key=eval_gcp_key,
+        )
+        
+        # EP evaluator
+        ep_evaluator = ActorEvaluator(
+            deterministic_ep_actor_step,
+            eval_env,
+            num_eval_envs=config.num_eval_envs,
+            episode_length=config.episode_length,
+            key=eval_ep_key,
         )
 
         training_walltime = 0
