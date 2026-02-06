@@ -795,8 +795,10 @@ class GoExploreCRL:
                 gc_proposed_goals = jnp.where(~gc_goals_proposed, gc_proposed_goals_new, gc_proposed_goals_state)
                 
                 # Update env_state with GC goals
+                # Ensure both gc_proposed_goals and ep_proposed_goals are in info for consistent PyTree structure
                 new_info = dict(env_state.info)
                 new_info["gc_proposed_goals"] = gc_proposed_goals
+                new_info["ep_proposed_goals"] = env_state.info.get("ep_proposed_goals", jnp.zeros_like(gc_proposed_goals))
                 
                 def update_env_with_goals():
                     return env_state.replace(
@@ -889,9 +891,10 @@ class GoExploreCRL:
                 ep_proposed_goals = jnp.where(~ep_goals_proposed, ep_proposed_goals_new, ep_proposed_goals_state)
                 
                 # Update env_state with EP goals
+                # Ensure both gc_proposed_goals and ep_proposed_goals are in info for consistent PyTree structure
                 new_info = dict(env_state.info)
                 new_info["ep_proposed_goals"] = ep_proposed_goals
-                new_info["gc_proposed_goals"] = env_state.info.get("gc_proposed_goals", ep_proposed_goals)
+                new_info["gc_proposed_goals"] = env_state.info.get("gc_proposed_goals", jnp.zeros_like(ep_proposed_goals))
                 
                 def update_env_with_ep_goals():
                     return env_state.replace(
@@ -1619,7 +1622,17 @@ class GoExploreCRL:
             }
             current_step = int(training_state.env_steps.item())
 
-            metrics = evaluator.run_evaluation(training_state, metrics)
+            # Run GCP evaluation
+            metrics = gcp_evaluator.run_evaluation(training_state, metrics)
+            
+            # Run EP evaluation and add metrics with "ep_eval" prefix
+            ep_eval_metrics = ep_evaluator.run_evaluation(training_state, {})
+            # Filter and rename EP evaluation metrics
+            for key, value in ep_eval_metrics.items():
+                if key.startswith("eval/"):
+                    # Rename eval/ to ep_eval/ for EP metrics
+                    new_key = key.replace("eval/", "ep_eval/")
+                    metrics[new_key] = value
             logging.info("step: %d", current_step)
 
             do_render = ne % config.visualization_interval == 0
