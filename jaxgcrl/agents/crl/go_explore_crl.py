@@ -302,10 +302,10 @@ class GoExploreCRL:
         env_steps_per_actor_step = config.num_envs * unroll_length  # Steps per chunk
         env_steps_per_training_step = config.num_envs * total_steps_per_training_step  # Steps per full training iteration
         num_prefill_env_steps = self.min_replay_size * config.num_envs
-        num_prefill_actor_steps = np.ceil(self.min_replay_size / total_steps_per_training_step)
-        num_training_steps_per_epoch = (config.total_env_steps - num_prefill_env_steps) // (
+        num_prefill_actor_steps = np.ceil(self.min_replay_size / (config.num_goal_conditioned_steps + config.num_exploratory_steps))
+        num_training_steps_per_epoch = -(-(config.total_env_steps - num_prefill_env_steps) // (
             config.num_evals * env_steps_per_training_step
-        )
+        ))
 
         assert num_training_steps_per_epoch > 0, (
             "total_env_steps too small for given num_envs and episode_length"
@@ -1633,7 +1633,7 @@ class GoExploreCRL:
             epoch_training_time = time.time() - t
             training_walltime += epoch_training_time
 
-            sps = (env_steps_per_actor_step * num_training_steps_per_epoch) / epoch_training_time
+            sps = (env_steps_per_training_step * num_training_steps_per_epoch) / epoch_training_time
             metrics = {
                 "training/sps": sps,
                 "training/walltime": training_walltime,
