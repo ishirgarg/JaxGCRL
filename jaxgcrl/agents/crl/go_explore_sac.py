@@ -28,7 +28,7 @@ from flax.training.train_state import TrainState
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
-from jaxgcrl.utils.visualize import visualize_goals_2d, visualize_kde_heatmap, visualize_q_function_2d, visualize_dual_crl_trajectories_2d
+from jaxgcrl.utils.visualize import visualize_goals_2d, visualize_kde_heatmap, visualize_q_function_2d, visualize_dual_crl_trajectories_2d, visualize_scatter_sample
 
 from .losses import update_actor_and_alpha, update_critic
 from .networks import Actor, Encoder
@@ -76,7 +76,7 @@ class Transition(NamedTuple):
 
 @functools.partial(jax.jit, static_argnames=("buffer_config"))
 def flatten_batch(buffer_config, transition, sample_key):
-    # Same as go_explore_crl - for GCP transitions
+    """Process trajectory for CRL training - same as go_explore_crl."""
     gamma, state_size, goal_indices = buffer_config
 
     seq_len = transition.observation.shape[0]
@@ -103,28 +103,79 @@ def flatten_batch(buffer_config, transition, sample_key):
             return obs[last_idx]
         return jax.vmap(last_state_for_t)(jnp.arange(seq_len))
 
-    future_states = last_state_for_each_step(transition.observation, transition.extras["state_extras"]["traj_id"])
+    def get_intermediate_trajectory_states(obs, traj_ids):
+        """Returns states at evenly spaced points along remaining trajectory."""
+        seq_len = obs.shape[0]
+        obs_dim = obs.shape[1]
+        
+        def intermediate_states_for_t(i, num_intermediate):
+            same_traj_mask = traj_ids == traj_ids[i]
+            future_mask = jnp.arange(seq_len) >= i
+            mask = same_traj_mask & future_mask
+            indices = jnp.where(mask, jnp.arange(seq_len), seq_len)
+            sorted_indices = jnp.sort(indices)
+            num_future = jnp.sum(mask)
+            fractions = (jnp.arange(1, num_intermediate + 1) / (num_intermediate + 1))
+            idxs = jnp.floor(fractions * num_future).astype(jnp.int32)
+            idxs = jnp.clip(idxs, 0, jnp.maximum(num_future - 1, 0))
+            actual_idxs = sorted_indices[idxs]
+            def get_state(idx):
+                return jnp.where(num_future > 0, obs[idx], jnp.zeros(obs_dim))
+            states = jax.vmap(get_state)(actual_idxs)
+            return states
+                
+        return jax.vmap(functools.partial(intermediate_states_for_t, num_intermediate=6))(jnp.arange(seq_len))
 
-    # Preserve all state_extras fields
-    state_extras = transition.extras["state_extras"]
-    sliced_state_extras = jax.tree_util.tree_map(
-        lambda x: x[:-1] if x.ndim > 0 and x.shape[0] == seq_len else x,
-        state_extras
-    )
-    # Explicitly squeeze traj_id and truncation
-    sliced_state_extras["traj_id"] = jnp.squeeze(sliced_state_extras["traj_id"], axis=-1) if sliced_state_extras["traj_id"].ndim > 1 else sliced_state_extras["traj_id"]
-    sliced_state_extras["truncation"] = jnp.squeeze(sliced_state_extras["truncation"], axis=-1) if sliced_state_extras["truncation"].ndim > 1 else sliced_state_extras["truncation"]
+    traj_ids = transition.extras["state_extras"]["traj_id"]
+    last_traj_state = last_state_for_each_step(transition.observation, traj_ids)
+    intermediate_traj = get_intermediate_trajectory_states(transition.observation, traj_ids)
 
-    return Transition(
-        observation=transition.observation[:-1],
-        action=transition.action[:-1],
-        reward=transition.reward[:-1],
-        discount=discount[:-1, 1:].sum(axis=1),
-        extras={
-            "future_state": future_states[:-1],
-            "state_extras": sliced_state_extras,
-        },
+    def is_last_occurrence(i):
+        traj_id = traj_ids[i]
+        future_mask = jnp.arange(seq_len) > i
+        has_future_same_id = jnp.any((traj_ids == traj_id) & future_mask)
+        return ~has_future_same_id
+    
+    last_traj_state_mask = jax.vmap(is_last_occurrence)(jnp.arange(seq_len))
+
+    goal_index = jax.random.categorical(sample_key, jnp.log(probs))
+    future_state = jnp.take(
+        transition.observation, goal_index[:-1], axis=0
     )
+    future_action = jnp.take(transition.action, goal_index[:-1], axis=0)
+    goal = future_state[:, goal_indices]
+    future_state = future_state[:, :state_size]
+    state = transition.observation[:-1, :state_size]
+    new_obs = jnp.concatenate([state, goal], axis=1)
+
+    original_state_extras = transition.extras["state_extras"]
+    state_extras = jax.tree_util.tree_map(
+        lambda x: x[:-1] if len(x.shape) > 0 else x,
+        original_state_extras
+    )
+    state_extras["truncation"] = jnp.squeeze(state_extras["truncation"])
+    state_extras["traj_id"] = jnp.squeeze(state_extras["traj_id"])
+    
+    extras = {
+        "policy_extras": {},
+        "state_extras": state_extras,
+        "state": state,
+        "future_state": future_state,
+        "future_action": future_action,
+        "proposed_goals": proposed_goals[:-1],
+        "last_traj_state": last_traj_state[:-1],
+        "intermediate_traj": intermediate_traj[:-1],
+        "last_traj_state_mask": last_traj_state_mask[:-1],
+    }
+
+    return transition._replace(
+        observation=jnp.squeeze(new_obs),
+        action=jnp.squeeze(transition.action[:-1]),
+        reward=jnp.squeeze(transition.reward[:-1]),
+        discount=jnp.squeeze(transition.discount[:-1]),
+        extras=extras,
+    )
+
 
 def save_params(path: str, params: Any):
     """Saves parameters in flax format."""
@@ -185,16 +236,21 @@ class GoExploreSAC:
     gcp_num_critic_ensemble: int = 5
     
     # EP reward computation
-    ep_reward_name: Literal["mean_max_critic"] = "mean_max_critic"  # Computes max_g f(s, a_g, g) per transition
+    ep_reward_name: Literal["mean_max_critic"] = "mean_max_critic"
+
+    # Unroll length for network updates
+    unroll_length: int = 50
 
     def check_config(self, config):
-        """
-        episode_length: the maximum length of an episode
-            NOTE: `num_envs * (episode_length - 1)` must be divisible by
-            `batch_size` due to the way data is stored in replay buffer.
-        """
+        """Validate configuration parameters."""
         assert config.num_envs * (config.episode_length - 1) % self.batch_size == 0, (
             "num_envs * (episode_length - 1) must be divisible by batch_size"
+        )
+        assert config.num_goal_conditioned_steps % self.unroll_length == 0, (
+            f"num_goal_conditioned_steps ({config.num_goal_conditioned_steps}) must be divisible by unroll_length ({self.unroll_length})"
+        )
+        assert config.num_exploratory_steps % self.unroll_length == 0, (
+            f"num_exploratory_steps ({config.num_exploratory_steps}) must be divisible by unroll_length ({self.unroll_length})"
         )
 
     def train_fn(
@@ -226,30 +282,25 @@ class GoExploreSAC:
 
         logging.info("Num env: %d", config.num_envs)
 
-        unroll_length = config.num_goal_conditioned_steps + config.num_exploratory_steps
-        env_steps_per_actor_step = config.num_envs * unroll_length
+        # Step calculations matching go_explore_crl pattern
+        unroll_length = self.unroll_length
+        total_steps_per_training_step = config.num_goal_conditioned_steps + config.num_exploratory_steps
+        env_steps_per_actor_step = config.num_envs * unroll_length  # Steps per chunk
+        env_steps_per_training_step = config.num_envs * total_steps_per_training_step  # Steps per full training iteration
         num_prefill_env_steps = self.min_replay_size * config.num_envs
-        num_prefill_actor_steps = np.ceil(self.min_replay_size / unroll_length)
-        num_training_steps_per_epoch = (config.total_env_steps - num_prefill_env_steps) // (
-            config.num_evals * env_steps_per_actor_step
-        )
+        num_prefill_actor_steps = int(np.ceil(self.min_replay_size / total_steps_per_training_step))
+        # Ceiling division for num_training_steps_per_epoch
+        num_training_steps_per_epoch = int(-(-(config.total_env_steps - num_prefill_env_steps) // (
+            config.num_evals * env_steps_per_training_step
+        )))
 
         assert num_training_steps_per_epoch > 0, (
             "total_env_steps too small for given num_envs and episode_length"
         )
 
-        logging.info(
-            "num_prefill_env_steps: %d",
-            num_prefill_env_steps,
-        )
-        logging.info(
-            "num_prefill_actor_steps: %d",
-            num_prefill_actor_steps,
-        )
-        logging.info(
-            "num_training_steps_per_epoch: %d",
-            num_training_steps_per_epoch,
-        )
+        logging.info("num_prefill_env_steps: %d", num_prefill_env_steps)
+        logging.info("num_prefill_actor_steps: %d", num_prefill_actor_steps)
+        logging.info("num_training_steps_per_epoch: %d", num_training_steps_per_epoch)
 
         random.seed(config.seed)
         np.random.seed(config.seed)
@@ -261,10 +312,13 @@ class GoExploreSAC:
         train_env.step = jax.jit(train_env.step)
         
         # Assign unique trajectory IDs per environment
-        TRAJ_ID_MULTIPLIER = 1000000
+        TRAJ_ID_MULTIPLIER = 100000
         env_indices = jnp.arange(config.num_envs, dtype=jnp.int32)
         initial_info = dict(env_state.info)
         initial_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
+        # Initialize gc_proposed_goals and ep_proposed_goals for consistent PyTree structure
+        initial_info["gc_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+        initial_info["ep_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
         env_state = env_state.replace(info=initial_info)
 
         # Dimensions definitions
@@ -279,7 +333,7 @@ class GoExploreSAC:
         # EP observation size (no goals)
         ep_obs_size = state_size
 
-        # Network setup
+        # ===== Network Setup =====
         # GCP Actor (goal-conditioned)
         gcp_actor = Actor(
             action_size=action_size,
@@ -296,7 +350,6 @@ class GoExploreSAC:
         )
 
         # EP Actor (non-goal-conditioned) - uses SAC network
-        # Use same pattern as SAC: create normalize function
         def normalize_fn(x, y):
             return x
         
@@ -311,11 +364,8 @@ class GoExploreSAC:
             hidden_layer_sizes=[self.h_dim] * self.n_hidden,
         )
         
-        # Create policy inference function (same as SAC)
         make_ep_policy = sac_networks.make_inference_fn(ep_sac_network)
         
-        # Initialize EP networks (same pattern as SAC)
-        # Match SAC's _init_training_state pattern exactly
         ep_actor_params = ep_sac_network.policy_network.init(ep_actor_key)
         ep_q_params = ep_sac_network.q_network.init(ep_q_key)
         ep_target_q_params = jax.tree_util.tree_map(lambda x: x, ep_q_params)
@@ -338,7 +388,6 @@ class GoExploreSAC:
             use_ln=self.use_ln,
         )
         
-        # Initialize GCP critic params
         if self.use_gcp_critic_ensemble:
             gcp_sa_keys = jax.random.split(gcp_sa_key, self.gcp_num_critic_ensemble)
             gcp_g_keys = jax.random.split(gcp_g_key, self.gcp_num_critic_ensemble)
@@ -363,41 +412,66 @@ class GoExploreSAC:
             tx=optax.adam(learning_rate=self.alpha_lr),
         )
         
-        # EP alpha (SAC) - initialize optimizers (will be created later)
+        # EP alpha (SAC)
         ep_alpha_params = log_alpha
-        
-        # EP optimizer states (will be initialized after optimizers are created)
-        # Note: optimizers are created later in the code, so we'll initialize states there
         
         # EP normalizer (SAC)
         ep_normalizer_params = running_statistics.init_state(
             specs.Array((ep_obs_size,), jnp.float32)
         )
 
-        # EP normalizer (SAC)
-        ep_normalizer_params = running_statistics.init_state(
-            specs.Array((ep_obs_size,), jnp.float32)
+        # ===== SAC Loss Functions and Optimizers for EP =====
+        ep_alpha_optimizer = optax.adam(learning_rate=self.alpha_lr)
+        ep_policy_optimizer = optax.adam(learning_rate=self.policy_lr)
+        ep_q_optimizer = optax.adam(learning_rate=self.critic_lr)
+        
+        ep_alpha_loss_fn, ep_critic_loss_fn, ep_actor_loss_fn = sac_losses.make_losses(
+            sac_network=ep_sac_network,
+            reward_scaling=1.0,
+            discounting=self.discounting,
+            action_size=action_size,
         )
         
-        # Training state (EP optimizer states and actor state will be set after optimizers are created)
-        # Create placeholder values for now
+        ep_alpha_update = gradients.gradient_update_fn(
+            ep_alpha_loss_fn, ep_alpha_optimizer, pmap_axis_name=None
+        )
+        ep_critic_update = gradients.gradient_update_fn(
+            ep_critic_loss_fn, ep_q_optimizer, pmap_axis_name=None
+        )
+        ep_actor_update = gradients.gradient_update_fn(
+            ep_actor_loss_fn, ep_policy_optimizer, pmap_axis_name=None
+        )
+
+        # Initialize EP optimizer states
+        ep_alpha_optimizer_state = ep_alpha_optimizer.init(ep_alpha_params)
+        ep_q_optimizer_state = ep_q_optimizer.init(ep_q_params)
+        ep_actor_optimizer_state = ep_policy_optimizer.init(ep_actor_params)
+        
+        ep_actor_state = TrainState.create(
+            apply_fn=None,
+            params=ep_actor_params,
+            tx=ep_policy_optimizer,
+        )
+        
+        # Training state
         training_state = TrainingState(
             env_steps=jnp.zeros(()),
             gradient_steps=jnp.zeros(()),
             gcp_actor_state=gcp_actor_state,
             gcp_critic_state=gcp_critic_state,
-            ep_actor_state=None,  # Will be set after optimizers are created
+            ep_actor_state=ep_actor_state,
             ep_q_params=ep_q_params,
             ep_target_q_params=ep_target_q_params,
-            ep_q_optimizer_state=None,  # Will be set after optimizers are created
-            ep_actor_optimizer_state=None,  # Will be set after optimizers are created
+            ep_q_optimizer_state=ep_q_optimizer_state,
+            ep_actor_optimizer_state=ep_actor_optimizer_state,
             gcp_alpha_state=gcp_alpha_state,
             ep_alpha_params=ep_alpha_params,
-            ep_alpha_optimizer_state=None,  # Will be set after optimizers are created
+            ep_alpha_optimizer_state=ep_alpha_optimizer_state,
             ep_normalizer_params=ep_normalizer_params,
         )
 
-        # Replay Buffer
+        # ===== Replay Buffers =====
+        # Unified transition format for all buffers
         dummy_obs = jnp.zeros((obs_size,))
         dummy_action = jnp.zeros((action_size,))
         dummy_goal = jnp.zeros((goal_size,))
@@ -415,23 +489,6 @@ class GoExploreSAC:
                     "in_ep_phase": 0.0,
                     "gc_proposed_goals": dummy_goal,
                     "ep_proposed_goals": dummy_goal,
-                    "terminated": 0.0,
-                }
-            },
-        )
-        
-        # EP transition (no goals, but pad with zeros to match obs_size)
-        dummy_ep_obs = jnp.concatenate([jnp.zeros((ep_obs_size,)), jnp.zeros((goal_size,))], axis=0)  # (obs_size,)
-        dummy_ep_transition = Transition(
-            observation=dummy_ep_obs,
-            action=dummy_action,
-            reward=0.0,
-            discount=0.0,
-            extras={
-                "state_extras": {
-                    "truncation": 0.0,
-                    "traj_id": 0.0,
-                    "in_ep_phase": 1.0,
                     "terminated": 0.0,
                 }
             },
@@ -467,7 +524,7 @@ class GoExploreSAC:
         ep_replay_buffer = jit_wrap(
             TrajectoryUniformSamplingQueue(
                 max_replay_size=self.max_replay_size,
-                dummy_data_sample=dummy_ep_transition,
+                dummy_data_sample=dummy_transition,
                 sample_batch_size=self.batch_size,
                 num_envs=config.num_envs,
                 episode_length=config.episode_length,
@@ -475,15 +532,7 @@ class GoExploreSAC:
         )
         ep_buffer_state = jax.jit(ep_replay_buffer.init)(buffer_key)
 
-        # Initialize GCP goal proposers
-        from jaxgcrl.agents.crl.proposers import (
-            FinalReplayBufferProposer, 
-            RandomEnvironmentGoalProposer,
-            UCGRProposer,
-            MaxWaypointRatioOneEnvProposer,
-            QEpistemicProposer,
-        )
-        
+        # ===== Goal Proposers (GCP only - EP SAC is non-goal-conditioned) =====
         gcp_final_rb_proposer = FinalReplayBufferProposer()
         ep_final_rb_proposer = FinalReplayBufferProposer()
         env_goals_proposer = RandomEnvironmentGoalProposer()
@@ -499,7 +548,6 @@ class GoExploreSAC:
             zero_center=False
         )
         
-        # GCP goal proposer function
         if self.gcp_goal_proposer_name == "gcp_final_rb":
             def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
                 proposed_goals, updated_gcp = gcp_final_rb_proposer.propose_goals(
@@ -551,14 +599,13 @@ class GoExploreSAC:
         else:
             raise ValueError(f"Unknown gcp_goal_proposer_name: {self.gcp_goal_proposer_name}")
 
-        # Actor step functions
+        # ===== Actor Step Functions =====
         def deterministic_actor_step_with_proposals(actor_state, env, env_state, proposed_goals, extra_fields):
             """Deterministic actor step for GCP with proposed goals."""
-            # Overwrite goals in observation
             new_obs = env_state.obs.at[:, -len(env.goal_indices):].set(proposed_goals)
             env_state = env_state.replace(obs=new_obs)
 
-            means, _ = gcp_actor.apply(actor_state.params, env_state.obs)
+            means, _ = actor_state.apply_fn(actor_state.params, env_state.obs)
             actions = nn.tanh(means)
 
             nstate = env.step(env_state, actions)
@@ -572,297 +619,338 @@ class GoExploreSAC:
             )
         
         def ep_actor_step(training_state, env, env_state, key, extra_fields):
-            """EP actor step (non-goal-conditioned, uses SAC policy).
-            
-            Uses the same pattern as SAC: make_policy with (normalizer_params, policy_params)
-            """
-            # Extract state only (no goals) for policy input
+            """EP actor step (non-goal-conditioned, uses SAC policy)."""
             state_only = env_state.obs[:, :state_size]
             
-            # Create policy function (same as SAC)
-            # make_ep_policy expects (normalizer_params, policy_params) tuple
             ep_policy_params = (training_state.ep_normalizer_params, training_state.ep_actor_state.params)
             policy = make_ep_policy(ep_policy_params, deterministic=False)
+            actions, _ = policy(state_only, key)
             
-            # Sample action from SAC policy (same as SAC actor_step)
-            actions, policy_extras = policy(state_only, key)
-            
-            # Step environment (uses full obs with goals, but we'll store state-only)
             nstate = env.step(env_state, actions)
             state_extras = {x: nstate.info[x] for x in extra_fields}
             
-            # Get next state (state-only)
-            next_state_only = nstate.obs[:, :state_size]
-            
-            # Use environment reward (custom rewards are computed after rollout per transition)
             # Pad observation with zeros to match obs_size (for replay buffer consistency)
-            obs_padded = jnp.concatenate([state_only, jnp.zeros((state_only.shape[0], goal_size))], axis=-1)  # (batch_size, obs_size)
-            next_obs_padded = jnp.concatenate([next_state_only, jnp.zeros((next_state_only.shape[0], goal_size))], axis=-1)  # (batch_size, obs_size)
+            obs_padded = jnp.concatenate([state_only, jnp.zeros((state_only.shape[0], goal_size))], axis=-1)
             
             return nstate, Transition(
                 observation=obs_padded,
                 action=actions,
-                reward=nstate.reward,  # Environment reward; custom rewards added after rollout
+                reward=nstate.reward,
                 discount=1 - nstate.done,
-                extras={
-                    "state_extras": state_extras,
-                    "next_observation": next_obs_padded,
-                    "policy_extras": policy_extras,
-                },
+                extras={"state_extras": state_extras},
             )
 
-        # Used for evaluation
+        # Used for GCP evaluation
         def deterministic_actor_step(training_state, env, env_state, extra_fields):
             means, _ = gcp_actor.apply(training_state.gcp_actor_state.params, env_state.obs)
             actions = nn.tanh(means)
-
             nstate = env.step(env_state, actions)
             state_extras = {x: nstate.info[x] for x in extra_fields}
-            return nstate, state_extras
+            return nstate, Transition(
+                observation=env_state.obs,
+                action=actions,
+                reward=nstate.reward,
+                discount=1 - nstate.done,
+                extras={"state_extras": state_extras},
+            )
 
-        evaluator = ActorEvaluator(
-            eval_env,
-            deterministic_actor_step,
-            extra_fields=("truncation", "traj_id"),
+        # Check if EP reward bonus is applicable (resolved at trace time)
+        has_ep_reward_bonus = (
+            self.ep_reward_name == "mean_max_critic" 
+            and hasattr(train_env, 'possible_goals') 
+            and train_env.possible_goals is not None
         )
+        if has_ep_reward_bonus:
+            env_goals_for_reward = train_env.possible_goals
 
-        # Initialize SAC loss functions for EP (same as SAC)
-        ep_alpha_optimizer = optax.adam(learning_rate=self.alpha_lr)
-        ep_policy_optimizer = optax.adam(learning_rate=self.policy_lr)
-        ep_q_optimizer = optax.adam(learning_rate=self.critic_lr)
-        
-        ep_alpha_loss_fn, ep_critic_loss_fn, ep_actor_loss_fn = sac_losses.make_losses(
-            sac_network=ep_sac_network,
-            reward_scaling=1.0,  # Can be made configurable
-            discounting=self.discounting,
-            action_size=action_size,
-        )
-        
-        ep_alpha_update = gradients.gradient_update_fn(
-            ep_alpha_loss_fn, ep_alpha_optimizer, pmap_axis_name=None
-        )
-        ep_critic_update = gradients.gradient_update_fn(
-            ep_critic_loss_fn, ep_q_optimizer, pmap_axis_name=None
-        )
-        ep_actor_update = gradients.gradient_update_fn(
-            ep_actor_loss_fn, ep_policy_optimizer, pmap_axis_name=None
-        )
-
-        # Initialize EP optimizer states and actor state (now that optimizers are created)
-        ep_alpha_optimizer_state = ep_alpha_optimizer.init(ep_alpha_params)
-        ep_q_optimizer_state = ep_q_optimizer.init(ep_q_params)
-        ep_actor_optimizer_state = ep_policy_optimizer.init(ep_actor_params)
-        
-        # Create EP actor TrainState (for compatibility, though we use policy_params directly)
-        ep_actor_state = TrainState.create(
-            apply_fn=None,  # Not used directly, we use make_ep_policy instead
-            params=ep_actor_params,
-            tx=ep_policy_optimizer,
-        )
-        
-        # Update training state with EP optimizer states
-        training_state = training_state.replace(
-            ep_actor_state=ep_actor_state,
-            ep_q_optimizer_state=ep_q_optimizer_state,
-            ep_actor_optimizer_state=ep_actor_optimizer_state,
-            ep_alpha_optimizer_state=ep_alpha_optimizer_state,
-        )
-
-        @functools.partial(jax.jit, static_argnames=("ep_reward_name",))
-        def get_experience(gcp_actor_state, ep_actor_state, env_state, training_state, 
-                          main_buffer_state, gcp_buffer_state, ep_buffer_state, key, ep_reward_name):
-            """Collect experience with two sequential rollouts.
+        # ===== Experience Collection (chunk-based, matching go_explore_crl) =====
+        @jax.jit
+        def get_experience_chunk(training_state, env_state,
+                                 main_buffer_state, gcp_buffer_state, ep_buffer_state,
+                                 gc_steps_collected, ep_steps_collected, 
+                                 gc_goals_proposed, ep_goals_proposed,
+                                 gc_proposed_goals_state, ep_proposed_goals_state, key):
+            """Collect exactly unroll_length steps of experience.
             
-            First: GC policy (deterministic) for num_goal_conditioned_steps
-            Second: EP policy (non-deterministic, non-goal-conditioned) for num_exploratory_steps
+            Tracks which phase we're in (GC or EP) and how many steps collected in each phase.
             """
             num_envs = config.num_envs
-            
-            # Track initial traj_ids to detect mid-rollout resets
-            initial_traj_ids = env_state.info["traj_id"]
             num_goal_conditioned_steps = config.num_goal_conditioned_steps
-            num_exploratory_steps = config.num_exploratory_steps
             
-            # ===== FIRST ROLLOUT: Goal-Conditioned Policy (Deterministic) =====
-            gc_key, ep_key = jax.random.split(key, 2)
-            gc_proposed_goals, gcp_buffer_state, ep_buffer_state = gcp_propose_goals(
-                gcp_buffer_state, ep_buffer_state, train_env, env_state, gc_key, training_state
-            )
+            # Determine which phase we're in
+            in_gc_phase = gc_steps_collected < num_goal_conditioned_steps
+            steps_to_collect = unroll_length
             
-            new_info = dict(env_state.info)
-            new_info["gc_proposed_goals"] = gc_proposed_goals
-            env_state = env_state.replace(
-                obs=env_state.obs.at[:, -len(train_env.goal_indices):].set(gc_proposed_goals),
-                info=new_info
-            )
-
-            def gc_rollout_step(carry, unused_t):
-                env_state, gcp_actor_state, current_key = carry
-                current_key, next_key = jax.random.split(current_key)
-                
-                gc_proposed_goals = env_state.info.get("gc_proposed_goals", env_state.obs[:, -len(train_env.goal_indices):])
-                
-                nstate, transition = deterministic_actor_step_with_proposals(
-                    gcp_actor_state, train_env, env_state, gc_proposed_goals, ("truncation", "traj_id")
-                )
-                
-                truncation = transition.extras["state_extras"]["truncation"]
-                terminated = (transition.discount < 1.0) | (truncation > 0.5)
-                
-                new_info = dict(nstate.info)
-                new_info["gc_proposed_goals"] = gc_proposed_goals
-                env_state = nstate.replace(info=new_info)
-                
-                existing_state_extras = transition.extras["state_extras"]
-                transition_extras = {
-                    **existing_state_extras,
-                    "in_gc_phase": jnp.ones((num_envs,), dtype=jnp.float32),
-                    "in_ep_phase": jnp.zeros((num_envs,), dtype=jnp.float32),
-                    "gc_proposed_goals": gc_proposed_goals,
-                    "ep_proposed_goals": gc_proposed_goals,  # Placeholder
-                    "terminated": terminated.astype(jnp.float32),
-                }
-                transition = transition._replace(extras={"state_extras": transition_extras})
-                
-                obs_goals = transition.observation[:, -len(train_env.goal_indices):]
-                goals_match = jnp.allclose(obs_goals, gc_proposed_goals, atol=1e-5, rtol=1e-5)
-                _ = 1.0 / jnp.where(goals_match, 1.0, 0.0)
-                
-                return (env_state, gcp_actor_state, next_key), transition
+            key, gc_key, ep_key = jax.random.split(key, 3)
             
-            (env_state, _, _), gc_transitions = jax.lax.scan(
-                gc_rollout_step,
-                (env_state, gcp_actor_state, gc_key),
-                (),
-                length=num_goal_conditioned_steps
-            )
-            
-            # ===== SECOND ROLLOUT: Exploratory Policy (Non-Goal-Conditioned, SAC) =====
-            # EP does NOT use goal proposal - it's non-goal-conditioned
-            
-            def ep_rollout_step(carry, unused_t):
-                env_state, training_state, current_key = carry
-                current_key, next_key = jax.random.split(current_key)
-                
-                # Use ep_actor_step helper function (passes training_state for normalizer)
-                nstate, transition = ep_actor_step(
-                    training_state, train_env, env_state, current_key, ("truncation", "traj_id")
-                )
-                
-                # Check for early termination
-                truncation = transition.extras["state_extras"]["truncation"]
-                terminated = (transition.discount < 1.0) | (truncation > 0.5)
-                
-                # Add phase markers
-                existing_state_extras = transition.extras["state_extras"]
-                transition_extras = {
-                    **existing_state_extras,
-                    "in_gc_phase": jnp.zeros((num_envs,), dtype=jnp.float32),
-                    "in_ep_phase": jnp.ones((num_envs,), dtype=jnp.float32),
-                    "terminated": terminated.astype(jnp.float32),
-                }
-                transition = transition._replace(extras={"state_extras": transition_extras})
-                
-                return (nstate, training_state, next_key), transition
-            
-            (env_state, _, _), ep_transitions = jax.lax.scan(
-                ep_rollout_step,
-                (env_state, training_state, ep_key),
-                (),
-                length=num_exploratory_steps
-            )
-            
-            # ===== COMPUTE MEAN_MAX_CRITIC REWARD FOR EP TRANSITIONS =====
-            # Compute reward: max_g f(s, a_g, g) for each transition
-            # where s is the next state (state we reached), a_g is sampled from GCP policy π(s, g)
-            if ep_reward_name == "mean_max_critic" and hasattr(train_env, 'possible_goals') and train_env.possible_goals is not None:
-                env_goals = train_env.possible_goals  # (num_env_goals, goal_dim)
-                
-                # Get next states from EP transitions (the states we reached)
-                # ep_transitions.observation has shape (num_exploratory_steps, num_envs, obs_size)
-                # We need the next states, which are stored in extras["next_observation"]
-                ep_next_obs_full = ep_transitions.extras["next_observation"]  # (num_exploratory_steps, num_envs, obs_size)
-                
-                # Extract state only (remove goal padding)
-                ep_next_states = ep_next_obs_full[:, :, :state_size]  # (num_exploratory_steps, num_envs, state_dim)
-                
-                # Reshape to (num_transitions, state_dim) for vectorization
-                num_transitions = num_exploratory_steps * num_envs
-                ep_next_states_flat = ep_next_states.reshape(num_transitions, state_size)
-                
-                # Create keys for each transition
-                reward_keys = jax.random.split(ep_key, num_transitions)
-                
-                # Compute reward for each transition
-                def compute_reward_for_transition(next_state, key):
-                    """Compute max_critic reward for a single transition."""
-                    reward = compute_max_critic_reward_per_transition(
-                        next_state, env_goals,
-                        gcp_actor, training_state.gcp_actor_state.params,
-                        training_state.gcp_critic_state.params,
-                        gcp_sa_encoder, gcp_g_encoder, self.energy_fn, key
+            def collect_gc_phase():
+                # Propose GC goals if not already proposed
+                def propose_gc_goals_fn():
+                    proposed, updated_gcp, updated_ep = gcp_propose_goals(
+                        gcp_buffer_state, ep_buffer_state, train_env, env_state, gc_key, training_state
                     )
-                    return reward
+                    return proposed, updated_gcp, updated_ep
                 
-                # Vectorize over all transitions
-                rewards_flat = jax.vmap(compute_reward_for_transition)(ep_next_states_flat, reward_keys)
+                def use_existing_gc_goals():
+                    return gc_proposed_goals_state, gcp_buffer_state, ep_buffer_state
                 
-                # Reshape back to (num_exploratory_steps, num_envs)
-                rewards = rewards_flat.reshape(num_exploratory_steps, num_envs)
+                gc_proposed_goals_new, gcp_buffer_state_new, ep_buffer_state_new = jax.lax.cond(
+                    ~gc_goals_proposed,
+                    propose_gc_goals_fn,
+                    use_existing_gc_goals
+                )
+                gc_proposed_goals = jnp.where(~gc_goals_proposed, gc_proposed_goals_new, gc_proposed_goals_state)
                 
-                # Add to existing reward
-                ep_transitions = ep_transitions._replace(
-                    reward=ep_transitions.reward + rewards
-            )
-            
-            # Combine transitions
-            combined_transitions = jax.tree_util.tree_map(
-                lambda gc, ep: jnp.concatenate([gc, ep], axis=0),
-                gc_transitions, ep_transitions
-            )
-            
-            # Track mid-rollout resets
-            final_traj_ids = env_state.info["traj_id"]
-            reset_during_rollout = initial_traj_ids != final_traj_ids
-            num_reset_during_rollout = jnp.sum(reset_during_rollout)
-            
-            # Insert into buffers
-            main_buffer_state = main_replay_buffer.insert(main_buffer_state, combined_transitions)
-            gcp_buffer_state = gcp_replay_buffer.insert(gcp_buffer_state, gc_transitions)
-            ep_buffer_state = ep_replay_buffer.insert(ep_buffer_state, ep_transitions)
-         
-            return env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, combined_transitions
+                # Update env_state with GC goals
+                new_info = dict(env_state.info)
+                new_info["gc_proposed_goals"] = gc_proposed_goals
+                new_info["ep_proposed_goals"] = env_state.info.get("ep_proposed_goals", jnp.zeros_like(gc_proposed_goals))
+                
+                def update_env_with_goals():
+                    return env_state.replace(
+                        obs=env_state.obs.at[:, -len(train_env.goal_indices):].set(gc_proposed_goals),
+                        info=new_info
+                    )
+                
+                def keep_env_state():
+                    return env_state.replace(info=new_info)
+                
+                env_state_updated = jax.lax.cond(
+                    ~gc_goals_proposed,
+                    update_env_with_goals,
+                    keep_env_state
+                )
 
+                def gc_rollout_step(carry, unused_t):
+                    env_state_inner, gcp_actor_state_inner, current_key = carry
+                    current_key, next_key = jax.random.split(current_key)
+                    
+                    gc_proposed_goals_inner = env_state_inner.info.get("gc_proposed_goals", env_state_inner.obs[:, -len(train_env.goal_indices):])
+                    
+                    nstate, transition = deterministic_actor_step_with_proposals(
+                        gcp_actor_state_inner, train_env, env_state_inner, gc_proposed_goals_inner, ("truncation", "traj_id")
+                    )
+                    
+                    truncation = transition.extras["state_extras"]["truncation"]
+                    terminated = (transition.discount < 1.0) | (truncation > 0.5)
+                    
+                    new_info = dict(nstate.info)
+                    new_info["gc_proposed_goals"] = gc_proposed_goals_inner
+                    new_info["ep_proposed_goals"] = env_state_inner.info.get("ep_proposed_goals", jnp.zeros_like(gc_proposed_goals_inner))
+                    env_state_inner = nstate.replace(info=new_info)
+                    
+                    existing_state_extras = transition.extras["state_extras"]
+                    transition_extras = {
+                        **existing_state_extras,
+                        "in_gc_phase": jnp.ones((num_envs,), dtype=jnp.float32),
+                        "in_ep_phase": jnp.zeros((num_envs,), dtype=jnp.float32),
+                        "gc_proposed_goals": gc_proposed_goals_inner,
+                        "ep_proposed_goals": jnp.zeros_like(gc_proposed_goals_inner),
+                        "terminated": terminated.astype(jnp.float32),
+                    }
+                    transition = transition._replace(extras={"state_extras": transition_extras})
+                    
+                    return (env_state_inner, gcp_actor_state_inner, next_key), transition
+                
+                (env_state_final, _, _), gc_transitions = jax.lax.scan(
+                    gc_rollout_step,
+                    (env_state_updated, training_state.gcp_actor_state, key),
+                    (),
+                    length=steps_to_collect
+                )
+                
+                combined_transitions = gc_transitions
+                main_buffer_state_new = main_replay_buffer.insert(main_buffer_state, combined_transitions)
+                gcp_buffer_state_final = gcp_replay_buffer.insert(gcp_buffer_state_new, gc_transitions)
+                
+                new_gc_steps_collected = gc_steps_collected + steps_to_collect
+                new_ep_steps_collected = ep_steps_collected
+                new_gc_goals_proposed = True
+                new_ep_goals_proposed = ep_goals_proposed
+                
+                return (env_state_final, main_buffer_state_new, gcp_buffer_state_final, ep_buffer_state_new,
+                       new_gc_steps_collected, new_ep_steps_collected,
+                       new_gc_goals_proposed, new_ep_goals_proposed,
+                       gc_proposed_goals, ep_proposed_goals_state, combined_transitions)
+            
+            def collect_ep_phase():
+                # SAC EP: No goal proposals needed
+                ep_proposed_goals = jnp.zeros((num_envs, len(train_env.goal_indices)))
+                
+                new_info = dict(env_state.info)
+                new_info["ep_proposed_goals"] = ep_proposed_goals
+                new_info["gc_proposed_goals"] = env_state.info.get("gc_proposed_goals", jnp.zeros_like(ep_proposed_goals))
+                env_state_updated = env_state.replace(info=new_info)
+
+                def ep_rollout_step(carry, unused_t):
+                    env_state_inner, training_state_inner, current_key = carry
+                    current_key, next_key = jax.random.split(current_key)
+                    
+                    nstate, transition = ep_actor_step(
+                        training_state_inner, train_env, env_state_inner, current_key, ("truncation", "traj_id")
+                    )
+                    
+                    truncation = transition.extras["state_extras"]["truncation"]
+                    terminated = (transition.discount < 1.0) | (truncation > 0.5)
+                    
+                    new_info = dict(nstate.info)
+                    new_info["ep_proposed_goals"] = env_state_inner.info.get("ep_proposed_goals", jnp.zeros((num_envs, len(train_env.goal_indices))))
+                    new_info["gc_proposed_goals"] = env_state_inner.info.get("gc_proposed_goals", jnp.zeros((num_envs, len(train_env.goal_indices))))
+                    env_state_inner = nstate.replace(info=new_info)
+                    
+                    existing_state_extras = transition.extras["state_extras"]
+                    gc_proposed_goals_for_transition = env_state_inner.info.get("gc_proposed_goals", jnp.zeros((num_envs, len(train_env.goal_indices))))
+                    transition_extras = {
+                        **existing_state_extras,
+                        "in_gc_phase": jnp.zeros((num_envs,), dtype=jnp.float32),
+                        "in_ep_phase": jnp.ones((num_envs,), dtype=jnp.float32),
+                        "gc_proposed_goals": gc_proposed_goals_for_transition,
+                        "ep_proposed_goals": ep_proposed_goals,
+                        "terminated": terminated.astype(jnp.float32),
+                    }
+                    transition = transition._replace(extras={"state_extras": transition_extras})
+                    
+                    return (env_state_inner, training_state_inner, next_key), transition
+                
+                (env_state_final, _, _), ep_transitions = jax.lax.scan(
+                    ep_rollout_step,
+                    (env_state_updated, training_state, key),
+                    (),
+                    length=steps_to_collect
+                )
+                
+                # Optionally compute mean_max_critic reward bonus for EP transitions
+                if has_ep_reward_bonus:
+                    # Compute next states from consecutive observations
+                    # ep_transitions.observation shape: (steps_to_collect, num_envs, obs_size)
+                    # Next state for t = observation at t+1 (for t < steps-1), or env_state_final for last
+                    next_states = jnp.concatenate([
+                        ep_transitions.observation[1:, :, :state_size],
+                        env_state_final.obs[:, :state_size][None, :, :]
+                    ], axis=0)  # (steps_to_collect, num_envs, state_size)
+                    
+                    next_states_flat = next_states.reshape(-1, state_size)
+                    num_transitions = steps_to_collect * num_envs
+                    reward_keys = jax.random.split(ep_key, num_transitions)
+                    
+                    def compute_reward_for_transition(next_state, rk):
+                        return compute_max_critic_reward_per_transition(
+                            next_state, env_goals_for_reward,
+                            gcp_actor, training_state.gcp_actor_state.params,
+                            training_state.gcp_critic_state.params,
+                            gcp_sa_encoder, gcp_g_encoder, self.energy_fn, rk
+                        )
+                    
+                    rewards_bonus_flat = jax.vmap(compute_reward_for_transition)(next_states_flat, reward_keys)
+                    rewards_bonus = rewards_bonus_flat.reshape(steps_to_collect, num_envs)
+                    ep_transitions = ep_transitions._replace(reward=ep_transitions.reward + rewards_bonus)
+                
+                combined_transitions = ep_transitions
+                main_buffer_state_new = main_replay_buffer.insert(main_buffer_state, combined_transitions)
+                ep_buffer_state_final = ep_replay_buffer.insert(ep_buffer_state, ep_transitions)
+                
+                new_gc_steps_collected = gc_steps_collected
+                new_ep_steps_collected = ep_steps_collected + steps_to_collect
+                new_gc_goals_proposed = gc_goals_proposed
+                new_ep_goals_proposed = True  # No goals needed for SAC EP
+                
+                return (env_state_final, main_buffer_state_new, gcp_buffer_state, ep_buffer_state_final,
+                       new_gc_steps_collected, new_ep_steps_collected,
+                       new_gc_goals_proposed, new_ep_goals_proposed,
+                       gc_proposed_goals_state, ep_proposed_goals, combined_transitions)
+            
+            return jax.lax.cond(
+                in_gc_phase,
+                collect_gc_phase,
+                collect_ep_phase
+            )
+
+        # ===== Prefill Replay Buffer =====
         def prefill_replay_buffer(training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, key):
+            # Initialize env_state.info for consistent PyTree structure
+            initial_info = dict(env_state.info)
+            initial_info["gc_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+            initial_info["ep_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+            env_state = env_state.replace(info=initial_info)
+            
             @jax.jit
             def f(carry, unused):
                 del unused
                 training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, key = carry
                 key, reset_key, new_key = jax.random.split(key, 3)
-                env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, _ = get_experience(
-                    training_state.gcp_actor_state,
-                    training_state.ep_actor_state,
-                    env_state,
-                    training_state,
-                    main_buffer_state,
-                    gcp_buffer_state,
-                    ep_buffer_state,
-                    key,
-                    self.ep_reward_name
+                
+                num_goal_conditioned_steps = config.num_goal_conditioned_steps
+                num_exploratory_steps = config.num_exploratory_steps
+                num_gc_chunks = num_goal_conditioned_steps // unroll_length
+                num_ep_chunks = num_exploratory_steps // unroll_length
+                total_chunks = num_gc_chunks + num_ep_chunks
+                
+                experience_keys = jax.random.split(key, total_chunks)
+                
+                gc_steps_collected = 0
+                ep_steps_collected = 0
+                gc_goals_proposed = False
+                ep_goals_proposed = False
+                gc_proposed_goals_state = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+                ep_proposed_goals_state = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+                
+                def collect_chunk(carry_inner, chunk_idx):
+                    (env_state_inner, main_buffer_state_inner, gcp_buffer_state_inner, ep_buffer_state_inner,
+                     gc_steps_collected_inner, ep_steps_collected_inner,
+                     gc_goals_proposed_inner, ep_goals_proposed_inner,
+                     gc_proposed_goals_inner, ep_proposed_goals_inner) = carry_inner
+                    
+                    (env_state_new, main_buffer_state_new, gcp_buffer_state_new, ep_buffer_state_new,
+                     gc_steps_collected_new, ep_steps_collected_new,
+                     gc_goals_proposed_new, ep_goals_proposed_new,
+                     gc_proposed_goals_new, ep_proposed_goals_new, _) = get_experience_chunk(
+                        training_state,
+                        env_state_inner,
+                        main_buffer_state_inner,
+                        gcp_buffer_state_inner,
+                        ep_buffer_state_inner,
+                        gc_steps_collected_inner,
+                        ep_steps_collected_inner,
+                        gc_goals_proposed_inner,
+                        ep_goals_proposed_inner,
+                        gc_proposed_goals_inner,
+                        ep_proposed_goals_inner,
+                        experience_keys[chunk_idx]
+                    )
+                    
+                    carry_new = (env_state_new, main_buffer_state_new, gcp_buffer_state_new, ep_buffer_state_new,
+                                gc_steps_collected_new, ep_steps_collected_new,
+                                gc_goals_proposed_new, ep_goals_proposed_new,
+                                gc_proposed_goals_new, ep_proposed_goals_new)
+                    return carry_new, ()
+                
+                initial_carry = (env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state,
+                                gc_steps_collected, ep_steps_collected,
+                                gc_goals_proposed, ep_goals_proposed,
+                                gc_proposed_goals_state, ep_proposed_goals_state)
+                
+                (env_state_final, main_buffer_state_final, gcp_buffer_state_final, ep_buffer_state_final,
+                 _, _, _, _, _, _), _ = jax.lax.scan(
+                    collect_chunk,
+                    initial_carry,
+                    jnp.arange(total_chunks)
                 )
                 
+                # Reset environments after collecting experience
                 reset_keys = jax.random.split(reset_key, config.num_envs)
-                env_state = jax.jit(train_env.reset)(reset_keys)
-                TRAJ_ID_MULTIPLIER = 100000
+                env_state_final = jax.jit(train_env.reset)(reset_keys)
+                TRAJ_ID_MULTIPLIER = 10000000
                 env_indices = jnp.arange(config.num_envs, dtype=jnp.int32)
-                initial_info = dict(env_state.info)
-                initial_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
-                env_state = env_state.replace(info=initial_info)
+                final_info = dict(env_state_final.info)
+                final_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
+                final_info["gc_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+                final_info["ep_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+                env_state_final = env_state_final.replace(info=final_info)
                 
                 training_state = training_state.replace(
-                    env_steps=training_state.env_steps + env_steps_per_actor_step,
+                    env_steps=training_state.env_steps + total_steps_per_training_step * config.num_envs,
                 )
-                return (training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, new_key), ()
+                return (training_state, env_state_final, main_buffer_state_final, gcp_buffer_state_final, ep_buffer_state_final, new_key), ()
 
             return jax.lax.scan(
                 f,
@@ -871,8 +959,16 @@ class GoExploreSAC:
                 length=num_prefill_actor_steps,
             )[0]
 
+        # ===== Network Updates =====
         @jax.jit
-        def update_networks(carry, gcp_transitions, ep_transitions):
+        def update_networks(carry, gcp_transitions, ep_sac_transitions):
+            """Update GCP (CRL) and EP (SAC) networks.
+            
+            Args:
+                carry: (training_state, key)
+                gcp_transitions: Transition from flatten_batch (CRL format)
+                ep_sac_transitions: SACTransition with (obs, next_obs, action, reward, discount)
+            """
             training_state, key = carry
             
             key, gcp_critic_key, gcp_actor_key, ep_alpha_key, ep_critic_key, ep_actor_key = jax.random.split(key, 6)
@@ -904,29 +1000,10 @@ class GoExploreSAC:
                 context, gcp_networks, gcp_transitions, training_state.gcp_critic_state, gcp_critic_key
             )
             
-            # Update EP networks (SAC) - same pattern as SAC update_step
-            # EP transitions have shape (batch_size, ...) with state-only observations
-            # Convert to SAC Transition format (with next_observation)
-            ep_obs = ep_transitions.observation[:, :state_size]  # Extract state only (batch_size, state_size)
-            ep_actions = ep_transitions.action  # (batch_size, action_size)
-            ep_rewards = ep_transitions.reward  # (batch_size,)
-            ep_discounts = ep_transitions.discount  # (batch_size,)
-            # Get next_observation from extras (JAX-compatible access)
-            ep_next_obs_padded = ep_transitions.extras["next_observation"]  # (batch_size, obs_size)
-            ep_next_obs = ep_next_obs_padded[:, :state_size]  # Extract state only (batch_size, state_size)
-            
-            # Create SAC Transition format
-            ep_sac_transitions = SACTransition(
-                observation=ep_obs,
-                next_observation=ep_next_obs,
-                action=ep_actions,
-                reward=ep_rewards,
-                discount=ep_discounts,
-                extras=ep_transitions.extras,
-            )
-            
-            # Update EP alpha (same as SAC)
+            # Update EP networks (SAC)
+            # ep_sac_transitions already has observation/next_observation as state-only
             ep_alpha = jnp.exp(training_state.ep_alpha_params)
+            
             ep_alpha_loss, ep_alpha_params, ep_alpha_optimizer_state = ep_alpha_update(
                 training_state.ep_alpha_params,
                 training_state.ep_actor_state.params,
@@ -937,8 +1014,7 @@ class GoExploreSAC:
             )
             ep_alpha = jnp.exp(ep_alpha_params)
             
-            # Update EP critic (same as SAC)
-            ep_critic_loss, ep_q_params, ep_q_optimizer_state = ep_critic_update(
+            ep_critic_loss, new_ep_q_params, ep_q_optimizer_state = ep_critic_update(
                 training_state.ep_q_params,
                 training_state.ep_actor_state.params,
                 training_state.ep_normalizer_params,
@@ -949,7 +1025,6 @@ class GoExploreSAC:
                 optimizer_state=training_state.ep_q_optimizer_state,
             )
             
-            # Update EP actor (same as SAC)
             ep_actor_loss, ep_actor_params, ep_actor_optimizer_state = ep_actor_update(
                 training_state.ep_actor_state.params,
                 training_state.ep_normalizer_params,
@@ -960,29 +1035,27 @@ class GoExploreSAC:
                 optimizer_state=training_state.ep_actor_optimizer_state,
             )
             
-            # Update EP target Q-network (soft update, same as SAC)
+            # Soft target update for EP Q-network
             new_ep_target_q_params = jax.tree_util.tree_map(
                 lambda x, y: x * (1 - self.tau) + y * self.tau,
                 training_state.ep_target_q_params,
-                ep_q_params,
+                new_ep_q_params,
             )
             
-            # Update EP normalizer (same as SAC)
+            # Update EP normalizer
             new_ep_normalizer_params = running_statistics.update(
                 training_state.ep_normalizer_params,
-                ep_obs,
+                ep_sac_transitions.observation,
             )
             
-            # Update EP actor state
             new_ep_actor_state = training_state.ep_actor_state.replace(params=ep_actor_params)
             
-            # Update training state
             training_state = training_state.replace(
                 gcp_actor_state=new_gcp_actor_state,
                 gcp_critic_state=new_gcp_critic_state,
                 gcp_alpha_state=new_gcp_alpha_state,
                 ep_actor_state=new_ep_actor_state,
-                ep_q_params=ep_q_params,
+                ep_q_params=new_ep_q_params,
                 ep_target_q_params=new_ep_target_q_params,
                 ep_q_optimizer_state=ep_q_optimizer_state,
                 ep_actor_optimizer_state=ep_actor_optimizer_state,
@@ -992,7 +1065,6 @@ class GoExploreSAC:
                 gradient_steps=training_state.gradient_steps + 1,
             )
 
-            # Construct metrics
             metrics = {
                 "gcp_entropy": gcp_actor_metrics["entropy"],
                 "gcp_actor_loss": gcp_actor_metrics["actor_loss"],
@@ -1014,98 +1086,193 @@ class GoExploreSAC:
                 key,
             ), metrics
 
+        # ===== Training Step (scan over chunks, matching go_explore_crl) =====
         @jax.jit
         def training_step(training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, key):
-            experience_key1, reset_key, sampling_key, permute_key, training_key = jax.random.split(key, 5)
-
-            env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, collected_transitions = get_experience(
-                training_state.gcp_actor_state,
-                training_state.ep_actor_state,
-                env_state,
-                training_state,
-                main_buffer_state,
-                gcp_buffer_state,
-                ep_buffer_state,
-                experience_key1,
-                self.ep_reward_name
+            reset_key, experience_keys, sampling_keys, permute_keys, training_keys = jax.random.split(key, 5)
+            
+            num_goal_conditioned_steps = config.num_goal_conditioned_steps
+            num_exploratory_steps = config.num_exploratory_steps
+            num_gc_chunks = num_goal_conditioned_steps // unroll_length
+            num_ep_chunks = num_exploratory_steps // unroll_length
+            total_chunks = num_gc_chunks + num_ep_chunks
+            
+            experience_keys = jax.random.split(experience_keys, total_chunks)
+            sampling_keys = jax.random.split(sampling_keys, total_chunks)
+            permute_keys = jax.random.split(permute_keys, total_chunks)
+            training_keys = jax.random.split(training_keys, total_chunks)
+            
+            gc_steps_collected = 0
+            ep_steps_collected = 0
+            gc_goals_proposed = False
+            ep_goals_proposed = False
+            gc_proposed_goals_state = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+            ep_proposed_goals_state = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+            
+            def collect_and_update_chunk(carry, chunk_idx):
+                (training_state_inner, env_state_inner, main_buffer_state_inner, 
+                 gcp_buffer_state_inner, ep_buffer_state_inner,
+                 gc_steps_collected_inner, ep_steps_collected_inner,
+                 gc_goals_proposed_inner, ep_goals_proposed_inner,
+                 gc_proposed_goals_inner, ep_proposed_goals_inner) = carry
+                
+                # Collect experience chunk
+                (env_state_new, main_buffer_state_new, gcp_buffer_state_new, ep_buffer_state_new,
+                 gc_steps_collected_new, ep_steps_collected_new,
+                 gc_goals_proposed_new, ep_goals_proposed_new,
+                 gc_proposed_goals_new, ep_proposed_goals_new, collected_transitions) = get_experience_chunk(
+                    training_state_inner,
+                    env_state_inner,
+                    main_buffer_state_inner,
+                    gcp_buffer_state_inner,
+                    ep_buffer_state_inner,
+                    gc_steps_collected_inner,
+                    ep_steps_collected_inner,
+                    gc_goals_proposed_inner,
+                    ep_goals_proposed_inner,
+                    gc_proposed_goals_inner,
+                    ep_proposed_goals_inner,
+                    experience_keys[chunk_idx]
+                )
+                
+                # Update env_steps
+                training_state_inner = training_state_inner.replace(
+                    env_steps=training_state_inner.env_steps + env_steps_per_actor_step,
+                )
+                
+                # Sample transitions for training
+                # GCP: sample from GCP buffer (only GC transitions with real goals)
+                gcp_buffer_state_sampled, gcp_transitions = gcp_replay_buffer.sample(gcp_buffer_state_new)
+                gcp_buffer_state_new = gcp_buffer_state_sampled
+                
+                # EP: sample from EP buffer
+                ep_buffer_state_sampled, ep_transitions_raw = ep_replay_buffer.sample(ep_buffer_state_new)
+                ep_buffer_state_new = ep_buffer_state_sampled
+                
+                # Process GCP transitions (CRL format via flatten_batch)
+                gcp_batch_keys = jax.random.split(sampling_keys[chunk_idx], gcp_transitions.observation.shape[0])
+                
+                def process_gcp_transitions(transitions, batch_keys_inner, permute_key_inner):
+                    transitions = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
+                        (self.discounting, state_size, tuple(train_env.goal_indices)),
+                        transitions,
+                        batch_keys_inner,
+                    )
+                    transitions = jax.tree_util.tree_map(
+                        lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"), transitions
+                    )
+                    permutation = jax.random.permutation(permute_key_inner, len(transitions.observation))
+                    transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
+                    transitions = jax.tree_util.tree_map(
+                        lambda x: jnp.reshape(x, (-1, self.batch_size) + x.shape[1:]),
+                        transitions,
+                    )
+                    return transitions
+                
+                gcp_last_batch = process_gcp_transitions(gcp_transitions, gcp_batch_keys, permute_keys[chunk_idx])
+                
+                # Process EP transitions for SAC (extract obs, next_obs, action, reward, discount)
+                def process_ep_sac_transitions(transitions, permute_key_inner):
+                    """Convert trajectory-based transitions to SAC format with next_observation."""
+                    # transitions shape: (sample_batch_size, episode_length, ...)
+                    obs = transitions.observation[:, :-1, :state_size]       # (N, L-1, state_size)
+                    next_obs = transitions.observation[:, 1:, :state_size]   # (N, L-1, state_size)
+                    actions = transitions.action[:, :-1]                      # (N, L-1, action_size)
+                    rewards = transitions.reward[:, :-1]                      # (N, L-1)
+                    discounts = transitions.discount[:, :-1]                  # (N, L-1)
+                    
+                    # Flatten first two dims
+                    flat_obs = obs.reshape(-1, state_size)
+                    flat_next_obs = next_obs.reshape(-1, state_size)
+                    flat_actions = actions.reshape(-1, action_size)
+                    flat_rewards = rewards.reshape(-1)
+                    flat_discounts = discounts.reshape(-1)
+                    
+                    # Permute
+                    n = flat_obs.shape[0]
+                    perm = jax.random.permutation(permute_key_inner, n)
+                    flat_obs = flat_obs[perm]
+                    flat_next_obs = flat_next_obs[perm]
+                    flat_actions = flat_actions[perm]
+                    flat_rewards = flat_rewards[perm]
+                    flat_discounts = flat_discounts[perm]
+                    
+                    # Reshape into batches (same num_batches as GCP)
+                    num_complete = (n // self.batch_size) * self.batch_size
+                    num_batches = num_complete // self.batch_size
+                    
+                    sac_transitions = SACTransition(
+                        observation=flat_obs[:num_complete].reshape(num_batches, self.batch_size, state_size),
+                        next_observation=flat_next_obs[:num_complete].reshape(num_batches, self.batch_size, state_size),
+                        action=flat_actions[:num_complete].reshape(num_batches, self.batch_size, action_size),
+                        reward=flat_rewards[:num_complete].reshape(num_batches, self.batch_size),
+                        discount=flat_discounts[:num_complete].reshape(num_batches, self.batch_size),
+                        extras={'policy_extras': {}},
+                    )
+                    return sac_transitions
+                
+                ep_last_batch = process_ep_sac_transitions(ep_transitions_raw, permute_keys[chunk_idx])
+                
+                # Update networks (scan over batches)
+                ((training_state_updated, _), metrics) = jax.lax.scan(
+                    lambda carry, xs: update_networks(carry, xs[0], xs[1]),
+                    (training_state_inner, training_keys[chunk_idx]),
+                    (gcp_last_batch, ep_last_batch)
+                )
+                
+                carry_new = (training_state_updated, env_state_new, main_buffer_state_new,
+                            gcp_buffer_state_new, ep_buffer_state_new,
+                            gc_steps_collected_new, ep_steps_collected_new,
+                            gc_goals_proposed_new, ep_goals_proposed_new,
+                            gc_proposed_goals_new, ep_proposed_goals_new)
+                
+                return carry_new, (metrics, collected_transitions)
+            
+            # Run collection and updates for all chunks
+            initial_carry = (training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state,
+                            gc_steps_collected, ep_steps_collected,
+                            gc_goals_proposed, ep_goals_proposed,
+                            gc_proposed_goals_state, ep_proposed_goals_state)
+            
+            (training_state_final, env_state_final, main_buffer_state_final,
+             gcp_buffer_state_final, ep_buffer_state_final, _, _, _, _, _, _), (all_metrics, all_collected) = jax.lax.scan(
+                collect_and_update_chunk,
+                initial_carry,
+                jnp.arange(total_chunks)
             )
             
+            # Reset environments after collecting all experience
             reset_keys = jax.random.split(reset_key, config.num_envs)
-            env_state = jax.jit(train_env.reset)(reset_keys)
+            env_state_final = jax.jit(train_env.reset)(reset_keys)
             TRAJ_ID_MULTIPLIER = 100000
             env_indices = jnp.arange(config.num_envs, dtype=jnp.int32)
-            initial_info = dict(env_state.info)
-            initial_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
-            env_state = env_state.replace(info=initial_info)
-
-            training_state = training_state.replace(
-                env_steps=training_state.env_steps + env_steps_per_actor_step,
-            )
-
-            # Sample transitions
-            main_buffer_state, gcp_transitions = main_replay_buffer.sample(main_buffer_state)
-            ep_buffer_state, ep_transitions = ep_replay_buffer.sample(ep_buffer_state)
-
-            # Process transitions for training
-            batch_keys = jax.random.split(sampling_key, gcp_transitions.observation.shape[0] + ep_transitions.observation.shape[0])
-            gcp_batch_keys = batch_keys[:gcp_transitions.observation.shape[0]]
-            ep_batch_keys = batch_keys[gcp_transitions.observation.shape[0]:]
-
-            def process_gcp_transitions(transitions, batch_keys):
-                transitions = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
-                    (self.discounting, state_size, tuple(train_env.goal_indices)),
-                    transitions,
-                    batch_keys,
-                )
-                transitions = jax.tree_util.tree_map(
-                    lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"), transitions
-                )
-                permutation = jax.random.permutation(permute_key, len(transitions.observation))
-                transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
-                transitions = jax.tree_util.tree_map(
-                    lambda x: jnp.reshape(x, (-1, self.batch_size) + x.shape[1:]),
-                    transitions,
-                )
-                return transitions
+            final_info = dict(env_state_final.info)
+            final_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
+            final_info["gc_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+            final_info["ep_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
+            env_state_final = env_state_final.replace(info=final_info)
             
-            def process_ep_transitions(transitions, batch_keys):
-                # EP transitions don't need flatten_batch (no goal-conditioning)
-                # Just reshape and permute
-                transitions = jax.tree_util.tree_map(
-                    lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"), transitions
-                )
-                permutation = jax.random.permutation(permute_key, len(transitions.observation))
-                transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
-                transitions = jax.tree_util.tree_map(
-                    lambda x: jnp.reshape(x, (-1, self.batch_size) + x.shape[1:]),
-                    transitions,
-                )
-                return transitions
-            
-            gcp_last_batch = process_gcp_transitions(gcp_transitions, gcp_batch_keys)
-            ep_last_batch = process_ep_transitions(ep_transitions, ep_batch_keys)
-
-            (
-                (
-                    training_state,
-                    _,
-                ),
-                metrics,
-            ) = jax.lax.scan(
-                lambda carry, xs: update_networks(carry, xs[0], xs[1]),
-                (training_state, training_key),
-                (gcp_last_batch, ep_last_batch)
+            # Combine collected transitions for visualization
+            # all_collected shape: (total_chunks, unroll_length, num_envs, ...)
+            # Reshape to (total_chunks * unroll_length, num_envs, ...)
+            collected_transitions = jax.tree_util.tree_map(
+                lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
+                all_collected
             )
-
+            
+            # Average metrics across all chunks
+            metrics = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), all_metrics)
+            
             return (
-                training_state,
-                env_state,
-                main_buffer_state,
-                gcp_buffer_state,
-                ep_buffer_state,
+                training_state_final,
+                env_state_final,
+                main_buffer_state_final,
+                gcp_buffer_state_final,
+                ep_buffer_state_final,
                 collected_transitions
             ), metrics
 
+        # ===== Training Epoch =====
         @jax.jit
         def training_epoch(
             training_state,
@@ -1132,6 +1299,7 @@ class GoExploreSAC:
                 ) = training_step(ts, es, mbs, gcbs, ebs, train_key)
                 return (ts, es, mbs, gcbs, ebs, k, collected_transitions), metrics
 
+            # Run one step to get initial structures for carry
             key, first_key = jax.random.split(key)
             ((training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, init_collected), first_metrics) = training_step(
                 training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, first_key
@@ -1144,6 +1312,7 @@ class GoExploreSAC:
                 length=num_training_steps_per_epoch - 1,
             )
 
+            # Combine metrics from first step with rest
             metrics = jax.tree_util.tree_map(
                 lambda a, b: jnp.concatenate([a[None], b]),
                 first_metrics,
@@ -1151,22 +1320,19 @@ class GoExploreSAC:
             )
             return training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, metrics, collected_transitions
         
+        # ===== Visualization =====
         def visualize_goals(train_env, transitions, wandb_key):
-            """Visualize trajectories and goals for go_explore_sac.
-            Note: EP does not have goals, so we only visualize GC goals."""
-            # Shape is (episode_len-1, batch_size, ...) since we only keep the last training step's batch
-            obs = np.array(transitions.observation)  # (episode_len-1, batch_size, obs_dim)
-            last_traj_state = np.array(transitions.extras["last_traj_state"][:, :, :state_size])  # (episode_len-1, batch_size, state_size)
-            last_traj_state_flat = last_traj_state.reshape(-1, state_size)
-            intermediate_traj = np.array(transitions.extras["intermediate_traj"])  # (episode_len-1, batch_size, num_intermediate_states, obs_dim)
+            """Visualize trajectories and goals. EP has no goals, so only GC goals are shown."""
+            obs = np.array(transitions.observation)
+            last_traj_state = np.array(transitions.extras["last_traj_state"][:, :, :state_size])
+            intermediate_traj = np.array(transitions.extras["intermediate_traj"])
             
-            obs_flat = obs.reshape(-1, obs.shape[-1])  # (total_samples, obs_dim)
+            obs_flat = obs.reshape(-1, obs.shape[-1])
             
-            # Extract GC and EP specific data
-            in_gc_phase = np.array(transitions.extras["state_extras"]["in_gc_phase"])  # (episode_len-1, batch_size)
-            in_ep_phase = np.array(transitions.extras["state_extras"]["in_ep_phase"])  # (episode_len-1, batch_size)
-            gc_proposed_goals = np.array(transitions.extras["state_extras"]["gc_proposed_goals"])  # (episode_len-1, batch_size, goal_dim)
-            traj_ids = np.array(transitions.extras["state_extras"]["traj_id"])  # (episode_len-1, batch_size)
+            in_gc_phase = np.array(transitions.extras["state_extras"]["in_gc_phase"])
+            in_ep_phase = np.array(transitions.extras["state_extras"]["in_ep_phase"])
+            gc_proposed_goals = np.array(transitions.extras["state_extras"]["gc_proposed_goals"])
+            traj_ids = np.array(transitions.extras["state_extras"]["traj_id"])
             
             in_gc_phase_flat = in_gc_phase.reshape(-1)
             in_ep_phase_flat = in_ep_phase.reshape(-1)
@@ -1175,7 +1341,6 @@ class GoExploreSAC:
             
             intermediate_traj_flat = intermediate_traj.reshape(-1, intermediate_traj.shape[-2], intermediate_traj.shape[-1])
             
-            # Extract GC and EP final states for each trajectory
             gc_final_states = []
             ep_final_states = []
             start_states = []
@@ -1184,6 +1349,7 @@ class GoExploreSAC:
             ep_intermediate_states_list = []
             
             unique_traj_ids = np.unique(traj_ids_flat)
+            logging.info(f"Visualization: Found {len(unique_traj_ids)} unique trajectory IDs out of {len(traj_ids_flat)} total transitions")
             
             for traj_id in unique_traj_ids:
                 traj_mask = traj_ids_flat == traj_id
@@ -1192,7 +1358,6 @@ class GoExploreSAC:
                 start_state = obs_flat[traj_indices[0]][train_env.goal_indices]
                 start_states.append(start_state)
                 
-                # Find last GC phase transition
                 gc_mask = in_gc_phase_flat[traj_indices] > 0.5
                 gc_indices = traj_indices[gc_mask]
                 if len(gc_indices) > 0:
@@ -1202,7 +1367,6 @@ class GoExploreSAC:
                     gc_final_states.append(gc_final_state)
                     gc_goals.append(gc_goal)
                 
-                # Find last EP phase transition
                 ep_mask = in_ep_phase_flat[traj_indices] > 0.5
                 ep_indices = traj_indices[ep_mask]
                 if len(ep_indices) > 0:
@@ -1210,59 +1374,27 @@ class GoExploreSAC:
                     ep_final_state = obs_flat[ep_final_idx][train_env.goal_indices]
                     ep_final_states.append(ep_final_state)
                 
-                # Get intermediate states from transitions in their respective phases
-                # Intermediate states are computed per transition as fractions of the remaining trajectory
-                # We use intermediate states from the first transition of each phase and filter to correct phase
-                
-                # GC intermediate states: use intermediate states from first GC transition
+                # GC intermediate states
                 gc_intermediate = np.array([]).reshape(0, len(train_env.goal_indices))
                 if len(gc_indices) > 0:
-                    gc_first_idx = gc_indices[0]  # First GC transition in this trajectory
-                    gc_intermediate_full = intermediate_traj_flat[gc_first_idx, :, train_env.goal_indices]  # (num_intermediate, goal_dim)
-                    # Map each intermediate state back to its actual trajectory position and filter by phase
-                    gc_local_idx = gc_first_idx - traj_indices[0]  # Local index within this trajectory
-                    remaining_length = len(traj_indices) - gc_local_idx
-                    gc_intermediate_list = []
-                    for inter_idx in range(gc_intermediate_full.shape[0]):
-                        if remaining_length > 0:
-                            # Intermediate states are at fractions: [1/(n+1), 2/(n+1), ..., n/(n+1)] of remaining trajectory
-                            fraction = (inter_idx + 1) / (gc_intermediate_full.shape[0] + 1)
-                            target_local_idx = gc_local_idx + int(fraction * remaining_length)
-                            target_local_idx = min(target_local_idx, len(traj_indices) - 1)
-                            target_global_idx = traj_indices[target_local_idx]
-                            # Only include if the target state is actually in GC phase
-                            if target_global_idx < len(in_gc_phase_flat) and in_gc_phase_flat[target_global_idx] > 0.5:
-                                gc_intermediate_list.append(gc_intermediate_full[inter_idx])
-                    if len(gc_intermediate_list) > 0:
-                        gc_intermediate = np.array(gc_intermediate_list)
+                    gc_states = obs_flat[gc_indices][:, train_env.goal_indices]
+                    num_gc_steps = len(gc_states)
+                    if num_gc_steps > 0:
+                        indices = np.linspace(0, num_gc_steps - 1, 6).astype(int)
+                        gc_intermediate = gc_states[indices]
                 
-                # EP intermediate states: use intermediate states from first EP transition
+                # EP intermediate states
                 ep_intermediate = np.array([]).reshape(0, len(train_env.goal_indices))
                 if len(ep_indices) > 0:
-                    ep_first_idx = ep_indices[0]  # First EP transition in this trajectory
-                    ep_intermediate_full = intermediate_traj_flat[ep_first_idx, :, train_env.goal_indices]  # (num_intermediate, goal_dim)
-                    # Map each intermediate state back to its actual trajectory position and filter by phase
-                    ep_local_idx = ep_first_idx - traj_indices[0]  # Local index within this trajectory
-                    remaining_length = len(traj_indices) - ep_local_idx
-                    ep_intermediate_list = []
-                    for inter_idx in range(ep_intermediate_full.shape[0]):
-                        if remaining_length > 0:
-                            # Intermediate states are at fractions: [1/(n+1), 2/(n+1), ..., n/(n+1)] of remaining trajectory
-                            fraction = (inter_idx + 1) / (ep_intermediate_full.shape[0] + 1)
-                            target_local_idx = ep_local_idx + int(fraction * remaining_length)
-                            target_local_idx = min(target_local_idx, len(traj_indices) - 1)
-                            target_global_idx = traj_indices[target_local_idx]
-                            # Only include if the target state is actually in EP phase
-                            if target_global_idx < len(in_ep_phase_flat) and in_ep_phase_flat[target_global_idx] > 0.5:
-                                ep_intermediate_list.append(ep_intermediate_full[inter_idx])
-                    if len(ep_intermediate_list) > 0:
-                        ep_intermediate = np.array(ep_intermediate_list)
+                    ep_states = obs_flat[ep_indices][:, train_env.goal_indices]
+                    num_ep_steps = len(ep_states)
+                    if num_ep_steps > 0:
+                        indices = np.linspace(0, num_ep_steps - 1, 6).astype(int)
+                        ep_intermediate = ep_states[indices]
                 
-                # Store separate GC and EP intermediate states
                 gc_intermediate_states_list.append(gc_intermediate)
                 ep_intermediate_states_list.append(ep_intermediate)
             
-            # Convert to numpy arrays
             start_states = np.array(start_states)
             gc_final_states = np.array(gc_final_states)
             ep_final_states = np.array(ep_final_states)
@@ -1278,60 +1410,67 @@ class GoExploreSAC:
             if gc_goals.ndim == 1:
                 gc_goals = gc_goals.reshape(-1, goal_dim)
             
-            # Sample exactly 4 trajectories for 2x2 grid visualization
             num_trajs = start_states.shape[0]
             num_viz_trajs = min(4, num_trajs)
+            if num_viz_trajs == 0:
+                return
             sample_indices = np.random.choice(num_trajs, num_viz_trajs, replace=False)
             
             start_xy = start_states[sample_indices]
-            gc_final_xy = gc_final_states[sample_indices]
-            ep_final_xy = ep_final_states[sample_indices]
-            gc_proposed_goals_xy = gc_goals[sample_indices]
+            gc_final_xy = gc_final_states[sample_indices] if len(gc_final_states) > 0 else start_xy
+            ep_final_xy = ep_final_states[sample_indices] if len(ep_final_states) > 0 else start_xy
+            gc_proposed_goals_xy = gc_goals[sample_indices] if len(gc_goals) > 0 else start_xy
             
-            # Extract GC and EP intermediate states for sampled trajectories
             gc_intermediate_xy_list = [gc_intermediate_states_list[i] for i in sample_indices]
             ep_intermediate_xy_list = [ep_intermediate_states_list[i] for i in sample_indices]
             
-            # Visualize trajectories (without EP goals - pass zeros as placeholder)
-            ep_proposed_goals_xy_placeholder = np.zeros_like(gc_proposed_goals_xy)  # Placeholder, won't be plotted
+            # EP has no goals - use zeros as placeholder
+            ep_proposed_goals_xy_placeholder = np.zeros_like(gc_proposed_goals_xy)
             visualize_dual_crl_trajectories_2d(
                 start_xy, gc_final_xy, ep_final_xy, gc_proposed_goals_xy, ep_proposed_goals_xy_placeholder,
                 gc_intermediate_xy_list, ep_intermediate_xy_list, f"{wandb_key}/dual_crl_trajectories",
                 x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
             )
             
-            # Heatmaps (no EP goal proposals heatmap)
-            visualize_kde_heatmap(
-                gc_final_states, "GC Final States", f"{wandb_key}/gc_final_states_heatmap",
-                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
-            )
+            # Scatter plots
+            if len(gc_final_states) > 0:
+                visualize_scatter_sample(
+                    gc_final_states, "GC Final States", f"{wandb_key}/gc_final_states_scatter",
+                    train_env.x_bounds, train_env.y_bounds
+                )
             
-            visualize_kde_heatmap(
-                ep_final_states, "EP Final States", f"{wandb_key}/ep_final_states_heatmap",
-                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
-            )
+            if len(ep_final_states) > 0:
+                visualize_scatter_sample(
+                    ep_final_states, "EP Final States", f"{wandb_key}/ep_final_states_scatter",
+                    train_env.x_bounds, train_env.y_bounds
+                )
             
-            visualize_kde_heatmap(
-                gc_goals, "GC Goal Proposals", f"{wandb_key}/gc_goal_proposals_heatmap",
-                x_bounds=train_env.x_bounds, y_bounds=train_env.y_bounds
-            )
+            if len(gc_goals) > 0:
+                visualize_scatter_sample(
+                    gc_goals, "GC Goal Proposals", f"{wandb_key}/gc_goal_proposals_scatter",
+                    train_env.x_bounds, train_env.y_bounds
+                )
             
             logging.info(f"Plotted visualizations at env step {training_state.env_steps.item()}")
-        
+
+        # ===== Run Prefill =====
         key, prefill_key = jax.random.split(key, 2)
 
         training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, _ = prefill_replay_buffer(
             training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, prefill_key
         )
 
+        # ===== Evaluator (GCP only) =====
+        key, eval_gcp_key = jax.random.split(key, 2)
         evaluator = ActorEvaluator(
             deterministic_actor_step,
             eval_env,
             num_eval_envs=config.num_eval_envs,
             episode_length=config.episode_length,
-            key=eval_env_key,
+            key=eval_gcp_key,
         )
 
+        # ===== Main Training Loop =====
         training_walltime = 0
         logging.info("starting training....")
         for ne in range(config.num_evals):
@@ -1346,14 +1485,11 @@ class GoExploreSAC:
             # Process collected_transitions for visualization
             @jax.jit
             def process_for_viz(transitions, batch_keys):
-                # Process transitions through flatten_batch (vmap over environments)
                 processed = jax.vmap(flatten_batch, in_axes=(None, 1, 0))(
                     (self.discounting, state_size, tuple(train_env.goal_indices)),
                     transitions,
                     batch_keys,
                 )
-                # processed now has shape (num_envs, episode_length-1, obs_dim)
-                # Reshape to (episode_length-1, num_envs, ...) for visualization
                 processed = jax.tree_util.tree_map(
                     lambda x: jnp.transpose(x, (1, 0) + tuple(range(2, len(x.shape)))),
                     processed
@@ -1366,32 +1502,53 @@ class GoExploreSAC:
             processed_transitions = process_for_viz(collected_transitions, viz_batch_keys)
             visualize_goals(train_env, processed_transitions, wandb_key="training")
 
-            training_walltime += time.time() - t
+            metrics = jax.tree_util.tree_map(jnp.mean, metrics)
+            metrics = jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
 
-            # Aggregate metrics
-            eval_metrics = {}
-            eval_metrics.update(
-                {
-                    f"training/{k}": np.array(v).mean() for k, v in metrics.items()
-                }
+            epoch_training_time = time.time() - t
+            training_walltime += epoch_training_time
+
+            sps = (env_steps_per_training_step * num_training_steps_per_epoch) / epoch_training_time
+            metrics = {
+                "training/sps": sps,
+                "training/walltime": training_walltime,
+                "training/envsteps": training_state.env_steps.item(),
+                **{f"training/{name}": value for name, value in metrics.items()},
+            }
+            current_step = int(training_state.env_steps.item())
+
+            # Run GCP evaluation only
+            metrics = evaluator.run_evaluation(training_state, metrics)
+
+            logging.info("step: %d", current_step)
+
+            do_render = ne % config.visualization_interval == 0
+            make_policy = lambda param: lambda obs, rng: gcp_actor_state.apply_fn(param, obs)
+
+            progress_fn(
+                current_step,
+                metrics,
+                make_policy,
+                training_state.gcp_actor_state.params,
+                unwrapped_env,
+                do_render=do_render,
             )
-            eval_metrics["training/walltime"] = training_walltime
-            eval_metrics["training/env_steps"] = training_state.env_steps
 
-            # Evaluation
-            eval_state = evaluator.run_evaluation(
-                (training_state.gcp_actor_state.params,),
-                training_state.env_steps,
-                eval_metrics,
-            )
-
-            progress_fn(int(training_state.env_steps), eval_metrics)
-
-            # Save checkpoint
-            if config.save_dir:
-                save_params(
-                    str(epath.Path(config.save_dir) / f"params_{ne}.pkl"),
+            if config.checkpoint_logdir:
+                params = (
+                    training_state.gcp_alpha_state.params,
                     training_state.gcp_actor_state.params,
+                    training_state.gcp_critic_state.params,
+                    training_state.ep_alpha_params,
+                    training_state.ep_actor_state.params,
+                    training_state.ep_q_params,
                 )
+                path = f"{config.checkpoint_logdir}/step_{int(training_state.env_steps)}.pkl"
+                save_params(path, params)
+            else:
+                params = None
 
-        return {"params": training_state.gcp_actor_state.params}
+        total_steps = current_step
+        logging.info("total steps: %s", total_steps)
+
+        return make_policy, params, metrics
