@@ -26,8 +26,15 @@ from jaxgcrl.utils.visualize import visualize_goals_2d, visualize_kde_heatmap, v
 
 from .losses import update_actor_and_alpha, update_critic
 from .networks import Actor, Encoder
-from .goals import GoalProposer, ReplayBufferGoalProposal, MediumEnergyGoalProposal, MetricPreservationGoalProposal, FisherTraceGoalProposal, QEpistemicGoalProposal, MEGAGoalProposal, OMEGAGoalProposal, UCGRGoalProposal,DISCOVERGoalProposal, mix_goals
-
+from jaxgcrl.agents.crl.proposers import (
+    FinalReplayBufferProposer, 
+    RandomEnvironmentGoalProposer,
+    UCGRProposer,
+    MaxWaypointRatioOneEnvProposer,
+    QEpistemicProposer,
+    MEGAProposer,
+    OMEGAProposer,
+)
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
 State = Union[envs.State, envs_v1.State]
@@ -237,9 +244,13 @@ class GoExploreCRL:
 
 
     # Goal proposer names for go-explore style algorithms
-    gcp_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "ucgr", "maxwaypointratio_one_env", "q_epistemic"] = "gcp_final_rb"
+    gcp_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "ucgr", "maxwaypointratio_one_env", "q_epistemic", "mega", "omega"] = "gcp_final_rb"
     ep_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals"] = "ep_final_rb"
     goal_sampling_temperature: float = 1.0
+    
+    # Replay buffer goal sampling parameters
+    num_rb_goals: int = 256
+    candidate_goals_type: Literal["final", "any"] = "final"
 
     train_ep_on_main_buffer: bool = False
 
@@ -530,29 +541,52 @@ class GoExploreCRL:
             )
         )
         ep_buffer_state = jax.jit(ep_replay_buffer.init)(buffer_key)
-
-        from jaxgcrl.agents.crl.proposers import (
-            FinalReplayBufferProposer, 
-            RandomEnvironmentGoalProposer,
-            UCGRProposer,
-            MaxWaypointRatioOneEnvProposer,
-            QEpistemicProposer,
-        )
         
         # Initialize goal proposer instances
-        gcp_final_rb_proposer = FinalReplayBufferProposer()
-        ep_final_rb_proposer = FinalReplayBufferProposer()
+        gcp_final_rb_proposer = FinalReplayBufferProposer(
+            num_rb_goals=self.num_rb_goals,
+            candidate_goals_type=self.candidate_goals_type
+        )
+        ep_final_rb_proposer = FinalReplayBufferProposer(
+            num_rb_goals=self.num_rb_goals,
+            candidate_goals_type=self.candidate_goals_type
+        )
         env_goals_proposer = RandomEnvironmentGoalProposer()
-        ucgr_proposer = UCGRProposer(energy_fn_name=self.energy_fn, num_samples=256)
+        ucgr_proposer = UCGRProposer(
+            energy_fn_name=self.energy_fn,
+            num_rb_samples=self.num_rb_goals,
+            candidate_goals_type=self.candidate_goals_type
+        )
         maxwaypointratio_one_env_proposer = MaxWaypointRatioOneEnvProposer(
             energy_fn_name=self.energy_fn,
-            goal_sampling_temperature=self.goal_sampling_temperature
+            goal_sampling_temperature=self.goal_sampling_temperature,
+            num_rb_goals=self.num_rb_goals,
+            candidate_goals_type=self.candidate_goals_type
         )
         q_epistemic_proposer = QEpistemicProposer(
             energy_fn_name=self.energy_fn,
             num_ensemble=self.gcp_num_critic_ensemble,
             use_env_goals=False,
-            zero_center=False
+            zero_center=False,
+            num_rb_goals=self.num_rb_goals,
+            candidate_goals_type=self.candidate_goals_type
+        )
+        mega_proposer = MEGAProposer(
+            bandwidth=0.1,
+            use_q_cutoff=True,
+            cutoff_percentile=0.3,
+            energy_fn_name=self.energy_fn,
+            num_rb_goals=self.num_rb_goals,
+            candidate_goals_type=self.candidate_goals_type
+        )
+        omega_proposer = OMEGAProposer(
+            bandwidth=0.1,
+            use_q_cutoff=True,
+            cutoff_percentile=0.3,
+            energy_fn_name=self.energy_fn,
+            bias_param=-3.0,
+            num_rb_goals=self.num_rb_goals,
+            candidate_goals_type=self.candidate_goals_type
         )
         
         # Create goal proposer functions that select the right buffer based on name
@@ -608,6 +642,24 @@ class GoExploreCRL:
                 # QEpistemic uses EP buffer but GCP actor/critic ensemble
                 # Note: requires use_gcp_critic_ensemble=True
                 proposed_goals, updated_ep = q_epistemic_proposer.propose_goals(
+                    ep_replay_buffer, ep_buffer_state, env, env_state, key,
+                    gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
+                    gcp_sa_encoder, gcp_g_encoder, training_state
+                )
+                return proposed_goals, gcp_buffer_state, updated_ep
+        elif self.gcp_goal_proposer_name == "mega":
+            def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                # MEGA uses EP buffer for sampling achieved goals
+                proposed_goals, updated_ep = mega_proposer.propose_goals(
+                    ep_replay_buffer, ep_buffer_state, env, env_state, key,
+                    gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
+                    gcp_sa_encoder, gcp_g_encoder, training_state
+                )
+                return proposed_goals, gcp_buffer_state, updated_ep
+        elif self.gcp_goal_proposer_name == "omega":
+            def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                # OMEGA uses EP buffer and anneals between MEGA and environment goals
+                proposed_goals, updated_ep = omega_proposer.propose_goals(
                     ep_replay_buffer, ep_buffer_state, env, env_state, key,
                     gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
                     gcp_sa_encoder, gcp_g_encoder, training_state

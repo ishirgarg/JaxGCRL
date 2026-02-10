@@ -99,6 +99,82 @@ def sample_random_states_from_batch(observations, traj_ids, goal_indices, key):
     return sampled_goals
 
 
+def sample_candidate_goals_from_replay_buffer(
+    replay_buffer, buffer_state, env, key, num_rb_goals, candidate_goals_type="final"
+):
+    """Sample candidate goals from replay buffer.
+    
+    This is a common function used by all goal proposers to sample candidate goals
+    from the replay buffer. It supports two modes:
+    - "final": Extract final states from trajectories
+    - "any": Extract any random states from trajectories
+    
+    Args:
+        replay_buffer: Replay buffer to sample from
+        buffer_state: Current buffer state
+        env: Training environment (must have goal_indices attribute)
+        key: JAX random key
+        num_rb_goals: Number of candidate goals to sample
+        candidate_goals_type: Either "final" (use final trajectory states) or "any" (use any trajectory state)
+        
+    Returns:
+        candidate_goals: (num_rb_goals, goal_dim) array of candidate goals
+        buffer_state: Updated buffer state
+    """
+    assert candidate_goals_type in ["final", "any"], \
+        f"candidate_goals_type must be 'final' or 'any', got {candidate_goals_type}"
+    
+    goal_indices = env.goal_indices
+    
+    # Sample trajectories from replay buffer
+    buffer_state, sampled_transitions = replay_buffer.sample(buffer_state)
+    
+    # sampled_transitions.observation has shape (N, ep_len, obs_dim)
+    # where N = num_envs, ep_len = episode_length
+    observations = sampled_transitions.observation  # (N, ep_len, obs_dim)
+    traj_ids = sampled_transitions.extras["state_extras"]["traj_id"]  # (N, ep_len)
+    
+    N, ep_len = observations.shape[:2]
+    
+    if candidate_goals_type == "final":
+        # Extract final states from each trajectory
+        last_states = jax.vmap(get_last_state_from_trajectory)(observations, traj_ids)  # (N, obs_dim)
+        candidate_goals = last_states[:, goal_indices]  # (N, goal_dim)
+    else:  # candidate_goals_type == "any"
+        # Sample random states from trajectories
+        # Flatten all (trajectory, timestep) pairs
+        total_pairs = N * ep_len
+        observations_flat = observations.reshape(total_pairs, -1)  # (N * ep_len, obs_dim)
+        traj_ids_flat = traj_ids.reshape(total_pairs)  # (N * ep_len,)
+        
+        # Sample num_rb_goals random indices (with replacement if needed)
+        key, sample_key = jax.random.split(key)
+        flat_indices = jax.random.randint(sample_key, (num_rb_goals,), 0, total_pairs)
+        candidate_goals = observations_flat[flat_indices, :][:, goal_indices]  # (num_rb_goals, goal_dim)
+    
+    # If we have more goals than requested, raise an error
+    if candidate_goals.shape[0] > num_rb_goals:
+        raise ValueError(
+            f"Number of candidate goals ({candidate_goals.shape[0]}) exceeds "
+            f"num_rb_goals ({num_rb_goals}). This should not happen. "
+            f"Consider increasing num_rb_goals or adjusting the replay buffer sample size."
+        )
+    # If we have fewer goals than requested, pad with replacement sampling
+    elif candidate_goals.shape[0] < num_rb_goals:
+        key, sample_key = jax.random.split(key)
+        num_needed = num_rb_goals - candidate_goals.shape[0]
+        additional_indices = jax.random.choice(
+            sample_key,
+            a=candidate_goals.shape[0],
+            shape=(num_needed,),
+            replace=True
+        )
+        additional_goals = candidate_goals[additional_indices]
+        candidate_goals = jnp.concatenate([candidate_goals, additional_goals], axis=0)
+    
+    return candidate_goals, buffer_state
+
+
 # ============================================================================
 # Goal and State Manipulation Utilities
 # ============================================================================

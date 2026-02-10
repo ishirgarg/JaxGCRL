@@ -1,4 +1,3 @@
-from .crl import CRL
 from .crl import GoExploreCRL
 from .crl import GoExploreSAC
 from .ppo import PPO
