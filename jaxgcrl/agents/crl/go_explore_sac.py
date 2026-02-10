@@ -235,8 +235,8 @@ class GoExploreSAC:
     use_gcp_critic_ensemble: bool = False
     gcp_num_critic_ensemble: int = 5
     
-    # EP reward computation
-    ep_reward_name: Literal["mean_max_critic"] = "mean_max_critic"
+    # EP reward function (EP never uses environment reward, always uses this)
+    ep_reward_fn: Literal["max_critic"] = "max_critic"
 
     # Unroll length for network updates
     unroll_length: int = 50
@@ -654,14 +654,14 @@ class GoExploreSAC:
                 extras={"state_extras": state_extras},
             )
 
-        # Check if EP reward bonus is applicable (resolved at trace time)
-        has_ep_reward_bonus = (
-            self.ep_reward_name == "mean_max_critic" 
-            and hasattr(train_env, 'possible_goals') 
-            and train_env.possible_goals is not None
-        )
-        if has_ep_reward_bonus:
+        # EP reward setup (EP always uses a specified reward, never environment reward)
+        if self.ep_reward_fn == "max_critic":
+            assert hasattr(train_env, 'possible_goals') and train_env.possible_goals is not None, (
+                "ep_reward_fn='max_critic' requires train_env.possible_goals to be defined"
+            )
             env_goals_for_reward = train_env.possible_goals
+        else:
+            raise ValueError(f"Unknown ep_reward_fn: {self.ep_reward_fn}")
 
         # ===== Experience Collection (chunk-based, matching go_explore_crl) =====
         @jax.jit
@@ -819,31 +819,31 @@ class GoExploreSAC:
                     length=steps_to_collect
                 )
                 
-                # Optionally compute mean_max_critic reward bonus for EP transitions
-                if has_ep_reward_bonus:
-                    # Compute next states from consecutive observations
-                    # ep_transitions.observation shape: (steps_to_collect, num_envs, obs_size)
-                    # Next state for t = observation at t+1 (for t < steps-1), or env_state_final for last
-                    next_states = jnp.concatenate([
-                        ep_transitions.observation[1:, :, :state_size],
-                        env_state_final.obs[:, :state_size][None, :, :]
-                    ], axis=0)  # (steps_to_collect, num_envs, state_size)
-                    
-                    next_states_flat = next_states.reshape(-1, state_size)
-                    num_transitions = steps_to_collect * num_envs
-                    reward_keys = jax.random.split(ep_key, num_transitions)
-                    
-                    def compute_reward_for_transition(next_state, rk):
-                        return compute_max_critic_reward_per_transition(
-                            next_state, env_goals_for_reward,
-                            gcp_actor, training_state.gcp_actor_state.params,
-                            training_state.gcp_critic_state.params,
-                            gcp_sa_encoder, gcp_g_encoder, self.energy_fn, rk
-                        )
-                    
-                    rewards_bonus_flat = jax.vmap(compute_reward_for_transition)(next_states_flat, reward_keys)
-                    rewards_bonus = rewards_bonus_flat.reshape(steps_to_collect, num_envs)
-                    ep_transitions = ep_transitions._replace(reward=ep_transitions.reward + rewards_bonus)
+                # Compute EP reward (replaces environment reward entirely)
+                # Immediate max-critic rewards: r_t = max_g f(s'_t, a_g, g)
+                # ep_transitions.observation shape: (steps_to_collect, num_envs, obs_size)
+                # Next state for t = observation at t+1 (for t < steps-1), or env_state_final for last
+                next_states = jnp.concatenate([
+                    ep_transitions.observation[1:, :, :state_size],
+                    env_state_final.obs[:, :state_size][None, :, :]
+                ], axis=0)  # (steps_to_collect, num_envs, state_size)
+                
+                # Flatten and compute immediate rewards
+                next_states_flat = next_states.reshape(-1, state_size)
+                num_transitions = steps_to_collect * num_envs
+                reward_keys = jax.random.split(ep_key, num_transitions)
+                
+                def compute_reward_for_transition(next_state, rk):
+                    return compute_max_critic_reward_per_transition(
+                        next_state, env_goals_for_reward,
+                        gcp_actor, training_state.gcp_actor_state.params,
+                        training_state.gcp_critic_state.params,
+                        gcp_sa_encoder, gcp_g_encoder, self.energy_fn, rk
+                    )
+                
+                ep_rewards_flat = jax.vmap(compute_reward_for_transition)(next_states_flat, reward_keys)
+                ep_rewards = ep_rewards_flat.reshape(steps_to_collect, num_envs)
+                ep_transitions = ep_transitions._replace(reward=ep_rewards)
                 
                 combined_transitions = ep_transitions
                 main_buffer_state_new = main_replay_buffer.insert(main_buffer_state, combined_transitions)
@@ -1180,6 +1180,7 @@ class GoExploreSAC:
                     actions = transitions.action[:, :-1]                      # (N, L-1, action_size)
                     rewards = transitions.reward[:, :-1]                      # (N, L-1)
                     discounts = transitions.discount[:, :-1]                  # (N, L-1)
+                    truncations = transitions.extras['state_extras']['truncation'][:, :-1]  # (N, L-1)
                     
                     # Flatten first two dims
                     flat_obs = obs.reshape(-1, state_size)
@@ -1187,6 +1188,7 @@ class GoExploreSAC:
                     flat_actions = actions.reshape(-1, action_size)
                     flat_rewards = rewards.reshape(-1)
                     flat_discounts = discounts.reshape(-1)
+                    flat_truncations = truncations.reshape(-1)
                     
                     # Permute
                     n = flat_obs.shape[0]
@@ -1196,6 +1198,7 @@ class GoExploreSAC:
                     flat_actions = flat_actions[perm]
                     flat_rewards = flat_rewards[perm]
                     flat_discounts = flat_discounts[perm]
+                    flat_truncations = flat_truncations[perm]
                     
                     # Reshape into batches (same num_batches as GCP)
                     num_complete = (n // self.batch_size) * self.batch_size
@@ -1207,7 +1210,12 @@ class GoExploreSAC:
                         action=flat_actions[:num_complete].reshape(num_batches, self.batch_size, action_size),
                         reward=flat_rewards[:num_complete].reshape(num_batches, self.batch_size),
                         discount=flat_discounts[:num_complete].reshape(num_batches, self.batch_size),
-                        extras={'policy_extras': {}},
+                        extras={
+                            'state_extras': {
+                                'truncation': flat_truncations[:num_complete].reshape(num_batches, self.batch_size),
+                            },
+                            'policy_extras': {},
+                        },
                     )
                     return sac_transitions
                 

@@ -395,6 +395,61 @@ def compute_max_critic_reward_per_transition(
     return max_q
 
 
+def compute_discounted_max_critic_rewards(
+    trajectory_next_states, env_goals, actor, actor_params, critic_params,
+    sa_encoder, g_encoder, energy_fn_name, gamma, key
+):
+    """Compute discounted max-critic returns over an entire trajectory.
+    
+    For a trajectory of next-states s'_0, s'_1, ..., s'_{T-1}:
+    1. Compute raw per-step rewards: r_t = max_g f(s'_t, a_g, g)
+    2. Compute discounted returns via reverse scan:
+       R_{T-1} = r_{T-1}
+       R_t     = r_t + γ · R_{t+1}
+    
+    Args:
+        trajectory_next_states: (T, state_dim) array of next-states for one env
+        env_goals: (num_env_goals, goal_dim) environment goals
+        actor: Actor network (GCP actor)
+        actor_params: Actor parameters (GCP actor)
+        critic_params: Critic parameters (GCP critic, can be single or ensemble)
+        sa_encoder: State-action encoder network (GCP)
+        g_encoder: Goal encoder network (GCP)
+        energy_fn_name: Name of energy function
+        gamma: Discount factor
+        key: JAX random key
+        
+    Returns:
+        discounted_returns: (T,) array of discounted returns for each timestep
+    """
+    T = trajectory_next_states.shape[0]
+    keys = jax.random.split(key, T)
+    
+    # Step 1: compute raw per-step rewards r_t = max_g f(s'_t, a_g, g)
+    raw_rewards = jax.vmap(
+        lambda s, k: compute_max_critic_reward_per_transition(
+            s, env_goals, actor, actor_params, critic_params,
+            sa_encoder, g_encoder, energy_fn_name, k
+        )
+    )(trajectory_next_states, keys)  # (T,)
+    
+    # Step 2: compute discounted returns via reverse scan
+    # R_{T-1} = r_{T-1},  R_t = r_t + γ · R_{t+1}
+    def scan_fn(future_return, reward_t):
+        current_return = reward_t + gamma * future_return
+        return current_return, current_return
+    
+    # Scan in reverse (from T-1 down to 0)
+    _, discounted_returns = jax.lax.scan(
+        scan_fn,
+        jnp.float32(0.0),       # initial future return beyond trajectory end
+        raw_rewards[::-1],       # reverse the rewards
+    )
+    discounted_returns = discounted_returns[::-1]  # reverse back to forward order
+    
+    return discounted_returns
+
+
 def compute_min_critic_mean_reward(
     states, actions, env_goals, actor, actor_params, critic_params,
     sa_encoder, g_encoder, energy_fn_name
