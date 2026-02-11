@@ -179,6 +179,33 @@ def sample_candidate_goals_from_replay_buffer(
 # Goal and State Manipulation Utilities
 # ============================================================================
 
+def propose_random_environment_goals(env, batch_size, key):
+    """Propose random goals from environment's possible_goals.
+    
+    Args:
+        env: Training environment (must have possible_goals attribute)
+        env_state: Current environment state (used to get batch_size)
+        key: JAX random key for sampling
+        
+    Returns:
+        proposed_goals: (batch_size, goal_dim) array of proposed goals
+    """
+    assert hasattr(env, 'possible_goals'), \
+        "Environment must have 'possible_goals' attribute for propose_random_environment_goals."
+        
+    # Get environment goals
+    env_goals = env.possible_goals  # (num_env_goals, goal_dim)
+    num_env_goals = env_goals.shape[0]
+    
+    # Sample random indices for each environment in the batch
+    indices = jax.random.randint(key, (batch_size,), 0, num_env_goals)
+    
+    # Extract goals using sampled indices
+    proposed_goals = env_goals[indices]  # (batch_size, goal_dim)
+    
+    return proposed_goals
+
+
 def expand_goal_to_state(goal, state_size, goal_indices):
     """Expand a goal to a full state vector with zeros elsewhere.
     

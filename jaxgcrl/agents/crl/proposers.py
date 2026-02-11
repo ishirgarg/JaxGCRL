@@ -21,6 +21,7 @@ from jaxgcrl.agents.crl.goals_utils import (
     compute_kl_divergence_empirical,
     compute_energy_for_state_goal_pairs,
     sample_candidate_goals_from_replay_buffer,
+    propose_random_environment_goals,
 )
 from jaxgcrl.agents.crl.losses import energy_fn
 
@@ -120,22 +121,7 @@ class RandomEnvironmentGoalProposer:
             proposed_goals: (batch_size, goal_size) array of proposed goals
             buffer_state: Updated buffer state (unchanged)
         """
-        assert hasattr(env, 'possible_goals'), \
-            "Environment must have 'possible_goals' attribute for RandomEnvironmentGoalProposer."
-        
-        # Get batch size from env_state
-        batch_size = env_state.obs.shape[0]
-        
-        # Get environment goals
-        env_goals = env.possible_goals  # (num_env_goals, goal_dim)
-        num_env_goals = env_goals.shape[0]
-        
-        # Sample random indices for each environment in the batch
-        indices = jax.random.randint(key, (batch_size,), 0, num_env_goals)
-        
-        # Extract goals using sampled indices
-        proposed_goals = env_goals[indices]  # (batch_size, goal_dim)
-        
+        proposed_goals = propose_random_environment_goals(env, env_state.obs.shape[0], key)
         return proposed_goals, buffer_state
 
 
@@ -736,6 +722,7 @@ class MaxWaypointRatioOneEnvProposer:
         zero_out_cand_goals: Whether to zero out non-goal dimensions in candidate goals
         zero_out_state: Whether to zero out non-goal dimensions in current state
         propose_env_goals: If True, propose environment goals instead of waypoint goals
+        filter_successful_waypoints: If True, filter out candidate goals that are within goal_reach_thresh of any environment goal
         LOG_INTERVAL_STEPS: Log visualizations every N environment steps
     """
     energy_fn_name: str
@@ -745,6 +732,7 @@ class MaxWaypointRatioOneEnvProposer:
     zero_out_cand_goals: bool = True
     zero_out_state: bool = False
     propose_env_goals: bool = False
+    filter_successful_waypoints: bool = False
     LOG_INTERVAL_STEPS: int = 1000000
 
     def propose_goals(self, replay_buffer, buffer_state, env, env_state, key,
@@ -780,16 +768,43 @@ class MaxWaypointRatioOneEnvProposer:
             replay_buffer, buffer_state, env, sample_key, self.num_rb_goals, self.candidate_goals_type
         )  # (num_rb_goals, goal_dim)
         
+        env_goals = env.possible_goals  # (num_env_goals, goal_dim)
+        
+        # Filter out successful waypoints if requested
+        if self.filter_successful_waypoints:
+            assert hasattr(env, 'goal_reach_thresh'), \
+                "Environment must have 'goal_reach_thresh' attribute for filter_successful_waypoints=True."
+            
+            # For each candidate goal, check if it's within goal_reach_thresh of any environment goal
+            # candidate_goals: (num_rb_goals, goal_dim)
+            # env_goals: (num_env_goals, goal_dim)
+            
+            # Compute distances: (num_rb_goals, num_env_goals)
+            candidate_expanded = jnp.repeat(candidate_goals[:, None, :], env_goals.shape[0], axis=1)  # (num_rb_goals, num_env_goals, goal_dim)
+            env_expanded = jnp.repeat(env_goals[None, :, :], candidate_goals.shape[0], axis=0)  # (num_rb_goals, num_env_goals, goal_dim)
+            distances = jnp.linalg.norm(candidate_expanded - env_expanded, axis=-1)  # (num_rb_goals, num_env_goals)
+            
+            # Check if any environment goal is within threshold for each candidate
+            is_successful = jnp.any(distances < env.goal_reach_thresh, axis=1)  # (num_rb_goals,)
+            
+            # Filter out successful candidates
+            keep_mask = ~is_successful  # (num_rb_goals,)
+            candidate_goals = candidate_goals[keep_mask]  # (num_filtered, goal_dim)
+            
+            # If all candidates were filtered out, propose random environment goals
+            if candidate_goals.shape[0] == 0:
+                key, sample_key = jax.random.split(key)
+                proposed_goals = propose_random_environment_goals(env, env_stat.obs.shape[0], sample_key)
+                return proposed_goals, buffer_state
+        
         # For candidate_goals_full, we need full state vectors
         # Expand goals to states using expand_goal_to_state
         candidate_goals_full = jax.vmap(
             lambda g: expand_goal_to_state(g, state_size, env.goal_indices)
-        )(candidate_goals)  # (num_rb_goals, state_dim)
+        )(candidate_goals)  # (num_filtered, state_dim)
         
         # Note: If zero_out_cand_goals is False, we'd ideally want the actual full states
         # from the replay buffer, but for simplicity we use the expanded version
-
-        env_goals = env.possible_goals  # (num_env_goals, goal_dim)
 
         def energy_triplet(state):
             """Compute M[g,h] for a single state."""

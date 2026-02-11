@@ -251,6 +251,7 @@ class GoExploreCRL:
     # Replay buffer goal sampling parameters
     num_rb_goals: int = 256
     candidate_goals_type: Literal["final", "any"] = "final"
+    filter_successful_waypoints: bool = False
 
     train_ep_on_main_buffer: bool = False
 
@@ -561,7 +562,8 @@ class GoExploreCRL:
             energy_fn_name=self.energy_fn,
             goal_sampling_temperature=self.goal_sampling_temperature,
             num_rb_goals=self.num_rb_goals,
-            candidate_goals_type=self.candidate_goals_type
+            candidate_goals_type=self.candidate_goals_type,
+            filter_successful_waypoints=self.filter_successful_waypoints
         )
         q_epistemic_proposer = QEpistemicProposer(
             energy_fn_name=self.energy_fn,
