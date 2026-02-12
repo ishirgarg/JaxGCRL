@@ -787,118 +787,148 @@ class MaxWaypointRatioOneEnvProposer:
             # Check if any environment goal is within threshold for each candidate
             is_successful = jnp.any(distances < env.goal_reach_thresh, axis=1)  # (num_rb_goals,)
             
-            # Filter out successful candidates
+            # Keep mask: True for goals we want to keep (not successful)
             keep_mask = ~is_successful  # (num_rb_goals,)
-            candidate_goals = candidate_goals[keep_mask]  # (num_filtered, goal_dim)
             
-            # If all candidates were filtered out, propose random environment goals
-            if candidate_goals.shape[0] == 0:
-                key, sample_key = jax.random.split(key)
-                proposed_goals = propose_random_environment_goals(env, env_stat.obs.shape[0], sample_key)
-                return proposed_goals, buffer_state
+            # Check if all goals were filtered out
+            all_filtered = jnp.all(~keep_mask)  # True if all goals are filtered
+        else:
+            # No filtering: all goals are valid
+            keep_mask = jnp.ones(candidate_goals.shape[0], dtype=bool)
+            all_filtered = jnp.array(False)
         
-        # For candidate_goals_full, we need full state vectors
-        # Expand goals to states using expand_goal_to_state
-        candidate_goals_full = jax.vmap(
-            lambda g: expand_goal_to_state(g, state_size, env.goal_indices)
-        )(candidate_goals)  # (num_filtered, state_dim)
+        # If all goals were filtered, return random environment goals
+        def return_random_goals(key):
+            sample_key, _ = jax.random.split(key)
+            return propose_random_environment_goals(env, current_states.shape[0], sample_key), buffer_state
         
-        # Note: If zero_out_cand_goals is False, we'd ideally want the actual full states
-        # from the replay buffer, but for simplicity we use the expanded version
-
-        def energy_triplet(state):
-            """Compute M[g,h] for a single state."""
-            # Optionally zero out everything except goal indices
-            if self.zero_out_state:
-                state = zero_out_non_goal_indices(state, env.goal_indices)
+        def compute_goals_normally(key, keep_mask):
+            # For candidate_goals_full, we need full state vectors
+            # Expand goals to states using expand_goal_to_state
+            candidate_goals_full = jax.vmap(
+                lambda g: expand_goal_to_state(g, state_size, env.goal_indices)
+            )(candidate_goals)  # (num_rb_goals, state_dim)
             
-            num_cand = candidate_goals.shape[0]
-            num_env = env_goals.shape[0]
+            # Note: If zero_out_cand_goals is False, we'd ideally want the actual full states
+            # from the replay buffer, but for simplicity we use the expanded version
 
-            # f(g, a2, h) - only term we need (no waypoint difficulty, no KDE)
-            g_exp = jnp.repeat(candidate_goals_full[:, None, :], num_env, axis=1)  # (num_cand, num_env, state_dim)
-            h_exp = jnp.repeat(env_goals[None, :, :], num_cand, axis=0)
-            obs_gh = jnp.concatenate([g_exp, h_exp], axis=-1).reshape(num_cand * num_env, -1)
-            means2, _ = actor.apply(actor_params, obs_gh)
-            a2 = jnp.tanh(means2)
-            phi_gh = sa_encoder.apply(critic_params['sa_encoder'],
-                                      jnp.concatenate([g_exp.reshape(-1, g_exp.shape[-1]), a2], axis=1))
-            psi_h = g_encoder.apply(critic_params['g_encoder'], env_goals)
-            psi_h_rep = jnp.repeat(psi_h[None, :, :], num_cand, axis=0).reshape(num_cand * num_env, -1)
-            f_gah = energy_fn(self.energy_fn_name, phi_gh, psi_h_rep).reshape(num_cand, num_env)
+            def energy_triplet(state):
+                """Compute M[g,h] for a single state."""
+                # Optionally zero out everything except goal indices
+                if self.zero_out_state:
+                    state = zero_out_non_goal_indices(state, env.goal_indices)
+                
+                num_cand = candidate_goals.shape[0]  # All candidate goals (not filtered)
+                num_env = env_goals.shape[0]
 
-            # f(s, a3, h)
-            s3 = jnp.repeat(state[None, :], num_env, axis=0)
-            obs_sh = jnp.concatenate([s3, env_goals], axis=1)
-            means3, _ = actor.apply(actor_params, obs_sh)
-            a3 = jnp.tanh(means3)
-            phi_sh = sa_encoder.apply(critic_params['sa_encoder'], jnp.concatenate([s3, a3], axis=1))
-            f_sah = energy_fn(self.energy_fn_name, phi_sh, psi_h)  # (num_env,)
+                # f(g, a2, h) - only term we need (no waypoint difficulty, no KDE)
+                g_exp = jnp.repeat(candidate_goals_full[:, None, :], num_env, axis=1)  # (num_cand, num_env, state_dim)
+                h_exp = jnp.repeat(env_goals[None, :, :], num_cand, axis=0)
+                obs_gh = jnp.concatenate([g_exp, h_exp], axis=-1).reshape(num_cand * num_env, -1)
+                means2, _ = actor.apply(actor_params, obs_gh)
+                a2 = jnp.tanh(means2)
+                phi_gh = sa_encoder.apply(critic_params['sa_encoder'],
+                                          jnp.concatenate([g_exp.reshape(-1, g_exp.shape[-1]), a2], axis=1))
+                psi_h = g_encoder.apply(critic_params['g_encoder'], env_goals)
+                psi_h_rep = jnp.repeat(psi_h[None, :, :], num_cand, axis=0).reshape(num_cand * num_env, -1)
+                f_gah = energy_fn(self.energy_fn_name, phi_gh, psi_h_rep).reshape(num_cand, num_env)
+
+                # f(s, a3, h)
+                s3 = jnp.repeat(state[None, :], num_env, axis=0)
+                obs_sh = jnp.concatenate([s3, env_goals], axis=1)
+                means3, _ = actor.apply(actor_params, obs_sh)
+                a3 = jnp.tanh(means3)
+                phi_sh = sa_encoder.apply(critic_params['sa_encoder'], jnp.concatenate([s3, a3], axis=1))
+                f_sah = energy_fn(self.energy_fn_name, phi_sh, psi_h)  # (num_env,)
+                
+                # Compute M matrix: M = f(g, a2, h) - f(s, a3, h)
+                M = f_gah - f_sah[None, :]
+                return M
+
+            # compute M for all states
+            energy_mats = jax.vmap(energy_triplet)(current_states)  # (batch, num_cand, num_env)
             
-            # Compute M matrix: M = f(g, a2, h) - f(s, a3, h)
-            M = f_gah - f_sah[None, :]
-            return M
+            def select_goal_maxlogsumexp_one_env(M, rand_key, mask):
+                """Select one random environment goal and compute weights using only that column.
+                
+                Args:
+                    M: Energy matrix (num_cand, num_env)
+                    rand_key: Random key
+                    mask: Boolean mask (num_cand,) - True for goals to keep
+                """
+                rand_key_h, rand_key_g = jax.random.split(rand_key)
 
-        # compute M for all states
-        energy_mats = jax.vmap(energy_triplet)(current_states)  # (batch, num_cand, num_env)
-        
-        def select_goal_maxlogsumexp_one_env(M, rand_key):
-            """Select one random environment goal and compute weights using only that column."""
-            rand_key_h, rand_key_g = jax.random.split(rand_key)
-
-            # Randomly select one environment goal
-            num_env_goals = M.shape[1]
-            h_idx = jax.random.choice(rand_key_h, a=jnp.arange(num_env_goals))
-            
-            energies_for_h = M[:, h_idx]  # (num_candidate_goals,)
-            score = energies_for_h  # Positive because we want to maximize
-            if self.goal_sampling_temperature > 0:
-                logits = score / self.goal_sampling_temperature
-                weights = jax.nn.softmax(logits)
-            else:
-                # Greedy: take argmax
-                g_idx = jnp.argmax(score)
+                # Randomly select one environment goal
+                num_env_goals = M.shape[1]
+                h_idx = jax.random.choice(rand_key_h, a=jnp.arange(num_env_goals))
+                
+                energies_for_h = M[:, h_idx]  # (num_candidate_goals,)
+                score = energies_for_h  # Positive because we want to maximize
+                
+                # Mask out filtered goals by setting their logits to -inf
+                # Set score to -inf for filtered goals so they get zero probability
+                score = jnp.where(mask, score, jnp.array(-jnp.inf))
+                
+                if self.goal_sampling_temperature > 0:
+                    logits = score / self.goal_sampling_temperature
+                    weights = jax.nn.softmax(logits)
+                else:
+                    # Greedy: take argmax
+                    g_idx = jnp.argmax(score)
+                    return g_idx, h_idx
+                g_idx = jax.random.choice(rand_key_g, a=jnp.arange(M.shape[0]), p=weights)
+                
                 return g_idx, h_idx
-            g_idx = jax.random.choice(rand_key_g, a=jnp.arange(M.shape[0]), p=weights)
+
+            # Split key for batch operations
+            batch_size = energy_mats.shape[0]
+            batch_keys = jax.random.split(key, batch_size)
             
-            return g_idx, h_idx
+            # Broadcast mask to batch dimension
+            keep_mask_batch = jnp.broadcast_to(keep_mask[None, :], (batch_size, keep_mask.shape[0]))
 
-        # Split key for batch operations
-        batch_size = energy_mats.shape[0]
-        batch_keys = jax.random.split(key, batch_size)
+            best_g_indices, best_h_indices = jax.vmap(select_goal_maxlogsumexp_one_env)(energy_mats, batch_keys, keep_mask_batch)
 
-        best_g_indices, best_h_indices = jax.vmap(select_goal_maxlogsumexp_one_env)(energy_mats, batch_keys)
-
-        # Select proposed goals: either candidate goals (waypoints) or environment goals
-        if self.propose_env_goals:
-            proposed_goals = env_goals[best_h_indices]  # (batch, goal_dim)
-        else:
-            proposed_goals = candidate_goals[best_g_indices]      # (batch, goal_dim)
-
-        # Log visualizations only at specified intervals to reduce wandb storage
-        if training_state is not None:
-            env_steps = training_state.env_steps
-        else:
-            env_steps = jnp.array(0)  # Default if not provided
+            # Select proposed goals: either candidate goals (waypoints) or environment goals
+            if self.propose_env_goals:
+                proposed_goals = env_goals[best_h_indices]  # (batch, goal_dim)
+            else:
+                proposed_goals = candidate_goals[best_g_indices]      # (batch, goal_dim)
+            
+            # Log visualizations only at specified intervals to reduce wandb storage
+            if training_state is not None:
+                env_steps = training_state.env_steps
+            else:
+                env_steps = jnp.array(0)  # Default if not provided
+            
+            # Select a state index for visualization (use first state)
+            viz_state_idx = jnp.array(0)
+            
+            jax.experimental.io_callback(
+                MaxWaypointRatioOneEnvProposer._log_goal_selection_viz,
+                None,
+                current_states,
+                candidate_goals,
+                env_goals,
+                best_g_indices,
+                best_h_indices,
+                energy_mats,
+                viz_state_idx,
+                env_steps,
+                env.goal_indices,
+                env.x_bounds if hasattr(env, 'x_bounds') else None,
+                env.y_bounds if hasattr(env, 'y_bounds') else None,
+                self.LOG_INTERVAL_STEPS
+            )
+            
+            return proposed_goals, buffer_state
         
-        # Select a state index for visualization (use first state)
-        viz_state_idx = jnp.array(0)
-        
-        jax.experimental.io_callback(
-            MaxWaypointRatioOneEnvProposer._log_goal_selection_viz,
-            None,
-            current_states,
-            candidate_goals,
-            env_goals,
-            best_g_indices,
-            best_h_indices,
-            energy_mats,
-            viz_state_idx,
-            env_steps,
-            env.goal_indices,
-            env.x_bounds if hasattr(env, 'x_bounds') else None,
-            env.y_bounds if hasattr(env, 'y_bounds') else None,
-            self.LOG_INTERVAL_STEPS
+        # Use conditional to choose between random goals or normal computation
+        proposed_goals, buffer_state = jax.lax.cond(
+            all_filtered,
+            return_random_goals,
+            lambda k: compute_goals_normally(k, keep_mask),
+            key
         )
 
         return proposed_goals, buffer_state
