@@ -255,7 +255,7 @@ class GoExploreCRL:
 
     train_ep_on_main_buffer: bool = False
 
-    use_same_policy: bool = False
+    use_same_policy: bool = True
     
     # Critic ensemble for Q-epistemic goal proposal
     use_gcp_critic_ensemble: bool = False

@@ -62,6 +62,7 @@ legal_envs = (
     "ant_bigger_maze_two_corner",
     "ant_bigger_maze_three_corner",
     "ant_hardest_maze",
+    "ant_trident_maze",
     "humanoid_u_maze",
     "humanoid_big_maze",
     "humanoid_hardest_maze",

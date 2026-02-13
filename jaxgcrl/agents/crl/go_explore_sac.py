@@ -41,7 +41,7 @@ from .proposers import (
     MEGAProposer,
     OMEGAProposer,
 )
-from .goals_utils import compute_min_critic_mean_reward, compute_max_critic_reward_per_transition
+from .goals_utils import compute_min_critic_mean_reward, compute_max_critic_reward_per_transition, compute_state_goal_mi_reward_per_transition
 from jaxgcrl.agents.sac import networks as sac_networks
 
 Metrics = types.Metrics
@@ -243,7 +243,7 @@ class GoExploreSAC:
     gcp_num_critic_ensemble: int = 5
     
     # EP reward function (EP never uses environment reward, always uses this)
-    ep_reward_fn: Literal["max_critic"] = "max_critic"
+    ep_reward_fn: Literal["max_critic", "state_goal_mi"] = "max_critic"
 
     # Unroll length for network updates
     unroll_length: int = 50
@@ -717,6 +717,11 @@ class GoExploreSAC:
                 "ep_reward_fn='max_critic' requires train_env.possible_goals to be defined"
             )
             env_goals_for_reward = train_env.possible_goals
+        elif self.ep_reward_fn == "state_goal_mi":
+            assert hasattr(train_env, 'possible_goals') and train_env.possible_goals is not None, (
+                "ep_reward_fn='state_goal_mi' requires train_env.possible_goals to be defined"
+            )
+            env_goals_for_reward = train_env.possible_goals
         else:
             raise ValueError(f"Unknown ep_reward_fn: {self.ep_reward_fn}")
 
@@ -877,8 +882,9 @@ class GoExploreSAC:
                 )
                 
                 # Compute EP reward (replaces environment reward entirely)
-                # Immediate max-critic rewards: r_t = max_g f(s'_t, a_g, g)
                 # ep_transitions.observation shape: (steps_to_collect, num_envs, obs_size)
+                # Current states: observations at each timestep
+                current_states = ep_transitions.observation[:, :, :state_size]  # (steps_to_collect, num_envs, state_size)
                 # Next state for t = observation at t+1 (for t < steps-1), or env_state_final for last
                 next_states = jnp.concatenate([
                     ep_transitions.observation[1:, :, :state_size],
@@ -886,19 +892,36 @@ class GoExploreSAC:
                 ], axis=0)  # (steps_to_collect, num_envs, state_size)
                 
                 # Flatten and compute immediate rewards
+                current_states_flat = current_states.reshape(-1, state_size)
                 next_states_flat = next_states.reshape(-1, state_size)
                 num_transitions = steps_to_collect * num_envs
                 reward_keys = jax.random.split(ep_key, num_transitions)
                 
-                def compute_reward_for_transition(next_state, rk):
-                    return compute_max_critic_reward_per_transition(
-                        next_state, env_goals_for_reward,
-                        gcp_actor, training_state.gcp_actor_state.params,
-                        training_state.gcp_critic_state.params,
-                        gcp_sa_encoder, gcp_g_encoder, self.energy_fn, rk
-                    )
+                if self.ep_reward_fn == "max_critic":
+                    # Immediate max-critic rewards: r_t = max_g f(s'_t, a_g, g)
+                    def compute_reward_for_transition(next_state, rk):
+                        return compute_max_critic_reward_per_transition(
+                            next_state, env_goals_for_reward,
+                            gcp_actor, training_state.gcp_actor_state.params,
+                            training_state.gcp_critic_state.params,
+                            gcp_sa_encoder, gcp_g_encoder, self.energy_fn, rk
+                        )
+                    
+                    ep_rewards_flat = jax.vmap(compute_reward_for_transition)(next_states_flat, reward_keys)
+                elif self.ep_reward_fn == "state_goal_mi":
+                    # StateGoalMI rewards: r_t = -H(p(g|s_t, s'_t))
+                    def compute_reward_for_transition(state, next_state, rk):
+                        return compute_state_goal_mi_reward_per_transition(
+                            state, next_state, env_goals_for_reward,
+                            gcp_actor, training_state.gcp_actor_state.params,
+                            training_state.gcp_critic_state.params,
+                            gcp_sa_encoder, gcp_g_encoder, self.energy_fn, rk
+                        )
+                    
+                    ep_rewards_flat = jax.vmap(compute_reward_for_transition)(current_states_flat, next_states_flat, reward_keys)
+                else:
+                    raise ValueError(f"Unknown ep_reward_fn: {self.ep_reward_fn}")
                 
-                ep_rewards_flat = jax.vmap(compute_reward_for_transition)(next_states_flat, reward_keys)
                 ep_rewards = ep_rewards_flat.reshape(steps_to_collect, num_envs)
                 ep_transitions = ep_transitions._replace(reward=ep_rewards)
                 

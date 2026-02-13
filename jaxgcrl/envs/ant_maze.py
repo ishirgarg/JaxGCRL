@@ -165,6 +165,16 @@ HARDEST_MAZE = [
     [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
+TRIDENT_MAZE = [
+    [1, 1, 1, G, 1, 1],
+    [1, 1, 1, S, 1, 1],
+    [1, 1, 1, S, 1, 1],
+    [1, R, S, S, S, S],
+    [1, 1, 1, S, 1, 1],
+    [1, 1, 1, S, 1, 1],
+    [1, 1, 1, G, 1, 1],
+]
+
 
 MAZE_HEIGHT = 0.5
 
@@ -199,6 +209,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
         maze_layout = BIG_MAZE
     elif maze_layout_name == "big_maze_one_corner":
         maze_layout = BIG_MAZE_ONE_CORNER
+    elif maze_layout_name == "trident_maze":
+        maze_layout = TRIDENT_MAZE
     elif maze_layout_name == "big_maze_two_corner":
         maze_layout = BIG_MAZE_TWO_CORNER
     elif maze_layout_name == "big_maze_two_corner_hard":

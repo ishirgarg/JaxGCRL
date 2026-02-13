@@ -498,6 +498,111 @@ def compute_max_critic_reward_per_transition(
     return max_q
 
 
+def compute_state_goal_mi_reward_per_transition(
+    state, next_state, env_goals, actor, actor_params, critic_params,
+    sa_encoder, g_encoder, energy_fn_name, key
+):
+    """Compute StateGoalMI reward for a single transition (s, s'): -H(p(g|s,s')).
+    
+    For a transition (s, s'), for each environment goal g:
+    1. Sample action a1 from goal-conditioned policy: a1 ~ π_gcp(s', g)
+    2. Sample action a2 from goal-conditioned policy: a2 ~ π_gcp(s, g)
+    3. Compute f(s', a1, g) - f(s, a2, g) using the GCP critic
+    4. Compute exp(f(s', a1, g) - f(s, a2, g))
+    5. Normalize these values to get a distribution p(g|s, s') over environment goals
+    6. Compute negative entropy: -H(p(g|s, s'))
+    
+    Args:
+        state: (state_dim,) state vector (current state s)
+        next_state: (state_dim,) state vector (next state s')
+        env_goals: (num_env_goals, goal_dim) environment goals
+        actor: Actor network (GCP actor)
+        actor_params: Actor parameters (GCP actor)
+        critic_params: Critic parameters (GCP critic, can be single or ensemble)
+        sa_encoder: State-action encoder network (GCP)
+        g_encoder: Goal encoder network (GCP)
+        energy_fn_name: Name of energy function
+        key: JAX random key for sampling actions
+        
+    Returns:
+        reward: Scalar reward value (negative entropy of the distribution)
+    """
+    from jaxgcrl.agents.crl.losses import energy_fn
+    
+    num_env_goals = env_goals.shape[0]
+    
+    # Expand states to match number of env goals
+    state_expanded = jnp.tile(state, (num_env_goals, 1))  # (num_env_goals, state_dim)
+    next_state_expanded = jnp.tile(next_state, (num_env_goals, 1))  # (num_env_goals, state_dim)
+    
+    # Create observations: concatenate state and goal
+    obs_s = jnp.concatenate([state_expanded, env_goals], axis=1)  # (num_env_goals, obs_dim)
+    obs_s_prime = jnp.concatenate([next_state_expanded, env_goals], axis=1)  # (num_env_goals, obs_dim)
+    
+    # Sample actions from goal-conditioned policy for each (s, g) and (s', g) pair
+    # Use deterministic action (mean) for consistency
+    means_s, _ = actor.apply(actor_params, obs_s)  # (num_env_goals, action_dim)
+    actions_s = jnp.tanh(means_s)  # (num_env_goals, action_dim) - a2
+    
+    means_s_prime, _ = actor.apply(actor_params, obs_s_prime)  # (num_env_goals, action_dim)
+    actions_s_prime = jnp.tanh(means_s_prime)  # (num_env_goals, action_dim) - a1
+    
+    # Compute state-action pairs
+    sa_pairs_s = jnp.concatenate([state_expanded, actions_s], axis=1)  # (num_env_goals, state_dim + action_dim)
+    sa_pairs_s_prime = jnp.concatenate([next_state_expanded, actions_s_prime], axis=1)  # (num_env_goals, state_dim + action_dim)
+    
+    # Handle ensemble vs single critic
+    is_ensemble = isinstance(critic_params["sa_encoder"], list)
+    
+    if is_ensemble:
+        # Ensemble case: compute Q-values for each critic, then take mean
+        stacked_sa_params, stacked_g_params = stack_ensemble_params(critic_params)
+        
+        def compute_q_for_critic(sa_p, g_p):
+            phi_sa_s = sa_encoder.apply(sa_p, sa_pairs_s)  # (num_env_goals, repr_dim)
+            phi_sa_s_prime = sa_encoder.apply(sa_p, sa_pairs_s_prime)  # (num_env_goals, repr_dim)
+            psi_g = g_encoder.apply(g_p, env_goals)  # (num_env_goals, repr_dim)
+            q_values_s = energy_fn(energy_fn_name, phi_sa_s, psi_g)  # (num_env_goals,)
+            q_values_s_prime = energy_fn(energy_fn_name, phi_sa_s_prime, psi_g)  # (num_env_goals,)
+            return q_values_s, q_values_s_prime
+        
+        # Compute Q-values for all ensemble members
+        all_q_s, all_q_s_prime = jax.vmap(compute_q_for_critic)(stacked_sa_params, stacked_g_params)  # (num_ensemble, num_env_goals) each
+        
+        # Take mean over ensemble
+        mean_q_s = jnp.mean(all_q_s, axis=0)  # (num_env_goals,)
+        mean_q_s_prime = jnp.mean(all_q_s_prime, axis=0)  # (num_env_goals,)
+        
+        # Compute f(s', a1, g) - f(s, a2, g)
+        diff = mean_q_s_prime - mean_q_s  # (num_env_goals,)
+    else:
+        # Single critic case
+        phi_sa_s = sa_encoder.apply(critic_params['sa_encoder'], sa_pairs_s)  # (num_env_goals, repr_dim)
+        phi_sa_s_prime = sa_encoder.apply(critic_params['sa_encoder'], sa_pairs_s_prime)  # (num_env_goals, repr_dim)
+        psi_g = g_encoder.apply(critic_params['g_encoder'], env_goals)  # (num_env_goals, repr_dim)
+        q_values_s = energy_fn(energy_fn_name, phi_sa_s, psi_g)  # (num_env_goals,)
+        q_values_s_prime = energy_fn(energy_fn_name, phi_sa_s_prime, psi_g)  # (num_env_goals,)
+        
+        # Compute f(s', a1, g) - f(s, a2, g)
+        diff = q_values_s_prime - q_values_s  # (num_env_goals,)
+    
+    # Compute exp(f(s', a1, g) - f(s, a2, g))
+    exp_diff = jnp.exp(diff)  # (num_env_goals,)
+    
+    # Normalize to get distribution p(g|s, s')
+    # Use logsumexp for numerical stability
+    log_sum_exp = jax.scipy.special.logsumexp(diff)  # Scalar
+    log_probs = diff - log_sum_exp  # (num_env_goals,) - log probabilities
+    probs = jnp.exp(log_probs)  # (num_env_goals,) - probabilities
+    
+    # Compute negative entropy: -H(p) = sum_g p(g) * log(p(g))
+    # Use log_probs for numerical stability: -H = sum_g p(g) * log(p(g))
+    entropy = -jnp.sum(probs * log_probs)  # Scalar entropy
+    negative_entropy = -entropy  # Negative entropy (reward)
+    
+    return negative_entropy
+
+
 def compute_discounted_max_critic_rewards(
     trajectory_next_states, env_goals, actor, actor_params, critic_params,
     sa_encoder, g_encoder, energy_fn_name, gamma, key
