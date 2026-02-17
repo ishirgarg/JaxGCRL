@@ -129,7 +129,7 @@ def visualize_goals_2d(start_xy, proposed_goals_xy,
 
 def visualize_dual_crl_trajectories_2d(start_xy, gc_final_xy, ep_final_xy, gc_proposed_goals_xy, ep_proposed_goals_xy,
                                        gc_intermediate_xy_list, ep_intermediate_xy_list, wandb_key,
-                                       x_bounds=None, y_bounds=None):
+                                       x_bounds=None, y_bounds=None, gc_step_counts=None, ep_step_counts=None):
     '''Visualize 2D trajectories for dual CRL with GC and EP phases in a 2x2 grid.
     - start_xy: (num_samples, 2) array of start states (should be 4 trajectories)
     - gc_final_xy: (num_samples, 2) array of final states from GC rollout
@@ -141,6 +141,8 @@ def visualize_dual_crl_trajectories_2d(start_xy, gc_final_xy, ep_final_xy, gc_pr
     - wandb_key: str, key to log the plot in WandB
     - x_bounds: tuple (min, max) for x-axis range, or None for auto
     - y_bounds: tuple (min, max) for y-axis range, or None for auto
+    - gc_step_counts: list of int, number of GCP steps for each trajectory (optional)
+    - ep_step_counts: list of int, number of EP steps for each trajectory (optional)
     '''
     assert start_xy.shape[1] == 2, "Goal visualization only supported for 2D goals"
     assert gc_final_xy.shape[1] == 2, "Goal visualization only supported for 2D goals"
@@ -247,7 +249,14 @@ def visualize_dual_crl_trajectories_2d(start_xy, gc_final_xy, ep_final_xy, gc_pr
         ax.grid(True, alpha=0.3)
         ax.set_xlabel('x')
         ax.set_ylabel('y')
-        ax.set_title(f'Trajectory {i+1}')
+        
+        # Create title with step counts if available
+        if gc_step_counts is not None and ep_step_counts is not None:
+            title = f'Trajectory {i+1} (GCP: {gc_step_counts[i]} steps, EP: {ep_step_counts[i]} steps)'
+        else:
+            title = f'Trajectory {i+1}'
+        ax.set_title(title, fontsize=10)
+        
         if i == 0:
             ax.legend(loc='upper right', fontsize=8)
     
