@@ -51,6 +51,7 @@ class TrainingState:
     ep_critic_state: TrainState
     gcp_alpha_state: TrainState
     ep_alpha_state: TrainState
+    traj_counter: jnp.ndarray  # Global counter for unique trajectory IDs
 
 
 class Transition(NamedTuple):
@@ -345,13 +346,12 @@ class GoExploreCRL:
         env_state = jax.jit(train_env.reset)(env_keys)
         train_env.step = jax.jit(train_env.step)
         
-        # Assign unique trajectory IDs per environment (environment index * large_number)
-        # This ensures each environment has a different trajectory ID even if they reset together
-        # Use a large multiplier so increments from episode endings don't cause collisions
-        TRAJ_ID_MULTIPLIER = 100000
+        # Assign unique trajectory IDs per environment using global counter
+        # Format: traj_counter * num_envs + env_index
+        # This ensures globally unique IDs across all training iterations
         env_indices = jnp.arange(config.num_envs, dtype=jnp.int32)
         initial_info = dict(env_state.info)
-        initial_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
+        initial_info["traj_id"] = env_indices  # Start with 0, 1, 2, ...
         # Initialize gc_proposed_goals and ep_proposed_goals for consistent PyTree structure
         initial_info["gc_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
         initial_info["ep_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
@@ -480,6 +480,7 @@ class GoExploreCRL:
             ep_critic_state=ep_critic_state,
             gcp_alpha_state=gcp_alpha_state,
             ep_alpha_state=ep_alpha_state,
+            traj_counter=jnp.zeros((), dtype=jnp.int32),  # Initialize trajectory counter
         )
 
         # Replay Buffer
@@ -1116,10 +1117,12 @@ class GoExploreCRL:
                 # Reset environments after collecting experience
                 reset_keys = jax.random.split(reset_key, config.num_envs)
                 env_state_final = jax.jit(train_env.reset)(reset_keys)
-                TRAJ_ID_MULTIPLIER = 10000000
+                
+                # Generate globally unique trajectory IDs using the counter
                 env_indices = jnp.arange(config.num_envs, dtype=jnp.int32)
                 final_info = dict(env_state_final.info)
-                final_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
+                # Format: traj_counter * num_envs + env_index for globally unique IDs
+                final_info["traj_id"] = training_state.traj_counter * config.num_envs + env_indices
                 # Initialize gc_proposed_goals and ep_proposed_goals for consistent PyTree structure
                 final_info["gc_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
                 final_info["ep_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
@@ -1127,6 +1130,7 @@ class GoExploreCRL:
                 
                 training_state = training_state.replace(
                     env_steps=training_state.env_steps + (num_goal_conditioned_steps + num_exploratory_steps) * config.num_envs,
+                    traj_counter=training_state.traj_counter + 1,  # Increment counter after reset
                 )
                 return (training_state, env_state_final, main_buffer_state_final, gcp_buffer_state_final, ep_buffer_state_final, new_key), ()
 
@@ -1351,14 +1355,21 @@ class GoExploreCRL:
             # Reset environments after collecting all experience
             reset_keys = jax.random.split(reset_key, config.num_envs)
             env_state_final = jax.jit(train_env.reset)(reset_keys)
-            TRAJ_ID_MULTIPLIER = 100000
+            
+            # Generate globally unique trajectory IDs using the counter
             env_indices = jnp.arange(config.num_envs, dtype=jnp.int32)
             final_info = dict(env_state_final.info)
-            final_info["traj_id"] = env_indices * TRAJ_ID_MULTIPLIER
+            # Format: traj_counter * num_envs + env_index for globally unique IDs
+            final_info["traj_id"] = training_state_final.traj_counter * config.num_envs + env_indices
             # Initialize gc_proposed_goals and ep_proposed_goals for consistent PyTree structure
             final_info["gc_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
             final_info["ep_proposed_goals"] = jnp.zeros((config.num_envs, len(train_env.goal_indices)))
             env_state_final = env_state_final.replace(info=final_info)
+            
+            # Increment the trajectory counter
+            training_state_final = training_state_final.replace(
+                traj_counter=training_state_final.traj_counter + 1
+            )
             
             # Combine all collected transitions for visualization
             # all_collected from scan has shape (total_chunks, unroll_length, num_envs, ...)

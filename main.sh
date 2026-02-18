@@ -1,56 +1,49 @@
 #!/bin/bash
 
-## ant_big_maze — maxwaypointratio_one_env (temp 0.1) — shared policy
-CUDA_VISIBLE_DEVICES=2 python run.py go-explore-crl \
-  --env ant_big_maze \
-  --num_goal_conditioned_steps 500 \
-  --num_exploratory_steps 600 \
-  --gcp_goal_proposer_name ucgr \
-  --ep_goal_proposer_name env_goals \
-  --total_env_steps 200000000
-
-
-# ant_big_maze — maxwaypointratio_one_env (temp 0.1) — shared policy
-CUDA_VISIBLE_DEVICES=2 python run.py go-explore-crl \
-  --env ant_big_maze \
-  --num_goal_conditioned_steps 500 \
-  --num_exploratory_steps 600 \
-  --gcp_goal_proposer_name ucgr \
-  --ep_goal_proposer_name env_goals \
-  --use_same_policy \
-  --total_env_steps 200000000
-
-
-
-# ant_big_maze — maxwaypointratio_one_env (temp 0.1) — shared policy
-CUDA_VISIBLE_DEVICES=2 python run.py go-explore-crl \
-  --env ant_big_maze_one_corner \
-  --num_goal_conditioned_steps 500 \
-  --num_exploratory_steps 600 \
+CUDA_VISIBLE_DEVICES=1 python run.py go-explore-crl \
+  --env ant_u_maze_hard \
+  --num_goal_conditioned_steps 250 \
+  --num_exploratory_steps 250 \
   --gcp_goal_proposer_name maxwaypointratio_one_env \
-  --goal_sampling_temperature 0.1 \
+  --goal_sampling_temperature 0.01 \
   --ep_goal_proposer_name env_goals \
+  --candidate_goals_type any \
   --use_same_policy \
-  --total_env_steps 250000000
+  --max_replay_size 20000 \
+  --total_env_steps 120000000
 
-# ant_big_maze — maxwaypointratio_one_env (temp 0.1) — shared policy
-CUDA_VISIBLE_DEVICES=2 python run.py go-explore-crl \
-  --env ant_big_maze_two_corner \
-  --num_goal_conditioned_steps 500 \
-  --num_exploratory_steps 600 \
-  --gcp_goal_proposer_name maxwaypointratio_one_env \
-  --goal_sampling_temperature 0.1 \
-  --ep_goal_proposer_name env_goals \
-  --use_same_policy \
-  --total_env_steps 250000000
+#   CUDA_VISIBLE_DEVICES=1 python run.py go-explore-crl \
+#   --env ant_u_maze \
+#   --num_goal_conditioned_steps 900 \
+#   --num_exploratory_steps 600 \
+#   --gcp_goal_proposer_name maxwaypointratio_one_env \
+#   --goal_sampling_temperature 0.01 \
+#   --ep_goal_proposer_name env_goals \
+#   --candidate_goals_type any \
+#   --use_same_policy \
+#   --max_replay_size 20000 \
+#   --total_env_steps 120000000
 
-  # ant_big_maze — maxwaypointratio_one_env (temp 0.1) — shared policy
-CUDA_VISIBLE_DEVICES=2 python run.py go-explore-crl \
-  --env ant_big_maze_three_corner \
-  --num_goal_conditioned_steps 500 \
-  --num_exploratory_steps 600 \
-  --gcp_goal_proposer_name maxwaypointratio_one_env \
-  --goal_sampling_temperature 0.1 \
-  --ep_goal_proposer_name env_goals \
-  --use_same_policy \
-  --total_env_steps 250000000
+# CUDA_VISIBLE_DEVICES=1 python run.py go-explore-crl \
+#   --env ant_u_maze \
+#   --num_goal_conditioned_steps 900 \
+#   --num_exploratory_steps 600 \
+#   --gcp_goal_proposer_name mega \
+#   --goal_sampling_temperature 0.1 \
+#   --ep_goal_proposer_name env_goals \
+#   --candidate_goals_type any \
+#   --use_same_policy \
+#   --max_replay_size 20000 \
+#   --total_env_steps 120000000
+
+# CUDA_VISIBLE_DEVICES=1 python run.py go-explore-crl \
+#   --env ant_u_maze \
+#   --num_goal_conditioned_steps 900 \
+#   --num_exploratory_steps 600 \
+#   --gcp_goal_proposer_name omega \
+#   --ep_goal_proposer_name env_goals \
+#   --goal_sampling_temperature 0.1 \
+#   --candidate_goals_type any \
+#   --use_same_policy \
+#   --max_replay_size 20000 \
+#   --total_env_steps 120000000
