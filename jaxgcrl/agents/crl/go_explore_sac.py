@@ -800,7 +800,7 @@ class GoExploreSAC:
             
             # Unified rollout step
             def rollout_step(carry, _):
-                env_st, key_inner = carry
+                env_st, key_inner, current_max_traj_id_inner = carry
                 key_inner, step_key = jax.random.split(key_inner)
                 
                 # Get current phase, goals, and step counts per environment
@@ -816,6 +816,10 @@ class GoExploreSAC:
                 
                 # Force GCP→EP switch if GCP has reached its step limit
                 use_gcp_inner = use_gcp_inner & ~gc_at_limit
+                
+                # When EP is at limit, it should not take more steps
+                # Keep EP in EP phase but don't increment counter (will be reset after chunks)
+                use_ep_active = ~use_gcp_inner & ~ep_at_limit
                 
                 # Select goals based on phase
                 selected_goals = jnp.where(use_gcp_inner[:, None], gc_goals_inner, ep_goals_inner)
@@ -852,15 +856,45 @@ class GoExploreSAC:
                 gc_goal_reached = (gc_dist < goal_reach_thresh) & use_gcp_inner
                 
                 # Update step counters: increment based on current phase
+                # Only increment EP steps when EP is active (not at limit)
                 gc_steps_taken_new = gc_steps_taken + use_gcp_inner.astype(jnp.int32)
-                ep_steps_taken_new = ep_steps_taken + (~use_gcp_inner).astype(jnp.int32)
+                ep_steps_taken_new = ep_steps_taken + use_ep_active.astype(jnp.int32)
+                
+                # Cap step counters at their limits
+                gc_steps_taken_new = jnp.minimum(gc_steps_taken_new, num_goal_conditioned_steps)
+                ep_steps_taken_new = jnp.minimum(ep_steps_taken_new, num_exploratory_steps)
                 
                 # Update phase: GCP→EP when GCP goal reached OR GCP step limit reached
-                # EP never switches early (runs for full duration), but is capped at num_exploratory_steps
+                # EP stays in EP phase even when at limit (will be reset after chunks)
                 new_phase = jnp.where(gc_goal_reached | gc_at_limit, False, use_gcp_inner)
+                
+                # Detect phase transitions and step limit hits for new trajectory IDs
+                phase_transition = (use_gcp_inner & ~new_phase)  # GCP→EP transition
+                gc_limit_hit = gc_at_limit & use_gcp_inner  # GCP hit step limit
+                ep_limit_hit = ep_at_limit & ~use_gcp_inner  # EP hit step limit
+                needs_new_traj_id = phase_transition | gc_limit_hit | ep_limit_hit
+                
+                # Get current trajectory IDs and max_traj_id
+                current_traj_ids = env_st.info["traj_id"]
+                current_max_traj_id = current_max_traj_id_inner
+                
+                # Assign new trajectory IDs for environments that need them
+                num_needing_new_id = jnp.sum(needs_new_traj_id.astype(jnp.int32))
+                new_traj_id_start = current_max_traj_id + 1
+                new_traj_id_end = current_max_traj_id + num_needing_new_id
+                
+                # Create new trajectory IDs: incrementally assign to environments needing new IDs
+                # Create array of new IDs for environments that need them
+                new_id_indices = jnp.cumsum(needs_new_traj_id.astype(jnp.int32)) - 1
+                new_ids = new_traj_id_start + new_id_indices
+                # Only update IDs for environments that need new ones
+                new_traj_ids = jnp.where(needs_new_traj_id, new_ids, current_traj_ids)
+                # Update max_traj_id: use new_end if any IDs were assigned, else keep current
+                updated_max_traj_id = jnp.where(num_needing_new_id > 0, new_traj_id_end, current_max_traj_id)
                 
                 # Update info - ALL KEYS MUST BE PRESENT for consistent PyTree
                 new_info_inner = dict(nstate.info)
+                new_info_inner["traj_id"] = new_traj_ids
                 new_info_inner["gc_proposed_goals"] = gc_goals_inner
                 new_info_inner["ep_proposed_goals"] = ep_goals_inner
                 new_info_inner["policy_phase"] = new_phase
@@ -882,12 +916,13 @@ class GoExploreSAC:
                 transition = transition._replace(extras={"state_extras": trans_extras})
                 
                 env_st = nstate.replace(info=new_info_inner)
-                return (env_st, key_inner), transition
+                return (env_st, key_inner, updated_max_traj_id), transition
             
-            # Run rollout
-            (env_state_final, _), transitions = jax.lax.scan(
+            # Run rollout with max_traj_id tracking
+            initial_max_traj_id = training_state.max_traj_id
+            (env_state_final, _, final_max_traj_id), transitions = jax.lax.scan(
                 rollout_step,
-                (env_state, rollout_key),
+                (env_state, rollout_key, initial_max_traj_id),
                 None,
                 length=unroll_length
             )
@@ -942,7 +977,7 @@ class GoExploreSAC:
             gcp_buffer_state = gcp_replay_buffer.insert(gcp_buffer_state, transitions)
             ep_buffer_state = ep_replay_buffer.insert(ep_buffer_state, transitions)
             
-            return (env_state_final, main_buffer_state, gcp_buffer_state, ep_buffer_state, transitions)
+            return (env_state_final, main_buffer_state, gcp_buffer_state, ep_buffer_state, transitions, final_max_traj_id)
 
         # ===== Prefill Replay Buffer =====
         def prefill_replay_buffer(training_state, env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, key):
@@ -970,10 +1005,13 @@ class GoExploreSAC:
                 experience_keys = jax.random.split(key, total_chunks)
                 
                 def collect_chunk(carry_inner, chunk_idx):
-                    (env_state_inner, main_buffer_state_inner, gcp_buffer_state_inner, ep_buffer_state_inner) = carry_inner
+                    (env_state_inner, main_buffer_state_inner, gcp_buffer_state_inner, ep_buffer_state_inner, current_max_traj_id) = carry_inner
                     
-                    (env_state_new, main_buffer_state_new, gcp_buffer_state_new, ep_buffer_state_new, _) = get_experience_chunk(
-                        training_state,
+                    # Create a temporary training_state with current max_traj_id for get_experience_chunk
+                    temp_training_state = training_state.replace(max_traj_id=current_max_traj_id)
+                    
+                    (env_state_new, main_buffer_state_new, gcp_buffer_state_new, ep_buffer_state_new, _, updated_max_traj_id) = get_experience_chunk(
+                        temp_training_state,
                         env_state_inner,
                         main_buffer_state_inner,
                         gcp_buffer_state_inner,
@@ -981,12 +1019,12 @@ class GoExploreSAC:
                         experience_keys[chunk_idx]
                     )
                     
-                    carry_new = (env_state_new, main_buffer_state_new, gcp_buffer_state_new, ep_buffer_state_new)
+                    carry_new = (env_state_new, main_buffer_state_new, gcp_buffer_state_new, ep_buffer_state_new, updated_max_traj_id)
                     return carry_new, ()
                 
-                initial_carry = (env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state)
+                initial_carry = (env_state, main_buffer_state, gcp_buffer_state, ep_buffer_state, training_state.max_traj_id)
                 
-                (env_state_final, main_buffer_state_final, gcp_buffer_state_final, ep_buffer_state_final), _ = jax.lax.scan(
+                (env_state_final, main_buffer_state_final, gcp_buffer_state_final, ep_buffer_state_final, final_max_traj_id), _ = jax.lax.scan(
                     collect_chunk,
                     initial_carry,
                     jnp.arange(total_chunks)
@@ -996,9 +1034,8 @@ class GoExploreSAC:
                 reset_keys = jax.random.split(reset_key, config.num_envs)
                 env_state_final = jax.jit(train_env.reset)(reset_keys)
                 
-                # Generate globally unique trajectory IDs
-                current_max_id = training_state.max_traj_id
-                new_traj_ids = current_max_id + jnp.arange(1, config.num_envs + 1, dtype=jnp.int32)
+                # Generate globally unique trajectory IDs using final_max_traj_id from inner scan
+                new_traj_ids = final_max_traj_id + jnp.arange(1, config.num_envs + 1, dtype=jnp.int32)
                 new_max_id = new_traj_ids[-1]  # Update max_traj_id
                 
                 final_info = dict(env_state_final.info)
@@ -1172,7 +1209,7 @@ class GoExploreSAC:
                 
                 # Collect experience chunk
                 (env_state_new, main_buffer_state_new, gcp_buffer_state_new, ep_buffer_state_new,
-                 collected_transitions) = get_experience_chunk(
+                 collected_transitions, updated_max_traj_id) = get_experience_chunk(
                     training_state_inner,
                     env_state_inner,
                     main_buffer_state_inner,
@@ -1181,9 +1218,10 @@ class GoExploreSAC:
                     experience_keys[chunk_idx]
                 )
                 
-                # Update env_steps
+                # Update env_steps and max_traj_id
                 training_state_inner = training_state_inner.replace(
                     env_steps=training_state_inner.env_steps + unroll_length * config.num_envs,
+                    max_traj_id=updated_max_traj_id,
                 )
                 
                 # Sample transitions for training
