@@ -34,6 +34,7 @@ from jaxgcrl.agents.crl.proposers import (
     QEpistemicProposer,
     MEGAProposer,
     OMEGAProposer,
+    NearestEnvGoalProposer,
 )
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -220,7 +221,7 @@ class GoExploreCRL:
 
     # Goal proposer names for go-explore style algorithms
     gcp_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "ucgr", "maxwaypointratio_one_env", "q_epistemic", "mega", "omega"] = "gcp_final_rb"
-    ep_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals"] = "ep_final_rb"
+    ep_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "nearest_env_goal"] = "ep_final_rb"
     goal_sampling_temperature: float = 1.0
     
     # Replay buffer goal sampling parameters
@@ -519,6 +520,9 @@ class GoExploreCRL:
             candidate_goals_type=self.candidate_goals_type
         )
         env_goals_proposer = RandomEnvironmentGoalProposer()
+        nearest_env_goal_proposer = NearestEnvGoalProposer(
+            energy_fn_name=self.energy_fn
+        )
         ucgr_proposer = UCGRProposer(
             energy_fn_name=self.energy_fn,
             num_rb_samples=self.num_rb_goals,
@@ -647,6 +651,14 @@ class GoExploreCRL:
                     None, ep_buffer_state, env, env_state, key,
                     ep_actor, training_state.ep_actor_state.params, training_state.ep_critic_state.params,
                     ep_sa_encoder, ep_g_encoder, training_state
+                )
+                return proposed_goals, gcp_buffer_state, ep_buffer_state
+        elif self.ep_goal_proposer_name == "nearest_env_goal":
+            def ep_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                proposed_goals, _ = nearest_env_goal_proposer.propose_goals(
+                    None, ep_buffer_state, env, env_state, key,
+                    gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
+                    gcp_sa_encoder, gcp_g_encoder, training_state
                 )
                 return proposed_goals, gcp_buffer_state, ep_buffer_state
         else:

@@ -1385,3 +1385,84 @@ class OMEGAProposer:
             'omega/alpha': float(alpha_val),
         }
         wandb.log(metrics, step=int(env_steps))
+
+
+@dataclass
+class NearestEnvGoalProposer:
+    """Proposes goals by selecting the environment goal with minimal critic value.
+    
+    For each environment state, this proposer:
+    1. Gets all possible environment goals from env.possible_goals
+    2. Computes Q-value for each (current_state, env_goal) pair using GCP critic
+    3. Selects the env_goal with the minimal Q-value (closest/easiest to reach)
+    
+    This creates a curriculum where the EP policy practices reaching nearby goals first.
+    
+    Attributes:
+        energy_fn_name: Energy function to use for Q-value computation
+    """
+    energy_fn_name: str = "norm"  # Energy function: typically "norm", "dot", "l2", or "cosine"
+    
+    def propose_goals(self, replay_buffer, buffer_state, env, env_state, key,
+                     actor, actor_params, critic_params, sa_encoder, g_encoder, training_state=None):
+        """Propose nearest environment goals based on GCP critic values.
+        
+        Args:
+            replay_buffer: Replay buffer (unused but required by interface)
+            buffer_state: Current buffer state (returned unchanged)
+            env: Training environment (must have possible_goals attribute)
+            env_state: Current environment state
+            key: JAX random key (unused but required by interface)
+            actor: Actor network (GCP actor for computing Q-values)
+            actor_params: Actor parameters
+            critic_params: Critic parameters (GCP critic)
+            sa_encoder: State-action encoder network
+            g_encoder: Goal encoder network
+            training_state: Training state (unused)
+            
+        Returns:
+            proposed_goals: (batch_size, goal_size) array of proposed goals
+            buffer_state: Updated buffer state (unchanged)
+        """
+        batch_size = env_state.obs.shape[0]
+        state_size = env.state_dim
+        
+        # Get all possible environment goals
+        env_goals = jnp.array(env.possible_goals)  # (num_env_goals, goal_dim)
+        num_env_goals = env_goals.shape[0]
+        
+        # Get current states for all environments
+        current_states = env_state.obs[:, :state_size]  # (batch_size, state_dim)
+        
+        def select_nearest_goal_for_state(state):
+            """For a single state, select the environment goal with minimal Q-value.
+            
+            Args:
+                state: (state_dim,) current state
+                
+            Returns:
+                selected_goal: (goal_dim,) environment goal with minimal Q-value
+            """
+            # Expand state to match number of environment goals
+            states_expanded = jnp.tile(state, (num_env_goals, 1))  # (num_env_goals, state_dim)
+            
+            # Compute Q-values for all (state, env_goal) pairs
+            q_values = compute_energy_for_state_goal_pairs(
+                states_expanded, 
+                env_goals,
+                actor,
+                actor_params,
+                critic_params,
+                sa_encoder,
+                g_encoder,
+                self.energy_fn_name
+            )  # (num_env_goals,)
+            
+            # Select goal with minimum Q-value (easiest/nearest to reach)
+            min_idx = jnp.argmin(q_values)
+            return env_goals[min_idx]
+        
+        # Process all states in batch
+        proposed_goals = jax.vmap(select_nearest_goal_for_state)(current_states)
+        
+        return proposed_goals, buffer_state

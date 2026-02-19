@@ -182,6 +182,13 @@ TRIDENT_MAZE = [
     [1, 1, 1, S, 1, 1],
     [1, 1, 1, G, 1, 1],
 ]
+SNAKE_MAZE = [
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,R,1,G,S,S,1,S,S,S,1,G,S,S,1,S,S,S,1,G,1],
+    [1,S,1,S,1,S,1,S,1,S,1,S,1,S,1,S,1,S,1,S,1],
+    [1,S,S,S,1,S,S,G,1,G,S,S,1,S,S,G,1,G,S,S,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+]
 
 
 MAZE_HEIGHT = 0.5
@@ -237,6 +244,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
         maze_layout = BIG_MAZE_EVAL
     elif maze_layout_name == "hardest_maze":
         maze_layout = HARDEST_MAZE
+    elif maze_layout_name == "snake_maze":
+        maze_layout = SNAKE_MAZE
     else:
         raise ValueError(f"Unknown maze layout: {maze_layout_name}")
     
