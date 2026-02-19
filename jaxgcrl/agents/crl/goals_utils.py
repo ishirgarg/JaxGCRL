@@ -1216,6 +1216,49 @@ def estimate_log_density_knn(goals_batch):
     return log_densities
 
 
+def sample_states_from_replay_buffer(replay_buffer, buffer_state, state_dim, batch_size, key):
+    """Sample states from the replay buffer with trajectory metadata.
+
+    Samples raw trajectories from the replay buffer, then randomly picks
+    ``batch_size`` (trajectory, timestep) pairs.  Returns the corresponding
+    states together with their trajectory/timestep metadata so that future
+    states can be sampled later (e.g., via a truncated geometric distribution).
+
+    Args:
+        replay_buffer: Replay buffer to sample from.
+        buffer_state: Current buffer state.
+        state_dim: Dimensionality of the state (first ``state_dim`` dims of obs).
+        batch_size: Number of (state, metadata) tuples to return.
+        key: JAX random key.
+
+    Returns:
+        states: ``(batch_size, state_dim)`` sampled states.
+        traj_indices: ``(batch_size,)`` trajectory indices into all_observations.
+        time_indices: ``(batch_size,)`` timestep indices within each trajectory.
+        all_observations: ``(N_traj, ep_len, obs_dim)`` full observation block.
+        all_traj_ids: ``(N_traj, ep_len)`` trajectory IDs for same-traj masking.
+        updated_buffer_state: Updated buffer state after sampling.
+    """
+    # Draw a fresh batch of trajectories from the replay buffer
+    buffer_state, sampled_transitions = replay_buffer.sample(buffer_state)
+
+    # sampled_transitions.observation has shape (N_traj, ep_len, obs_dim)
+    all_observations = sampled_transitions.observation          # (N_traj, ep_len, obs_dim)
+    all_traj_ids = sampled_transitions.extras["state_extras"]["traj_id"]  # (N_traj, ep_len)
+
+    N_traj, ep_len = all_observations.shape[:2]
+
+    # Randomly pick batch_size (traj_idx, time_idx) pairs
+    key, traj_key, time_key = jax.random.split(key, 3)
+    traj_indices = jax.random.randint(traj_key, (batch_size,), 0, N_traj)   # (batch_size,)
+    time_indices = jax.random.randint(time_key, (batch_size,), 0, ep_len)   # (batch_size,)
+
+    # Extract states (first state_dim dimensions of observation)
+    states = all_observations[traj_indices, time_indices, :state_dim]  # (batch_size, state_dim)
+
+    return states, traj_indices, time_indices, all_observations, all_traj_ids, buffer_state
+
+
 def compute_kl_divergence_empirical(desired_goals, achieved_goals, bandwidth=0.1):
     """Compute empirical KL divergence D_KL(p_dg || p_ag) using KDE.
     

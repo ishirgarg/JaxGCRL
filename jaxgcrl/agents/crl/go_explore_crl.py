@@ -35,6 +35,7 @@ from jaxgcrl.agents.crl.proposers import (
     MEGAProposer,
     OMEGAProposer,
     NearestEnvGoalProposer,
+    EmpowermentDifferenceGoalProposer,
 )
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -220,14 +221,19 @@ class GoExploreCRL:
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
 
     # Goal proposer names for go-explore style algorithms
-    gcp_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "ucgr", "maxwaypointratio_one_env", "q_epistemic", "mega", "omega"] = "gcp_final_rb"
+    gcp_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "ucgr", "maxwaypointratio_one_env", "q_epistemic", "mega", "omega", "empowerment_diff"] = "gcp_final_rb"
     ep_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "nearest_env_goal"] = "ep_final_rb"
-    goal_sampling_temperature: float = 1.0
+    goal_sampling_temperature: float = 0.0
     
     # Replay buffer goal sampling parameters
     num_rb_goals: int = 256
     candidate_goals_type: Literal["final", "any"] = "final"
     filter_successful_waypoints: bool = False
+
+    # Empowerment difference goal proposer parameters
+    empowerment_num_outer_samples: int = 10   # N – outer MC samples
+    empowerment_num_inner_actions: int = 10   # M – contrastive inner actions
+    gcp_empowerment_penalty: float = 1.0      # beta coefficient
 
     train_ep_on_main_buffer: bool = False
 
@@ -560,6 +566,15 @@ class GoExploreCRL:
             num_rb_goals=self.num_rb_goals,
             candidate_goals_type=self.candidate_goals_type
         )
+        empowerment_diff_proposer = EmpowermentDifferenceGoalProposer(
+            energy_fn_name=self.energy_fn,
+            empowerment_num_outer_samples=self.empowerment_num_outer_samples,
+            empowerment_num_inner_actions=self.empowerment_num_inner_actions,
+            gcp_empowerment_penalty=self.gcp_empowerment_penalty,
+            num_rb_goals=self.num_rb_goals,
+            discounting=self.discounting,
+            goal_sampling_temperature=self.goal_sampling_temperature,
+        )
         
         # Create goal proposer functions
         if self.gcp_goal_proposer_name == "gcp_final_rb":
@@ -621,6 +636,16 @@ class GoExploreCRL:
         elif self.gcp_goal_proposer_name == "omega":
             def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
                 proposed_goals, updated_ep = omega_proposer.propose_goals(
+                    ep_replay_buffer, ep_buffer_state, env, env_state, key,
+                    gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
+                    gcp_sa_encoder, gcp_g_encoder, training_state
+                )
+                return proposed_goals, gcp_buffer_state, updated_ep
+        elif self.gcp_goal_proposer_name == "empowerment_diff":
+            def gcp_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                # Scores replay-buffer states by E_ep - beta*E_gcp against a random env goal.
+                # Uses the EP replay buffer for state sampling (diverse exploration states).
+                proposed_goals, updated_ep = empowerment_diff_proposer.propose_goals(
                     ep_replay_buffer, ep_buffer_state, env, env_state, key,
                     gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
                     gcp_sa_encoder, gcp_g_encoder, training_state

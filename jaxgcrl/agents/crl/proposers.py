@@ -4,6 +4,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import wandb
+from jaxgcrl.agents.crl.losses import energy_fn as _energy_fn
+
 
 from jaxgcrl.agents.crl.goals_utils import (
     get_final_states_from_batch,
@@ -22,6 +24,7 @@ from jaxgcrl.agents.crl.goals_utils import (
     compute_energy_for_state_goal_pairs,
     sample_candidate_goals_from_replay_buffer,
     propose_random_environment_goals,
+    sample_states_from_replay_buffer,
 )
 from jaxgcrl.agents.crl.losses import energy_fn
 
@@ -1385,6 +1388,482 @@ class OMEGAProposer:
             'omega/alpha': float(alpha_val),
         }
         wandb.log(metrics, step=int(env_steps))
+
+
+@dataclass
+class EmpowermentDifferenceGoalProposer:
+    """Empowerment Difference Goal Proposer.
+
+    Scores replay-buffer states by the difference between exploratory-policy
+    empowerment and goal-conditioned-policy empowerment for a *single* randomly
+    sampled environment goal ``g``:
+
+        E_diff(s, g) = E_ep(s, g)  -  beta * E_gcp(s, g)
+
+    where empowerment is estimated via a Monte Carlo InfoNCE estimator:
+
+        E_hat(s, g) = (1/N) * sum_k [
+            f(s, a_k, s+_k)
+            - logsumexp_m( f(s, a_m', s+_k) ) + log(M)
+        ]
+
+    N outer samples produce (a_k, s+_k) pairs; M separate inner actions a_m'
+    (never reused from the outer loop) form the contrastive denominator.
+    Future states s+_k are drawn by truncated geometric horizon sampling from
+    the same trajectory as the current state.
+
+    Attributes:
+        energy_fn_name: Energy function name (e.g. "dot", "norm").
+        empowerment_num_outer_samples: N – outer MC samples per state.
+        empowerment_num_inner_actions: M – contrastive actions per outer sample.
+        gcp_empowerment_penalty: beta – weight on GCP empowerment in E_diff.
+        num_rb_goals: Number of replay-buffer states to score per proposal step.
+        discounting: Discount factor gamma; geometric horizon p = 1 - gamma.
+        goal_sampling_temperature: Softmax temperature for goal selection.
+            0 → greedy (argmax).
+    """
+
+    energy_fn_name: str = "dot"
+    empowerment_num_outer_samples: int = 10
+    empowerment_num_inner_actions: int = 10
+    gcp_empowerment_penalty: float = 1.0
+    num_rb_goals: int = 256
+    discounting: float = 0.99
+    goal_sampling_temperature: float = 1.0
+    LOG_INTERVAL_STEPS: int = 1000000
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sample_future_states(
+        all_observations, all_traj_ids,
+        traj_indices, time_indices,
+        state_dim, num_outer_samples, discounting, key,
+    ):
+        """Sample ``num_outer_samples`` future states for each batch state.
+
+        For the state at position ``(traj_indices[i], time_indices[i])``, sample
+        ``num_outer_samples`` horizons K from a truncated geometric distribution
+        (p = 1 - discounting, truncated to the remaining same-trajectory steps)
+        and return the corresponding future observations.
+
+        Args:
+            all_observations: ``(N_traj, ep_len, obs_dim)`` observation block.
+            all_traj_ids: ``(N_traj, ep_len)`` trajectory IDs.
+            traj_indices: ``(batch_size,)`` trajectory index per sampled state.
+            time_indices: ``(batch_size,)`` timestep index per sampled state.
+            state_dim: First ``state_dim`` features of an observation are state.
+            num_outer_samples: N – number of future states to draw per state.
+            discounting: Discount factor gamma.
+            key: JAX random key.
+
+        Returns:
+            future_states: ``(batch_size, num_outer_samples, state_dim)``.
+                Gradients are stopped; sampling is not differentiable.
+        """
+        ep_len = all_observations.shape[1]
+
+        def _sample_for_one(traj_i, time_t, rng):
+            traj_obs = all_observations[traj_i]       # (ep_len, obs_dim)
+            traj_id_seq = all_traj_ids[traj_i]        # (ep_len,)
+
+            # Mask: same trajectory id AND strictly in the future
+            curr_id = traj_id_seq[time_t]
+            same_traj = traj_id_seq == curr_id                   # (ep_len,)
+            is_future = jnp.arange(ep_len) > time_t             # (ep_len,)
+            valid_mask = same_traj & is_future                   # (ep_len,)
+
+            # Log-geometric weights: P(K=k) ∝ gamma^k, k = j - time_t ≥ 1
+            k_vals = jnp.arange(ep_len, dtype=jnp.float32) - time_t.astype(jnp.float32)
+            log_probs = k_vals * jnp.log(jnp.clip(discounting, 1e-6, 1.0 - 1e-7))
+            log_probs = jnp.where(valid_mask, log_probs, -jnp.inf)
+
+            # Tiny self-probability as fallback for terminal states where no
+            # valid future exists (prevents all-inf softmax).
+            self_mask = jnp.arange(ep_len) == time_t
+            log_self = jnp.where(self_mask, jnp.log(1e-5), -jnp.inf)
+            log_probs = jnp.logaddexp(log_probs, log_self)
+
+            # Draw num_outer_samples indices from the categorical distribution
+            rngs = jax.random.split(rng, num_outer_samples)
+            future_idx = jax.vmap(
+                lambda k: jax.random.categorical(k, log_probs)
+            )(rngs)  # (num_outer_samples,)
+
+            # Stop gradient: future-state sampling is non-differentiable
+            return jax.lax.stop_gradient(
+                traj_obs[future_idx, :state_dim]
+            )  # (num_outer_samples, state_dim)
+
+        batch_size = traj_indices.shape[0]
+        rngs = jax.random.split(key, batch_size)
+        return jax.vmap(_sample_for_one)(traj_indices, time_indices, rngs)
+        # (batch_size, num_outer_samples, state_dim)
+
+    def _compute_empowerment(
+        self, policy, policy_params, critic_params,
+        sa_encoder, g_encoder,
+        states, goal, future_states, goal_indices, key,
+    ):
+        """Estimate empowerment for a batch of states via Monte Carlo InfoNCE.
+
+        The estimator is fully vectorised: no Python loops over the batch.
+
+        Args:
+            policy: Policy network (actor).
+            policy_params: Corresponding policy parameters.
+            critic_params: Critic parameters dict with keys
+                ``'sa_encoder'`` and ``'g_encoder'``.  Single (non-ensemble)
+                critic only; ensemble GCP critics are averaged before use
+                (see :meth:`propose_goals`).
+            sa_encoder: State-action encoder network.
+            g_encoder: Goal encoder network.
+            states: ``(batch_size, state_dim)`` current states.
+            goal: ``(goal_dim,)`` single environment goal (same for all states).
+            future_states: ``(batch_size, N, state_dim)`` pre-sampled future
+                states (N = empowerment_num_outer_samples).
+            goal_indices: Indices to extract goal features from a full state.
+            key: JAX random key.
+
+        Returns:
+            empowerment: ``(batch_size,)`` empowerment estimate per state.
+        """
+        N = self.empowerment_num_outer_samples
+        M = self.empowerment_num_inner_actions
+        batch_size = states.shape[0]
+        action_dim = None  # inferred from policy output
+
+        # Expand the single goal to match the full batch
+        goals_batch = jnp.tile(goal[None, :], (batch_size, 1))  # (B, goal_dim)
+
+        # Policy observation: concatenate state and goal
+        obs = jnp.concatenate([states, goals_batch], axis=1)    # (B, obs_dim)
+
+        # ---- Sample N outer actions ----------------------------------------
+        # Tile obs to (B*N, obs_dim), call policy once
+        obs_outer = jnp.tile(obs[:, None, :], (1, N, 1)).reshape(batch_size * N, -1)
+        means_o, log_stds_o = policy.apply(policy_params, obs_outer)
+        key, k_out = jax.random.split(key)
+        noise_o = jax.random.normal(k_out, means_o.shape)
+        actions_outer = jnp.tanh(means_o + jnp.exp(log_stds_o) * noise_o)
+        actions_outer = actions_outer.reshape(batch_size, N, -1)  # (B, N, A)
+
+        # ---- Sample M inner actions ----------------------------------------
+        # Tile obs to (B*N*M, obs_dim)
+        obs_inner = jnp.tile(obs[:, None, None, :], (1, N, M, 1)).reshape(
+            batch_size * N * M, -1
+        )
+        means_i, log_stds_i = policy.apply(policy_params, obs_inner)
+        key, k_in = jax.random.split(key)
+        noise_i = jax.random.normal(k_in, means_i.shape)
+        actions_inner = jnp.tanh(means_i + jnp.exp(log_stds_i) * noise_i)
+        actions_inner = actions_inner.reshape(batch_size, N, M, -1)  # (B, N, M, A)
+
+        # ---- Compute outer energies: f(s_i, a_k, s+_{i,k}) -----------------
+        # future_states: (B, N, state_dim) -> goal features: (B, N, goal_dim)
+        future_goals = future_states[:, :, goal_indices]          # (B, N, G)
+
+        states_outer_rep = jnp.tile(states[:, None, :], (1, N, 1))  # (B, N, S)
+        sa_outer = jnp.concatenate(
+            [states_outer_rep.reshape(batch_size * N, -1),
+             actions_outer.reshape(batch_size * N, -1)],
+            axis=1,
+        )  # (B*N, S+A)
+        phi_outer = sa_encoder.apply(
+            critic_params['sa_encoder'], sa_outer
+        )  # (B*N, repr_dim)
+        psi_future = g_encoder.apply(
+            critic_params['g_encoder'],
+            future_goals.reshape(batch_size * N, -1),
+        )  # (B*N, repr_dim)
+
+        energies_outer = _energy_fn(
+            self.energy_fn_name, phi_outer, psi_future
+        ).reshape(batch_size, N)  # (B, N)
+
+        # ---- Compute inner energies: f(s_i, a_m', s+_{i,k}) ----------------
+        # Same future state s+_{i,k} but different actions a_m'
+        states_inner_rep = jnp.tile(states[:, None, None, :], (1, N, M, 1))  # (B,N,M,S)
+        sa_inner = jnp.concatenate(
+            [states_inner_rep.reshape(batch_size * N * M, -1),
+             actions_inner.reshape(batch_size * N * M, -1)],
+            axis=1,
+        )  # (B*N*M, S+A)
+        phi_inner = sa_encoder.apply(
+            critic_params['sa_encoder'], sa_inner
+        )  # (B*N*M, repr_dim)
+
+        # Expand future_goals to (B, N, M, G) then flatten
+        future_goals_inner = jnp.tile(future_goals[:, :, None, :], (1, 1, M, 1))
+        psi_inner = g_encoder.apply(
+            critic_params['g_encoder'],
+            future_goals_inner.reshape(batch_size * N * M, -1),
+        )  # (B*N*M, repr_dim)
+
+        energies_inner = _energy_fn(
+            self.energy_fn_name, phi_inner, psi_inner
+        ).reshape(batch_size, N, M)  # (B, N, M)
+
+        # ---- InfoNCE per outer sample --------------------------------------
+        # log((1/M) * sum_m exp(f_inner)) = logsumexp(f_inner) - log(M)
+        logsumexp_inner = jax.scipy.special.logsumexp(
+            energies_inner, axis=2
+        )  # (B, N)
+        per_outer = energies_outer - logsumexp_inner + jnp.log(M)  # (B, N)
+
+        # Average over outer samples
+        return jnp.mean(per_outer, axis=1)  # (B,)
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def propose_goals(
+        self, replay_buffer, buffer_state, env, env_state, key,
+        actor, actor_params, critic_params,
+        sa_encoder, g_encoder, training_state=None,
+    ):
+        """Propose goals scored by the empowerment difference E_ep - beta*E_gcp.
+
+        One random environment goal ``g`` is sampled and held fixed for the
+        entire batch.  Replay-buffer states are sampled and scored:
+
+            E_diff(s_i, g) = E_ep(s_i, g) - beta * E_gcp(s_i, g)
+
+        Each environment independently samples a proposed goal from the
+        softmax distribution over E_diff scores.
+
+        Args:
+            replay_buffer: Replay buffer to sample states from.
+            buffer_state: Current buffer state.
+            env: Training environment (must have ``possible_goals``,
+                ``goal_indices``, ``state_dim``).
+            env_state: Current environment state (used for batch_size).
+            key: JAX random key.
+            actor: Actor network – used for *both* GCP and EP evaluation
+                (same architecture, different params supplied via
+                ``actor_params`` / ``training_state.ep_actor_state.params``).
+            actor_params: GCP actor parameters (= training_state.gcp_actor_state.params).
+            critic_params: GCP critic parameters dict.
+            sa_encoder: State-action encoder network (shared architecture).
+            g_encoder: Goal encoder network (shared architecture).
+            training_state: Must be provided; used to access EP actor/critic
+                parameters via ``training_state.ep_actor_state.params`` and
+                ``training_state.ep_critic_state.params``.
+
+        Returns:
+            proposed_goals: ``(batch_size, goal_dim)`` proposed goals.
+            buffer_state: Updated buffer state.
+        """
+        assert hasattr(env, 'possible_goals'), (
+            "EmpowermentDifferenceGoalProposer requires env.possible_goals."
+        )
+        assert training_state is not None, (
+            "EmpowermentDifferenceGoalProposer requires training_state to access "
+            "both EP and GCP actor/critic parameters."
+        )
+
+        batch_size = env_state.obs.shape[0]
+        state_dim = env.state_dim
+        goal_indices = env.goal_indices
+        N = self.empowerment_num_outer_samples
+
+        # ---- 1. Sample one random environment goal g ----------------------
+        key, g_key = jax.random.split(key)
+        env_goals = env.possible_goals  # (num_env_goals, goal_dim)
+        g_idx = jax.random.randint(g_key, (), 0, env_goals.shape[0])
+        goal = env_goals[g_idx]  # (goal_dim,)
+
+        # ---- 2. Sample batch of states from replay buffer -----------------
+        key, sample_key = jax.random.split(key)
+        (
+            states, traj_indices, time_indices,
+            all_observations, all_traj_ids,
+            buffer_state,
+        ) = sample_states_from_replay_buffer(
+            replay_buffer, buffer_state, state_dim,
+            self.num_rb_goals, sample_key,
+        )
+        # states: (num_rb_goals, state_dim)
+
+        # ---- 3. Sample N future states per replay-buffer state (geometric) -
+        key, fs_key = jax.random.split(key)
+        future_states = EmpowermentDifferenceGoalProposer._sample_future_states(
+            all_observations, all_traj_ids,
+            traj_indices, time_indices,
+            state_dim, N, self.discounting, fs_key,
+        )
+        # future_states: (num_rb_goals, N, state_dim)
+
+        # ---- 4. Resolve EP / GCP actor and critic params -------------------
+        ep_actor_params = training_state.ep_actor_state.params
+        ep_critic_params = training_state.ep_critic_state.params
+
+        # If GCP critic is an ensemble, collapse to a single set of params by
+        # averaging (only for proposer scoring; training uses the full ensemble)
+        if isinstance(critic_params['sa_encoder'], list):
+            gcp_sa_params = jax.tree_util.tree_map(
+                lambda *xs: jnp.mean(jnp.stack(xs, axis=0), axis=0),
+                *critic_params['sa_encoder'],
+            )
+            gcp_g_params = jax.tree_util.tree_map(
+                lambda *xs: jnp.mean(jnp.stack(xs, axis=0), axis=0),
+                *critic_params['g_encoder'],
+            )
+            gcp_critic_single = {'sa_encoder': gcp_sa_params, 'g_encoder': gcp_g_params}
+        else:
+            gcp_critic_single = critic_params
+
+        # ---- 5. Compute E_ep and E_gcp ------------------------------------
+        key, ep_key, gcp_key = jax.random.split(key, 3)
+
+        e_ep = self._compute_empowerment(
+            actor, ep_actor_params, ep_critic_params,
+            sa_encoder, g_encoder,
+            states, goal, future_states, goal_indices, ep_key,
+        )  # (num_rb_goals,)
+
+        e_gcp = self._compute_empowerment(
+            actor, actor_params, gcp_critic_single,
+            sa_encoder, g_encoder,
+            states, goal, future_states, goal_indices, gcp_key,
+        )  # (num_rb_goals,)
+
+        # ---- 6. E_diff = E_ep - beta * E_gcp ------------------------------
+        e_diff = e_ep - self.gcp_empowerment_penalty * e_gcp  # (num_rb_goals,)
+
+        # ---- 7. Select one goal per environment via softmax / argmax -------
+        key, sel_key = jax.random.split(key)
+        candidate_goals = states[:, goal_indices]  # (num_rb_goals, goal_dim)
+
+        if self.goal_sampling_temperature > 0:
+            logits = e_diff / self.goal_sampling_temperature
+            probs = jax.nn.softmax(logits)  # (num_rb_goals,)
+            # Each environment draws independently
+            sel_keys = jax.random.split(sel_key, batch_size)
+            selected_indices = jax.vmap(
+                lambda k: jax.random.choice(k, a=self.num_rb_goals, p=probs)
+            )(sel_keys)  # (batch_size,)
+        else:
+            # Greedy: every environment gets the same top-ranked state
+            best_idx = jnp.argmax(e_diff)
+            selected_indices = jnp.full((batch_size,), best_idx, dtype=jnp.int32)
+
+        proposed_goals = candidate_goals[selected_indices]  # (batch_size, goal_dim)
+
+        # ---- 8. Visualise at logging interval ------------------------------
+        env_steps = training_state.env_steps if training_state is not None else jnp.array(0)
+        
+        # For visualization, use the first selected index (or best if greedy)
+        viz_selected_idx = selected_indices[0] if batch_size > 0 else jnp.argmax(e_diff)
+
+        jax.experimental.io_callback(
+            EmpowermentDifferenceGoalProposer._visualize,
+            None,
+            e_ep, e_gcp, e_diff,
+            states, goal, goal_indices, viz_selected_idx,
+            env_steps,
+            self.LOG_INTERVAL_STEPS,
+        )
+
+        return proposed_goals, buffer_state
+
+    @staticmethod
+    def _visualize(
+        e_ep, e_gcp, e_diff,
+        states, goal, goal_indices, selected_idx,
+        env_steps, log_interval_steps,
+    ):
+        """Log scatter plots of candidate goals colored by empowerment values.
+
+        Generates three subplots showing candidate goals as scatter points:
+            - Colored by E_ep (exploratory empowerment)
+            - Colored by E_gcp (goal-conditioned empowerment)
+            - Colored by E_diff (empowerment difference)
+        
+        The selected goal is highlighted with a green circle in each plot.
+
+        Args:
+            e_ep: ``(num_rb_goals,)`` exploratory empowerment scores.
+            e_gcp: ``(num_rb_goals,)`` GCP empowerment scores.
+            e_diff: ``(num_rb_goals,)`` empowerment difference scores.
+            states: ``(num_rb_goals, state_dim)`` replay-buffer states.
+            goal: ``(goal_dim,)`` the fixed environment goal used for scoring.
+            goal_indices: Indices to extract goal coordinates from a state.
+            selected_idx: Index of the selected goal to highlight.
+            env_steps: Current environment step count (for wandb x-axis).
+            log_interval_steps: Minimum steps between consecutive log calls.
+        """
+        if not should_log_at_interval(env_steps, log_interval_steps, 'empowerment_diff'):
+            return
+
+        import io
+        import matplotlib.pyplot as plt
+        from PIL import Image
+
+        e_ep_np = np.array(e_ep)
+        e_gcp_np = np.array(e_gcp)
+        e_diff_np = np.array(e_diff)
+        states_np = np.array(states)
+        selected_idx = int(selected_idx)
+
+        # Extract goal coordinates from states
+        candidate_goals = states_np[:, goal_indices]  # (num_rb_goals, goal_dim)
+        selected_goal = candidate_goals[selected_idx]  # (goal_dim,)
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        for ax, scores, label, cmap in zip(
+            axes,
+            [e_ep_np, e_gcp_np, e_diff_np],
+            ['E_ep (exploratory)', 'E_gcp (goal-conditioned)', 'E_diff = E_ep - β·E_gcp'],
+            ['viridis', 'plasma', 'coolwarm'],
+        ):
+            # Scatter plot of candidate goals colored by empowerment values
+            scatter = ax.scatter(
+                candidate_goals[:, 0], candidate_goals[:, 1],
+                c=scores, cmap=cmap, s=150, alpha=0.8,
+                edgecolors='black', linewidths=0.5,
+            )
+            plt.colorbar(scatter, ax=ax, label='Empowerment value')
+            
+            # Highlight selected goal with green circle
+            ax.scatter(
+                selected_goal[0], selected_goal[1],
+                s=400, marker='o', facecolors='none',
+                edgecolors='green', linewidths=3, zorder=10,
+                label='Selected Goal'
+            )
+            
+            ax.set_xlabel('Goal X', fontsize=11)
+            ax.set_ylabel('Goal Y', fontsize=11)
+            ax.set_title(label, fontsize=12, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=9, loc='upper right')
+            ax.set_aspect('equal', adjustable='box')
+
+        goal_np = np.array(goal)
+        fig.suptitle(
+            f'Empowerment Difference Goal Proposer  |  step {int(env_steps)}'
+            f'  |  env goal = ({goal_np[0]:.2f}, {goal_np[1]:.2f})',
+            fontsize=13, fontweight='bold',
+        )
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+        pil_image = Image.open(buf)
+        pil_image.load()
+        buf.close()
+        plt.close(fig)
+
+        wandb.log(
+            {'empowerment_diff/scatter_plots': wandb.Image(pil_image)},
+            step=int(env_steps),
+        )
 
 
 @dataclass
