@@ -1868,14 +1868,14 @@ class EmpowermentDifferenceGoalProposer:
 
 @dataclass
 class NearestEnvGoalProposer:
-    """Proposes goals by selecting the environment goal with minimal critic value.
+    """Proposes goals by selecting the environment goal with maximum critic value.
     
     For each environment state, this proposer:
     1. Gets all possible environment goals from env.possible_goals
     2. Computes Q-value for each (current_state, env_goal) pair using GCP critic
-    3. Selects the env_goal with the minimal Q-value (closest/easiest to reach)
+    3. Selects the env_goal with the maximum Q-value (highest critic value)
     
-    This creates a curriculum where the EP policy practices reaching nearby goals first.
+    This encourages the EP policy to practice reaching goals with high critic values.
     
     Attributes:
         energy_fn_name: Energy function to use for Q-value computation
@@ -1884,7 +1884,7 @@ class NearestEnvGoalProposer:
     
     def propose_goals(self, replay_buffer, buffer_state, env, env_state, key,
                      actor, actor_params, critic_params, sa_encoder, g_encoder, training_state=None):
-        """Propose nearest environment goals based on GCP critic values.
+        """Propose environment goals based on maximum GCP critic values.
         
         Args:
             replay_buffer: Replay buffer (unused but required by interface)
@@ -1913,14 +1913,14 @@ class NearestEnvGoalProposer:
         # Get current states for all environments
         current_states = env_state.obs[:, :state_size]  # (batch_size, state_dim)
         
-        def select_nearest_goal_for_state(state):
-            """For a single state, select the environment goal with minimal Q-value.
+        def select_goal_for_state(state):
+            """For a single state, select the environment goal with maximum Q-value.
             
             Args:
                 state: (state_dim,) current state
                 
             Returns:
-                selected_goal: (goal_dim,) environment goal with minimal Q-value
+                selected_goal: (goal_dim,) environment goal with maximum Q-value
             """
             # Expand state to match number of environment goals
             states_expanded = jnp.tile(state, (num_env_goals, 1))  # (num_env_goals, state_dim)
@@ -1937,11 +1937,11 @@ class NearestEnvGoalProposer:
                 self.energy_fn_name
             )  # (num_env_goals,)
             
-            # Select goal with minimum Q-value (easiest/nearest to reach)
-            min_idx = jnp.argmin(q_values)
-            return env_goals[min_idx]
+            # Select goal with maximum Q-value (highest critic value)
+            max_idx = jnp.argmax(q_values)
+            return env_goals[max_idx]
         
         # Process all states in batch
-        proposed_goals = jax.vmap(select_nearest_goal_for_state)(current_states)
+        proposed_goals = jax.vmap(select_goal_for_state)(current_states)
         
         return proposed_goals, buffer_state
