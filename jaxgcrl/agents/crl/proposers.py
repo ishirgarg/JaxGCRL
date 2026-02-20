@@ -1945,3 +1945,96 @@ class NearestEnvGoalProposer:
         proposed_goals = jax.vmap(select_goal_for_state)(current_states)
         
         return proposed_goals, buffer_state
+
+
+@dataclass
+class NearestEnvGoalToGCPGoalProposer:
+    """Proposes goals by selecting the nearest environment goal to the GCP-proposed goal.
+    
+    For each environment, this proposer:
+    1. Gets the GCP-proposed goal from env_state.info["gc_proposed_goals"]
+    2. Gets all possible environment goals from env.possible_goals
+    3. Computes Q-value for each (gcp_goal, env_goal) pair using GCP critic
+    4. Selects the env_goal with the maximum Q-value (nearest via critic)
+    
+    This encourages the EP policy to practice reaching environment goals that are
+    "nearest" (via maximum critic value) to the goals proposed for the GCP policy.
+    
+    Attributes:
+        energy_fn_name: Energy function to use for Q-value computation
+    """
+    energy_fn_name: str = "norm"  # Energy function: typically "norm", "dot", "l2", or "cosine"
+    
+    def propose_goals(self, replay_buffer, buffer_state, env, env_state, key,
+                     actor, actor_params, critic_params, sa_encoder, g_encoder, training_state=None):
+        """Propose environment goals nearest to GCP-proposed goals via maximum critic.
+        
+        Args:
+            replay_buffer: Replay buffer (unused but required by interface)
+            buffer_state: Current buffer state (returned unchanged)
+            env: Training environment (must have possible_goals attribute)
+            env_state: Current environment state (must have gc_proposed_goals in info)
+            key: JAX random key (unused but required by interface)
+            actor: Actor network (GCP actor for computing Q-values)
+            actor_params: Actor parameters
+            critic_params: Critic parameters (GCP critic)
+            sa_encoder: State-action encoder network
+            g_encoder: Goal encoder network
+            training_state: Training state (unused)
+            
+        Returns:
+            proposed_goals: (batch_size, goal_size) array of proposed goals
+            buffer_state: Updated buffer state (unchanged)
+        """
+        batch_size = env_state.obs.shape[0]
+        state_size = env.state_dim
+        goal_indices = env.goal_indices
+        
+        # Get GCP-proposed goals from environment state info
+        gc_proposed_goals = env_state.info.get("gc_proposed_goals", None)
+        if gc_proposed_goals is None:
+            raise ValueError(
+                "NearestEnvGoalToGCPGoalProposer requires gc_proposed_goals in env_state.info. "
+                "Make sure GCP goals are proposed before EP goals."
+            )
+        gc_proposed_goals = jnp.array(gc_proposed_goals)  # (batch_size, goal_dim)
+        
+        # Get all possible environment goals
+        env_goals = jnp.array(env.possible_goals)  # (num_env_goals, goal_dim)
+        num_env_goals = env_goals.shape[0]
+        
+        def select_nearest_env_goal_to_gcp_goal(gcp_goal):
+            """For a single GCP-proposed goal, select the nearest env goal via max critic.
+            
+            Args:
+                gcp_goal: (goal_dim,) GCP-proposed goal
+                
+            Returns:
+                selected_goal: (goal_dim,) environment goal with maximum Q-value
+            """
+            # Expand GCP goal to a full state vector (goal at goal_indices, zeros elsewhere)
+            gcp_state = expand_goal_to_state(gcp_goal, state_size, goal_indices)  # (state_dim,)
+            
+            # Expand state to match number of environment goals
+            states_expanded = jnp.tile(gcp_state, (num_env_goals, 1))  # (num_env_goals, state_dim)
+            
+            # Compute Q-values for all (gcp_state, env_goal) pairs
+            q_values = compute_energy_for_state_goal_pairs(
+                states_expanded, 
+                env_goals,
+                actor,
+                actor_params,
+                critic_params,
+                sa_encoder,
+                g_encoder,
+                self.energy_fn_name
+            )  # (num_env_goals,)
+            
+            # Select environment goal with maximum Q-value (nearest via critic)
+            max_idx = jnp.argmax(q_values)
+            return env_goals[max_idx]
+        
+        # Process all GCP-proposed goals in batch
+        proposed_goals = jax.vmap(select_nearest_env_goal_to_gcp_goal)(gc_proposed_goals)
+        
+        return proposed_goals, buffer_state

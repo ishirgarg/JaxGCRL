@@ -35,6 +35,7 @@ from jaxgcrl.agents.crl.proposers import (
     MEGAProposer,
     OMEGAProposer,
     NearestEnvGoalProposer,
+    NearestEnvGoalToGCPGoalProposer,
     EmpowermentDifferenceGoalProposer,
 )
 Metrics = types.Metrics
@@ -222,7 +223,7 @@ class GoExploreCRL:
 
     # Goal proposer names for go-explore style algorithms
     gcp_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "ucgr", "maxwaypointratio_one_env", "q_epistemic", "mega", "omega", "empowerment_diff"] = "gcp_final_rb"
-    ep_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "nearest_env_goal"] = "ep_final_rb"
+    ep_goal_proposer_name: Literal["gcp_final_rb", "ep_final_rb", "env_goals", "nearest_env_goal", "nearest_env_goal_to_gcp_goal"] = "ep_final_rb"
     goal_sampling_temperature: float = 0.0
     
     # Replay buffer goal sampling parameters
@@ -529,6 +530,9 @@ class GoExploreCRL:
         nearest_env_goal_proposer = NearestEnvGoalProposer(
             energy_fn_name=self.energy_fn
         )
+        nearest_env_goal_to_gcp_goal_proposer = NearestEnvGoalToGCPGoalProposer(
+            energy_fn_name=self.energy_fn
+        )
         ucgr_proposer = UCGRProposer(
             energy_fn_name=self.energy_fn,
             num_rb_samples=self.num_rb_goals,
@@ -681,6 +685,14 @@ class GoExploreCRL:
         elif self.ep_goal_proposer_name == "nearest_env_goal":
             def ep_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
                 proposed_goals, _ = nearest_env_goal_proposer.propose_goals(
+                    None, ep_buffer_state, env, env_state, key,
+                    gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
+                    gcp_sa_encoder, gcp_g_encoder, training_state
+                )
+                return proposed_goals, gcp_buffer_state, ep_buffer_state
+        elif self.ep_goal_proposer_name == "nearest_env_goal_to_gcp_goal":
+            def ep_propose_goals(gcp_buffer_state, ep_buffer_state, env, env_state, key, training_state):
+                proposed_goals, _ = nearest_env_goal_to_gcp_goal_proposer.propose_goals(
                     None, ep_buffer_state, env, env_state, key,
                     gcp_actor, training_state.gcp_actor_state.params, training_state.gcp_critic_state.params,
                     gcp_sa_encoder, gcp_g_encoder, training_state
