@@ -240,6 +240,9 @@ class GoExploreCRL:
 
     use_same_policy: bool = True
     
+    # Use stochastic (noisy) actor for GCP instead of deterministic
+    use_gcp_noise: bool = False
+    
     # Critic ensemble for Q-epistemic goal proposal
     use_gcp_critic_ensemble: bool = False
     gcp_num_critic_ensemble: int = 5
@@ -838,7 +841,8 @@ class GoExploreCRL:
             # Unified rollout step
             def rollout_step(carry, _):
                 env_st, key_inner = carry
-                key_inner, step_key = jax.random.split(key_inner)
+                # Split keys for GCP and EP to ensure independence when both are stochastic
+                key_inner, gcp_step_key, ep_step_key = jax.random.split(key_inner, 3)
                 
                 # Get current phase, goals, and step counts per environment
                 use_gcp_inner = env_st.info["policy_phase"]
@@ -863,19 +867,24 @@ class GoExploreCRL:
                 )
                 
                 # Step with appropriate policy per environment
-                # Vectorized step for GCP environments (deterministic)
-                nstate_gcp, trans_gcp = deterministic_actor_step_with_proposals(
-                    gcp_actor_state, train_env, env_st, gc_goals_inner, ("truncation", "traj_id")
-                )
+                # Vectorized step for GCP environments (deterministic or stochastic based on flag)
+                if self.use_gcp_noise:
+                    nstate_gcp, trans_gcp = actor_step(
+                        gcp_actor_state, train_env, env_st, gc_goals_inner, gcp_step_key, ("truncation", "traj_id")
+                    )
+                else:
+                    nstate_gcp, trans_gcp = deterministic_actor_step_with_proposals(
+                        gcp_actor_state, train_env, env_st, gc_goals_inner, ("truncation", "traj_id")
+                    )
                 
                 # Vectorized step for EP environments (stochastic)
                 if self.use_same_policy:
                     nstate_ep, trans_ep = actor_step(
-                        gcp_actor_state, train_env, env_st, ep_goals_inner, step_key, ("truncation", "traj_id")
+                        gcp_actor_state, train_env, env_st, ep_goals_inner, ep_step_key, ("truncation", "traj_id")
                     )
                 else:
                     nstate_ep, trans_ep = actor_step(
-                        ep_actor_state, train_env, env_st, ep_goals_inner, step_key, ("truncation", "traj_id")
+                        ep_actor_state, train_env, env_st, ep_goals_inner, ep_step_key, ("truncation", "traj_id")
                     )
                 
                 # Combine results based on phase
