@@ -1237,6 +1237,9 @@ def sample_states_from_replay_buffer(replay_buffer, buffer_state, state_dim, bat
         time_indices: ``(batch_size,)`` timestep indices within each trajectory.
         all_observations: ``(N_traj, ep_len, obs_dim)`` full observation block.
         all_traj_ids: ``(N_traj, ep_len)`` trajectory IDs for same-traj masking.
+        all_actions: ``(N_traj, ep_len, action_dim)`` actions from trajectories.
+        all_gc_proposed_goals: ``(N_traj, ep_len, goal_dim)`` GCP goals from trajectories.
+        all_ep_proposed_goals: ``(N_traj, ep_len, goal_dim)`` EP goals from trajectories.
         updated_buffer_state: Updated buffer state after sampling.
     """
     # Draw a fresh batch of trajectories from the replay buffer
@@ -1245,7 +1248,16 @@ def sample_states_from_replay_buffer(replay_buffer, buffer_state, state_dim, bat
     # sampled_transitions.observation has shape (N_traj, ep_len, obs_dim)
     all_observations = sampled_transitions.observation          # (N_traj, ep_len, obs_dim)
     all_traj_ids = sampled_transitions.extras["state_extras"]["traj_id"]  # (N_traj, ep_len)
-
+    all_actions = sampled_transitions.action  # (N_traj, ep_len, action_dim)
+    
+    # Extract goals from state_extras if available, otherwise use zeros
+    state_extras = sampled_transitions.extras.get("state_extras", {})
+    goal_dim = all_observations.shape[-1] - state_dim
+    
+    # Get gc_proposed_goals and ep_proposed_goals if available
+    all_gc_proposed_goals = state_extras["gc_proposed_goals"]  # (N_traj, ep_len, goal_dim)
+    all_ep_proposed_goals = state_extras["ep_proposed_goals"]  # (N_traj, ep_len, goal_dim)
+   
     N_traj, ep_len = all_observations.shape[:2]
 
     # Randomly pick batch_size (traj_idx, time_idx) pairs
@@ -1256,7 +1268,7 @@ def sample_states_from_replay_buffer(replay_buffer, buffer_state, state_dim, bat
     # Extract states (first state_dim dimensions of observation)
     states = all_observations[traj_indices, time_indices, :state_dim]  # (batch_size, state_dim)
 
-    return states, traj_indices, time_indices, all_observations, all_traj_ids, buffer_state
+    return states, traj_indices, time_indices, all_observations, all_traj_ids, all_actions, all_gc_proposed_goals, all_ep_proposed_goals, buffer_state
 
 
 def compute_kl_divergence_empirical(desired_goals, achieved_goals, bandwidth=0.1):

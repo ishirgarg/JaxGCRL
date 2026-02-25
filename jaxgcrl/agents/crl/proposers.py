@@ -1506,6 +1506,7 @@ class EmpowermentDifferenceGoalProposer:
         self, policy, policy_params, critic_params,
         sa_encoder, g_encoder,
         states, goal, future_states, goal_indices, key,
+        actual_actions, trajectory_goals,
     ):
         """Estimate empowerment for a batch of states via Monte Carlo InfoNCE.
 
@@ -1526,6 +1527,10 @@ class EmpowermentDifferenceGoalProposer:
                 states (N = empowerment_num_outer_samples).
             goal_indices: Indices to extract goal features from a full state.
             key: JAX random key.
+            actual_actions: ``(batch_size, N, action_dim)`` actual actions from
+                trajectory. These are used for the outer actions.
+            trajectory_goals: ``(batch_size, goal_dim)`` goals that were used
+                for the trajectory. Inner actions are conditioned on these goals.
 
         Returns:
             empowerment: ``(batch_size,)`` empowerment estimate per state.
@@ -1535,26 +1540,19 @@ class EmpowermentDifferenceGoalProposer:
         batch_size = states.shape[0]
         action_dim = None  # inferred from policy output
 
-        # Expand the single goal to match the full batch
-        goals_batch = jnp.tile(goal[None, :], (batch_size, 1))  # (B, goal_dim)
+        # ---- Use actual actions from trajectory for outer actions -----------
+        # Use the actual actions that were sampled at state s in the trajectory
+        actions_outer = actual_actions  # (B, N, A)
 
-        # Policy observation: concatenate state and goal
-        obs = jnp.concatenate([states, goals_batch], axis=1)    # (B, obs_dim)
-
-        # ---- Sample N outer actions ----------------------------------------
-        # Tile obs to (B*N, obs_dim), call policy once
-        obs_outer = jnp.tile(obs[:, None, :], (1, N, 1)).reshape(batch_size * N, -1)
-        means_o, log_stds_o = policy.apply(policy_params, obs_outer)
-        key, k_out = jax.random.split(key)
-        noise_o = jax.random.normal(k_out, means_o.shape)
-        actions_outer = jnp.tanh(means_o + jnp.exp(log_stds_o) * noise_o)
-        actions_outer = actions_outer.reshape(batch_size, N, -1)  # (B, N, A)
-
-        # ---- Sample M inner actions ----------------------------------------
-        # Tile obs to (B*N*M, obs_dim)
-        obs_inner = jnp.tile(obs[:, None, None, :], (1, N, M, 1)).reshape(
-            batch_size * N * M, -1
-        )
+        # ---- Sample M inner actions, conditioned on trajectory goals --------
+        # Condition inner actions on the goal that was used for that trajectory
+        goals_for_inner = jnp.tile(trajectory_goals[:, None, None, :], (1, N, M, 1))  # (B, N, M, goal_dim)
+        states_inner = jnp.tile(states[:, None, None, :], (1, N, M, 1))  # (B, N, M, state_dim)
+        obs_inner = jnp.concatenate([
+            states_inner.reshape(batch_size * N * M, -1),  # (B*N*M, state_dim)
+            goals_for_inner.reshape(batch_size * N * M, -1)  # (B*N*M, goal_dim)
+        ], axis=-1)  # (B*N*M, obs_dim)
+        
         means_i, log_stds_i = policy.apply(policy_params, obs_inner)
         key, k_in = jax.random.split(key)
         noise_i = jax.random.normal(k_in, means_i.shape)
@@ -1623,7 +1621,9 @@ class EmpowermentDifferenceGoalProposer:
     def propose_goals(
         self, replay_buffer, buffer_state, env, env_state, key,
         actor, actor_params, critic_params,
-        sa_encoder, g_encoder, training_state=None,
+        sa_encoder, g_encoder, training_state,
+        gcp_replay_buffer, gcp_buffer_state,
+        ep_replay_buffer, ep_buffer_state,
     ):
         """Propose goals scored by the empowerment difference E_ep - beta*E_gcp.
 
@@ -1636,8 +1636,8 @@ class EmpowermentDifferenceGoalProposer:
         softmax distribution over E_diff scores.
 
         Args:
-            replay_buffer: Replay buffer to sample states from.
-            buffer_state: Current buffer state.
+            replay_buffer: Replay buffer (unused, kept for interface compatibility).
+            buffer_state: Buffer state (unused, kept for interface compatibility).
             env: Training environment (must have ``possible_goals``,
                 ``goal_indices``, ``state_dim``).
             env_state: Current environment state (used for batch_size).
@@ -1649,13 +1649,17 @@ class EmpowermentDifferenceGoalProposer:
             critic_params: GCP critic parameters dict.
             sa_encoder: State-action encoder network (shared architecture).
             g_encoder: Goal encoder network (shared architecture).
-            training_state: Must be provided; used to access EP actor/critic
+            training_state: Training state; used to access EP actor/critic
                 parameters via ``training_state.ep_actor_state.params`` and
                 ``training_state.ep_critic_state.params``.
+            gcp_replay_buffer: GCP replay buffer for GCP empowerment calculation.
+            gcp_buffer_state: GCP buffer state.
+            ep_replay_buffer: EP replay buffer for EP empowerment calculation.
+            ep_buffer_state: EP buffer state.
 
         Returns:
             proposed_goals: ``(batch_size, goal_dim)`` proposed goals.
-            buffer_state: Updated buffer state.
+            buffer_state: Updated EP buffer state.
         """
         assert hasattr(env, 'possible_goals'), (
             "EmpowermentDifferenceGoalProposer requires env.possible_goals."
@@ -1676,28 +1680,67 @@ class EmpowermentDifferenceGoalProposer:
         g_idx = jax.random.randint(g_key, (), 0, env_goals.shape[0])
         goal = env_goals[g_idx]  # (goal_dim,)
 
-        # ---- 2. Sample batch of states from replay buffer -----------------
-        key, sample_key = jax.random.split(key)
+        # ---- 2. Sample batch of states from EP replay buffer (for diversity) ---
+        # We'll compute both empowerments on the same states
+        key, ep_sample_key = jax.random.split(key)
         (
-            states, traj_indices, time_indices,
-            all_observations, all_traj_ids,
-            buffer_state,
+            states, ep_traj_indices, ep_time_indices,
+            ep_all_observations, ep_all_traj_ids,
+            ep_all_actions, ep_all_gc_goals, ep_all_ep_goals,
+            ep_bs,
         ) = sample_states_from_replay_buffer(
-            replay_buffer, buffer_state, state_dim,
-            self.num_rb_goals, sample_key,
+            ep_replay_buffer, ep_buffer_state, state_dim,
+            self.num_rb_goals, ep_sample_key,
         )
         # states: (num_rb_goals, state_dim)
+        
+        # ---- 2b. Also sample from GCP replay buffer to get GCP actions/goals ---
+        # We'll use the same number of samples, but from GCP buffer
+        key, gcp_sample_key = jax.random.split(key)
+        (
+            _, gcp_traj_indices, gcp_time_indices,
+            gcp_all_observations, gcp_all_traj_ids,
+            gcp_all_actions, gcp_all_gc_goals, gcp_all_ep_goals,
+            gcp_bs,
+        ) = sample_states_from_replay_buffer(
+            gcp_replay_buffer, gcp_buffer_state, state_dim,
+            self.num_rb_goals, gcp_sample_key,
+        )
+        # Note: We don't use gcp_states, we use the same states from EP buffer
 
         # ---- 3. Sample N future states per replay-buffer state (geometric) -
+        # Sample futures from EP trajectories (since we use EP states)
         key, fs_key = jax.random.split(key)
         future_states = EmpowermentDifferenceGoalProposer._sample_future_states(
-            all_observations, all_traj_ids,
-            traj_indices, time_indices,
+            ep_all_observations, ep_all_traj_ids,
+            ep_traj_indices, ep_time_indices,
             state_dim, N, self.discounting, fs_key,
         )
         # future_states: (num_rb_goals, N, state_dim)
 
-        # ---- 4. Resolve EP / GCP actor and critic params -------------------
+        # ---- 4. Extract actual actions and goals from trajectories -------
+        # For EP empowerment: get actions and goals from EP trajectories
+        ep_actions_at_states = ep_all_actions[ep_traj_indices, ep_time_indices]  # (num_rb_goals, action_dim)
+        ep_actions_outer = jnp.tile(ep_actions_at_states[:, None, :], (1, N, 1))  # (num_rb_goals, N, action_dim)
+        ep_traj_goals = ep_all_ep_goals[ep_traj_indices, ep_time_indices]  # (num_rb_goals, goal_dim)
+        
+        # For GCP empowerment: get actions and goals from GCP trajectories
+        gcp_actions_at_states = gcp_all_actions[gcp_traj_indices, gcp_time_indices]  # (num_rb_goals, action_dim)
+        gcp_actions_outer = jnp.tile(gcp_actions_at_states[:, None, :], (1, N, 1))  # (num_rb_goals, N, action_dim)
+        gcp_traj_goals = gcp_all_gc_goals[gcp_traj_indices, gcp_time_indices]  # (num_rb_goals, goal_dim)
+        
+        # Sample futures from GCP trajectories for GCP empowerment
+        # (We use the same future states for both, sampled from EP trajectories)
+        # Actually, we should sample from GCP trajectories for GCP empowerment
+        key, gcp_fs_key = jax.random.split(key)
+        gcp_future_states = EmpowermentDifferenceGoalProposer._sample_future_states(
+            gcp_all_observations, gcp_all_traj_ids,
+            gcp_traj_indices, gcp_time_indices,
+            state_dim, N, self.discounting, gcp_fs_key,
+        )
+        # gcp_future_states: (num_rb_goals, N, state_dim)
+
+        # ---- 5. Resolve EP / GCP actor and critic params -------------------
         ep_actor_params = training_state.ep_actor_state.params
         ep_critic_params = training_state.ep_critic_state.params
 
@@ -1716,25 +1759,33 @@ class EmpowermentDifferenceGoalProposer:
         else:
             gcp_critic_single = critic_params
 
-        # ---- 5. Compute E_ep and E_gcp ------------------------------------
+        # ---- 6. Compute E_ep and E_gcp ------------------------------------
         key, ep_key, gcp_key = jax.random.split(key, 3)
 
+        # Compute EP empowerment using same states, but EP actions and goals
         e_ep = self._compute_empowerment(
             actor, ep_actor_params, ep_critic_params,
             sa_encoder, g_encoder,
             states, goal, future_states, goal_indices, ep_key,
+            actual_actions=ep_actions_outer,
+            trajectory_goals=ep_traj_goals,
         )  # (num_rb_goals,)
 
+        # Compute GCP empowerment using same states, but GCP actions and goals
         e_gcp = self._compute_empowerment(
             actor, actor_params, gcp_critic_single,
             sa_encoder, g_encoder,
-            states, goal, future_states, goal_indices, gcp_key,
+            states, goal, gcp_future_states, goal_indices, gcp_key,
+            actual_actions=gcp_actions_outer,
+            trajectory_goals=gcp_traj_goals,
         )  # (num_rb_goals,)
 
-        # ---- 6. E_diff = E_ep - beta * E_gcp ------------------------------
+        # ---- 7. E_diff = E_ep - beta * E_gcp ------------------------------
+        # Note: e_ep and e_gcp are computed on different sets of states
+        # We need to align them - use EP states for goal selection
         e_diff = e_ep - self.gcp_empowerment_penalty * e_gcp  # (num_rb_goals,)
 
-        # ---- 7. Select one goal per environment via softmax / argmax -------
+        # ---- 8. Select one goal per environment via softmax / argmax -------
         key, sel_key = jax.random.split(key)
         candidate_goals = states[:, goal_indices]  # (num_rb_goals, goal_dim)
 
@@ -1753,7 +1804,7 @@ class EmpowermentDifferenceGoalProposer:
 
         proposed_goals = candidate_goals[selected_indices]  # (batch_size, goal_dim)
 
-        # ---- 8. Visualise at logging interval ------------------------------
+        # ---- 9. Visualise at logging interval ------------------------------
         env_steps = training_state.env_steps if training_state is not None else jnp.array(0)
         
         # For visualization, use the first selected index (or best if greedy)
@@ -1768,7 +1819,8 @@ class EmpowermentDifferenceGoalProposer:
             self.LOG_INTERVAL_STEPS,
         )
 
-        return proposed_goals, buffer_state
+        # Return ep_buffer_state since we use EP states for goal selection
+        return proposed_goals, ep_bs
 
     @staticmethod
     def _visualize(
