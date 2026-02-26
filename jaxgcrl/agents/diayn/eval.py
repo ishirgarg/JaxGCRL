@@ -93,6 +93,10 @@ def run_multi_skill_evaluation(
         Dictionary of aggregated metrics with per-skill and mean/std statistics.
     """
     all_metrics = {}
+    
+    # Collect all metric values per base key for aggregation
+    skill_metric_values = {}
+    per_skill_success = {}
 
     for skill_idx in range(num_skills):
         # Create evaluator for this specific skill
@@ -108,41 +112,30 @@ def run_multi_skill_evaluation(
             key=jax.random.fold_in(eval_key, skill_idx),
         )
 
-        # Run evaluation for this skill
+        # Run evaluation for this skill (only once per skill)
         skill_metrics = skill_evaluator.run_evaluation(params, training_metrics)
 
-        # Prefix all metrics with skill index
+        # Extract success rates per skill (with new key format: skill_0_eval, skill_1_eval, etc.)
         for key, value in skill_metrics.items():
-            if key.startswith("eval/"):
-                all_metrics[f"eval/skill_{skill_idx}/{key[5:]}"] = value
-            else:
-                all_metrics[f"skill_{skill_idx}/{key}"] = value
+            if key.startswith("eval/episode_success"):
+                success_type = key.replace("eval/episode_", "")
+                per_skill_success[f"skill_{skill_idx}_eval/{success_type}"] = value
+        
+        # Collect values for aggregation (excluding std metrics and success which we handle separately)
+        for key, value in skill_metrics.items():
+            if key.startswith("eval/episode_") and not key.endswith("_std") and not key.startswith("eval/episode_success"):
+                base_key = key.replace("eval/episode_", "")
+                if base_key not in skill_metric_values:
+                    skill_metric_values[base_key] = []
+                skill_metric_values[base_key].append(value)
 
-    # Compute aggregate metrics across all skills
-    skill_metric_keys = set()
-    for key in all_metrics.keys():
-        if key.startswith("eval/skill_"):
-            # Extract base metric name (e.g., "reward" from "eval/skill_0/reward")
-            parts = key.split("/")
-            if len(parts) >= 3:
-                base_key = "/".join(parts[2:])
-                skill_metric_keys.add(base_key)
+    # Add per-skill success rates
+    all_metrics.update(per_skill_success)
 
-    # Aggregate across skills for each metric
-    for base_key in skill_metric_keys:
-        values = [
-            all_metrics[f"eval/skill_{i}/{base_key}"]
-            for i in range(num_skills)
-            if f"eval/skill_{i}/{base_key}" in all_metrics
-        ]
+    # Add aggregated metrics (mean only, no std, no per-skill breakdowns)
+    for base_key, values in skill_metric_values.items():
         if values:
-            all_metrics[f"eval/mean_across_skills/{base_key}"] = np.mean(values)
-            all_metrics[f"eval/std_across_skills/{base_key}"] = np.std(values)
-            # Also add standard metric names for compatibility with metrics recorder
-            # Map base_key to standard eval/episode_* format
-            if base_key in ["dist", "reward", "reward_ctrl", "reward_dist", "reward_near", 
-                           "reward_survive", "success", "success_any", "success_easy", "success_hard"]:
-                all_metrics[f"eval/episode_{base_key}"] = np.mean(values)
+            all_metrics[f"eval/episode_{base_key}"] = np.mean(values)
 
     return all_metrics
 

@@ -474,6 +474,44 @@ class DIAYN:
                 optimizer_state=training_state.discriminator_optimizer_state,
             )
 
+            # Compute per-skill metrics for debugging
+            skills = transitions.extras["state_extras"]["skill"]  # (B, num_skills)
+            skill_indices = jnp.argmax(skills, axis=-1)  # (B,)
+            log_probs = jax.nn.log_softmax(disc_logits, axis=-1)
+            
+            # Per-skill discriminator loss and reward
+            per_skill_metrics = {}
+            per_skill_disc_losses = []
+            per_skill_rewards = []
+            
+            for skill_idx in range(num_skills):
+                mask = skill_indices == skill_idx
+                if jnp.any(mask):
+                    skill_log_probs = log_probs[mask]
+                    skill_targets = skill_indices[mask]
+                    skill_loss = -jnp.mean(skill_log_probs[jnp.arange(skill_log_probs.shape[0]), skill_targets])
+                    skill_reward = jnp.mean(diayn_reward[mask])
+                    
+                    per_skill_metrics[f"skill_{skill_idx}_training/discriminator_loss"] = skill_loss
+                    per_skill_metrics[f"skill_{skill_idx}_training/diayn_reward"] = skill_reward
+                    
+                    # Collect for mean computation (only non-NaN values)
+                    per_skill_disc_losses.append(skill_loss)
+                    per_skill_rewards.append(skill_reward)
+                else:
+                    # Skill not in batch - set to NaN to indicate missing data
+                    per_skill_metrics[f"skill_{skill_idx}_training/discriminator_loss"] = -1
+                    per_skill_metrics[f"skill_{skill_idx}_training/diayn_reward"] = -1
+
+            # Compute mean across skills (only for skills that appeared in batch)
+            mean_metrics = {}
+            if per_skill_disc_losses:
+                mean_metrics["mean_training/discriminator_loss"] = jnp.mean(jnp.array(per_skill_disc_losses))
+            if per_skill_rewards:
+                mean_metrics["mean_training/diayn_reward"] = jnp.mean(jnp.array(per_skill_rewards))
+
+            # Aggregated training metrics - extract loss values from update functions
+            # These are scalars returned by gradient_update_fn: (loss, params, optimizer_state)
             metrics = {
                 "critic_loss": critic_loss_val,
                 "actor_loss": actor_loss_val,
@@ -482,6 +520,8 @@ class DIAYN:
                 "discriminator_loss": disc_loss_val,
                 "discriminator_entropy": -jnp.mean(log_q),
                 "diayn_reward": jnp.mean(diayn_reward),
+                **per_skill_metrics,
+                **mean_metrics,
             }
 
             new_training_state = TrainingState(
@@ -760,9 +800,7 @@ class DIAYN:
 
             epoch_training_time = time.time() - t
             training_walltime += epoch_training_time
-            sps = (
-                env_steps_per_actor_step * num_training_steps_per_epoch
-            ) / epoch_training_time
+            sps = (env_steps_per_actor_step * num_training_steps_per_epoch) / epoch_training_time
             metrics = {
                 "training/sps": sps,
                 "training/walltime": training_walltime,
