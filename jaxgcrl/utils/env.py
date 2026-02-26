@@ -271,7 +271,7 @@ class MetricsRecorder:
     def progress(self, num_steps, metrics, make_policy, params, env, do_render=True):
         for key in self.metrics_to_collect:
             self.ensure_metric(metrics, key)
-        
+
         # Ensure all metrics exist (set to 0 if missing)
         # Convert to list to avoid issues with JAX dict iteration
         metric_keys = list(metrics.keys())

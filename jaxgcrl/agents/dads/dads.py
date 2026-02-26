@@ -1,6 +1,6 @@
-"""Diversity Is All You Need (DIAYN) training.
+"""Dynamics-Aware Discovery of Skills (DADS) training.
 
-Reference: https://arxiv.org/abs/1802.06070
+Reference: https://arxiv.org/abs/1907.01657
 
 Key ideas
 ---------
@@ -11,14 +11,14 @@ Key ideas
 * The environment's *goal* part of the observation is **replaced** by ``z``,
   giving the agent an augmented observation ``[state | z]`` of dimension
   ``state_dim + num_skills``.
-* The intrinsic reward is:
-      r(s, z) = log q_φ(z | s') − log p(z)
-             = log q_φ(z | s') + log(num_skills)      (uniform prior)
-  where ``s'`` is the *next* state (state part only, no skill appended) and
-  ``q_φ`` is a learned discriminator.
+* A skill dynamics model ``q_phi(s' | s, z)`` is a diagonal Gaussian that
+  predicts ``delta_s = s' - s`` given the current state and skill.
+* The intrinsic reward maximises the mutual information I(s'; z | s):
+      r(s, z, s') = log q(s'|s,z) - log[ (1/K) * Σ_{z'} q(s'|s,z') ]
+  where the denominator marginalises over all K skills.
 * A SAC agent is trained to maximise this intrinsic reward.  The environment's
   extrinsic reward is entirely ignored.
-* The discriminator is trained by cross-entropy to predict ``z`` from ``s'``.
+* The dynamics model is trained by maximum likelihood (NLL loss).
 """
 
 import functools
@@ -44,9 +44,9 @@ from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import Evaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
-from . import networks as diayn_networks
-from . import eval as diayn_eval
-from . import losses as diayn_losses
+from . import networks as dads_networks
+from . import eval as dads_eval
+from . import losses as dads_losses
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -68,7 +68,7 @@ class Transition(NamedTuple):
     ``observation`` and ``next_observation`` are the *skill-augmented*
     observations ``[state | z]`` of dimension ``state_dim + num_skills``.
     The skill ``z`` is also stored in ``extras["state_extras"]["skill"]``
-    so that the discriminator can be trained without re-augmenting.
+    so that the dynamics model can be trained without re-augmenting.
     """
 
     observation: NestedArray
@@ -85,15 +85,15 @@ class Transition(NamedTuple):
 
 @dataclass
 class TrainingState:
-    """Full training state for the DIAYN learner."""
+    """Full training state for the DADS learner."""
 
     policy_optimizer_state: optax.OptState
     policy_params: Params
     q_optimizer_state: optax.OptState
     q_params: Params
     target_q_params: Params
-    discriminator_optimizer_state: optax.OptState
-    discriminator_params: Params
+    dynamics_optimizer_state: optax.OptState
+    dynamics_params: Params
     gradient_steps: jnp.ndarray
     env_steps: jnp.ndarray
     alpha_optimizer_state: optax.OptState
@@ -113,26 +113,26 @@ def _init_training_state(
     key: PRNGKey,
     obs_size: int,
     local_devices_to_use: int,
-    diayn_network: diayn_networks.DIAYNNetworks,
+    dads_network: dads_networks.DADSNetworks,
     alpha_optimizer: optax.GradientTransformation,
     policy_optimizer: optax.GradientTransformation,
     q_optimizer: optax.GradientTransformation,
-    discriminator_optimizer: optax.GradientTransformation,
+    dynamics_optimizer: optax.GradientTransformation,
 ) -> TrainingState:
     """Initialise a replicated TrainingState."""
-    key_policy, key_q, key_disc = jax.random.split(key, 3)
+    key_policy, key_q, key_dyn = jax.random.split(key, 3)
 
     log_alpha = jnp.asarray(0.0, dtype=jnp.float32)
     alpha_optimizer_state = alpha_optimizer.init(log_alpha)
 
-    policy_params = diayn_network.policy_network.init(key_policy)
+    policy_params = dads_network.policy_network.init(key_policy)
     policy_optimizer_state = policy_optimizer.init(policy_params)
 
-    q_params = diayn_network.q_network.init(key_q)
+    q_params = dads_network.q_network.init(key_q)
     q_optimizer_state = q_optimizer.init(q_params)
 
-    disc_params = diayn_network.discriminator_network.init(key_disc)
-    disc_optimizer_state = discriminator_optimizer.init(disc_params)
+    dynamics_params = dads_network.skill_dynamics_network.init(key_dyn)
+    dynamics_optimizer_state = dynamics_optimizer.init(dynamics_params)
 
     normalizer_params = running_statistics.init_state(
         specs.Array((obs_size,), jnp.dtype("float32"))
@@ -144,8 +144,8 @@ def _init_training_state(
         q_optimizer_state=q_optimizer_state,
         q_params=q_params,
         target_q_params=q_params,
-        discriminator_optimizer_state=disc_optimizer_state,
-        discriminator_params=disc_params,
+        dynamics_optimizer_state=dynamics_optimizer_state,
+        dynamics_params=dynamics_params,
         gradient_steps=jnp.zeros(()),
         env_steps=jnp.zeros(()),
         alpha_optimizer_state=alpha_optimizer_state,
@@ -157,50 +157,53 @@ def _init_training_state(
     )
 
 
-
-
 # ---------------------------------------------------------------------------
-# DIAYN agent dataclass
+# DADS agent dataclass
 # ---------------------------------------------------------------------------
 
 @dataclass
-class DIAYN:
-    """Diversity Is All You Need (DIAYN) agent.
+class DADS:
+    """Dynamics-Aware Discovery of Skills (DADS) agent.
 
-    Trains a SAC policy with an intrinsic reward derived from a skill
-    discriminator.  The environment's extrinsic reward is ignored; the goal
-    part of the observation is replaced by a one-hot skill vector.
+    Trains a SAC policy with an intrinsic reward derived from a skill dynamics
+    model.  The model ``q_phi(s' | s, z)`` is a diagonal Gaussian predicting
+    ``delta_s = s' - s`` given current state and skill.  The reward maximises
+    the mutual information I(s'; z | s):
+
+        r(s, z, s') = log q(s'|s,z) - log[ (1/K) * Σ_{z'} q(s'|s,z') ]
+
+    The environment's extrinsic reward is ignored; the goal part of the
+    observation is replaced by a one-hot skill vector, exactly as in DIAYN.
 
     Args:
-        num_skills: Number of discrete skills ``|Z|``.
-        learning_rate: Learning rate for policy, Q-network, and discriminator.
-        discounting: Discount factor γ.
-        batch_size: Total training batch size (summed across all devices).
-        normalize_observations: Whether to normalise the skill-augmented
-            observations using a running mean/std.
-        reward_scaling: Scalar multiplier applied to the DIAYN intrinsic reward
-            before the Bellman update.
-        tau: Soft target-network update rate.
-        min_replay_size: Minimum number of transitions in the buffer before
-            training starts.
-        max_replay_size: Maximum replay buffer capacity (per device).
-        deterministic_eval: Use deterministic (mode) actions during evaluation.
-        train_step_multiplier: Number of gradient updates per environment step.
-        unroll_length: Number of environment steps collected between updates.
-        h_dim: Hidden layer dimension for all MLPs.
-        n_hidden: Number of hidden layers for all MLPs.
-        use_ln: Use layer normalisation in MLPs.
+        num_skills:        Number of discrete skills ``|Z|``.
+        learning_rate:     Learning rate for policy, Q-network, and dynamics model.
+        discounting:       Discount factor γ.
+        batch_size:        Total training batch size (summed across all devices).
+        normalize_observations: Whether to normalise skill-augmented observations.
+        reward_scaling:    Scalar multiplier on the intrinsic reward.
+        tau:               Soft target-network update rate.
+        min_replay_size:   Minimum transitions in buffer before training starts.
+        max_replay_size:   Maximum replay buffer capacity (per device).
+        deterministic_eval: Use deterministic actions during evaluation.
+        train_step_multiplier: Gradient updates per environment step.
+        unroll_length:     Environment steps collected between updates.
+        h_dim:             Hidden layer width for all MLPs.
+        n_hidden:          Number of hidden layers for all MLPs.
+        use_ln:            Use layer normalisation in MLPs.
+        log_std_min:       Lower clip on the dynamics model's log-std output.
+        log_std_max:       Upper clip on the dynamics model's log-std output.
     """
 
     num_skills: int = 8
     learning_rate: float = 3e-4
     discounting: float = 0.99
     batch_size: int = 256
-    normalize_observations: bool = False
+    normalize_observations: bool = True
     reward_scaling: float = 1.0
     tau: float = 0.005
     min_replay_size: int = 0
-    max_replay_size: Optional[int] = 100_000
+    max_replay_size: Optional[int] = 10_000
     deterministic_eval: bool = False
     train_step_multiplier: int = 1
     unroll_length: int = 50
@@ -219,7 +222,7 @@ class DIAYN:
         ] = None,
         progress_fn: Callable[[int, Metrics], None] = lambda *args: None,
     ):
-        """Run DIAYN training.
+        """Run DADS training.
 
         Parameters
         ----------
@@ -257,7 +260,7 @@ class DIAYN:
         state_dim: int = unwrapped_env.state_dim
 
         # Augmented observation size seen by the policy and Q-network
-        diayn_obs_size: int = state_dim + num_skills
+        dads_obs_size: int = state_dim + num_skills
 
         if self.min_replay_size >= config.total_env_steps:
             raise ValueError(
@@ -322,8 +325,8 @@ class DIAYN:
         if self.normalize_observations:
             normalize_fn = running_statistics.normalize
 
-        diayn_network = diayn_networks.make_diayn_networks(
-            observation_size=diayn_obs_size,
+        dads_network = dads_networks.make_dads_networks(
+            observation_size=dads_obs_size,
             action_size=action_size,
             state_size=state_dim,
             num_skills=num_skills,
@@ -331,7 +334,7 @@ class DIAYN:
             hidden_layer_sizes=[self.h_dim] * self.n_hidden,
             layer_norm=self.use_ln,
         )
-        make_policy = diayn_networks.make_inference_fn(diayn_network)
+        make_policy = dads_networks.make_inference_fn(dads_network)
 
         # ------------------------------------------------------------------
         # Optimisers
@@ -339,12 +342,12 @@ class DIAYN:
         alpha_optimizer = optax.adam(learning_rate=3e-4)
         policy_optimizer = optax.adam(learning_rate=self.learning_rate)
         q_optimizer = optax.adam(learning_rate=self.learning_rate)
-        discriminator_optimizer = optax.adam(learning_rate=self.learning_rate)
+        dynamics_optimizer = optax.adam(learning_rate=self.learning_rate)
 
         # ------------------------------------------------------------------
         # Replay buffer
         # ------------------------------------------------------------------
-        dummy_obs = jnp.zeros((diayn_obs_size,))
+        dummy_obs = jnp.zeros((dads_obs_size,))
         dummy_action = jnp.zeros((action_size,))
         dummy_transition = Transition(
             observation=dummy_obs,
@@ -357,7 +360,7 @@ class DIAYN:
                     "truncation": 0.0,
                     "traj_id": 0.0,
                     # One-hot skill vector stored alongside each transition so
-                    # the discriminator can be trained from the replay buffer.
+                    # the dynamics model can be trained from the replay buffer.
                     "skill": jnp.zeros((num_skills,)),
                 },
                 "policy_extras": {},
@@ -378,9 +381,9 @@ class DIAYN:
         # ------------------------------------------------------------------
         # The brax SAC losses are generic: they use transitions.reward /
         # transitions.observation / etc.  We replace transitions.reward with
-        # the DIAYN intrinsic reward inside update_step before calling them.
+        # the DADS intrinsic reward inside update_step before calling them.
         alpha_loss, critic_loss, actor_loss = sac_losses.make_losses(
-            sac_network=diayn_network,   # duck-typed: has policy_network, q_network, parametric_action_distribution
+            sac_network=dads_network,  # duck-typed: has policy_network, q_network, parametric_action_distribution
             reward_scaling=self.reward_scaling,
             discounting=self.discounting,
             action_size=action_size,
@@ -395,8 +398,8 @@ class DIAYN:
             actor_loss, policy_optimizer, pmap_axis_name=_PMAP_AXIS_NAME
         )
 
-        discriminator_update = diayn_losses.make_discriminator_update_fn(
-            diayn_network, state_dim, discriminator_optimizer
+        dynamics_update = dads_losses.make_skill_dynamics_update_fn(
+            dads_network, state_dim, dynamics_optimizer
         )
 
         # ------------------------------------------------------------------
@@ -409,24 +412,39 @@ class DIAYN:
             training_state, key = carry
             key, key_alpha, key_critic, key_actor = jax.random.split(key, 4)
 
-            # ---- 1. Compute DIAYN intrinsic reward -----------------------
-            # r(s', z) = log q_φ(z | s') + log(num_skills)
-            diayn_reward = diayn_losses.compute_diayn_reward(
-                diayn_network,
+            # ---- 1. Compute DADS intrinsic reward ------------------------
+            # r(s, z, s') = log q(s'|s,z) - log[(1/K) Σ_{z'} q(s'|s,z')]
+            dads_reward = dads_losses.compute_dads_reward(
+                dads_network,
                 state_dim,
                 num_skills,
-                training_state.discriminator_params,
+                training_state.dynamics_params,
                 transitions,
             )
-            # Also compute discriminator entropy for metrics
-            next_states = transitions.next_observation[:, :state_dim]
-            disc_logits = diayn_network.discriminator_network.apply(
-                None, training_state.discriminator_params, next_states
-            )
-            log_q = jax.nn.log_softmax(disc_logits, axis=-1)
 
-            # Replace the stored (env) reward with the DIAYN intrinsic reward
-            transitions = transitions._replace(reward=diayn_reward)
+            # Also compute per-sample log q(s'|s,z) for the actual skill
+            # (used for per-skill NLL metrics).
+            states      = transitions.observation[:, :state_dim]
+            next_states = transitions.next_observation[:, :state_dim]
+            skills      = transitions.extras["state_extras"]["skill"]
+            delta_s     = next_states - states
+            dynamics_input = jnp.concatenate([states, skills], axis=-1)
+            dyn_output  = dads_network.skill_dynamics_network.apply(
+                None, training_state.dynamics_params, dynamics_input
+            )
+            dyn_mean    = dyn_output[:, :state_dim]
+            dyn_log_std = dyn_output[:, state_dim:]
+            # Per-sample NLL: -log q(s'|s,z_actual)
+            per_sample_log_prob = -0.5 * jnp.sum(
+                ((delta_s - dyn_mean) ** 2) * jnp.exp(-2.0 * dyn_log_std)
+                + 2.0 * dyn_log_std
+                + jnp.log(2.0 * jnp.pi),
+                axis=-1,
+            )  # (B,)
+            per_sample_nll = -per_sample_log_prob  # (B,)
+
+            # Replace the stored (env) reward with the DADS intrinsic reward
+            transitions = transitions._replace(reward=dads_reward)
 
             # ---- 2. SAC updates ------------------------------------------
             alpha_loss_val, alpha_params, alpha_optimizer_state = alpha_update(
@@ -467,86 +485,70 @@ class DIAYN:
                 q_params,
             )
 
-            # ---- 3. Discriminator update ----------------------------------
-            disc_loss_val, disc_params, disc_optimizer_state = discriminator_update(
-                training_state.discriminator_params,
+            # ---- 3. Dynamics model update ---------------------------------
+            dyn_loss_val, dynamics_params, dynamics_optimizer_state = dynamics_update(
+                training_state.dynamics_params,
                 transitions,
-                optimizer_state=training_state.discriminator_optimizer_state,
+                optimizer_state=training_state.dynamics_optimizer_state,
             )
 
-            # Compute per-skill metrics for debugging
-            skills = transitions.extras["state_extras"]["skill"]  # (B, num_skills)
+            # ---- 4. Per-skill metrics ------------------------------------
             skill_indices = jnp.argmax(skills, axis=-1)  # (B,)
-            log_probs = jax.nn.log_softmax(disc_logits, axis=-1)
-            
-            # Per-skill discriminator loss and reward
-            # Use JAX operations instead of Python if/else to avoid tracer errors
+
             per_skill_metrics = {}
-            per_skill_disc_losses = []
-            per_skill_rewards = []
-            
+            per_skill_nll_list = []
+            per_skill_reward_list = []
+
             for skill_idx in range(num_skills):
-                mask = skill_indices == skill_idx  # (B,) boolean mask
+                mask = skill_indices == skill_idx  # (B,)
                 num_samples = jnp.sum(mask.astype(jnp.int32))
-                
-                # Compute loss for this skill: -mean(log_prob of correct skill for samples with this skill)
-                # For each sample, get the log_prob of its skill, then mask and average
-                sample_log_probs = log_probs[jnp.arange(log_probs.shape[0]), skill_indices]  # (B,)
-                skill_loss = jnp.where(
+
+                # Mean NLL for this skill (lower is better)
+                skill_nll = jnp.where(
                     num_samples > 0,
-                    -jnp.sum(sample_log_probs * mask) / num_samples,
-                    -1.0
+                    jnp.sum(per_sample_nll * mask) / num_samples,
+                    -1.0,
                 )
-                
-                # Compute reward for this skill: mean reward for samples with this skill
+                # Mean DADS reward for this skill
                 skill_reward = jnp.where(
                     num_samples > 0,
-                    jnp.sum(diayn_reward * mask) / num_samples,
-                    -1.0
+                    jnp.sum(dads_reward * mask) / num_samples,
+                    -1.0,
                 )
-                
-                per_skill_metrics[f"skill_{skill_idx}_training/discriminator_loss"] = skill_loss
-                per_skill_metrics[f"skill_{skill_idx}_training/diayn_reward"] = skill_reward
-                
-                # Collect for mean computation (only non-negative values, i.e., skills that appeared)
-                per_skill_disc_losses.append(skill_loss)
-                per_skill_rewards.append(skill_reward)
 
-            # Compute mean across skills (only for skills that appeared in batch, i.e., values >= 0)
-            # Filter out -1 values (missing skills) before computing mean
-            disc_losses_array = jnp.array(per_skill_disc_losses)
-            rewards_array = jnp.array(per_skill_rewards)
-            
-            # Only include values that are not -1 (skills that appeared)
-            valid_disc_mask = disc_losses_array >= 0
-            valid_reward_mask = rewards_array >= 0
-            
-            # Count valid samples and compute mean
-            num_valid_disc = jnp.sum(valid_disc_mask.astype(jnp.int32))
-            num_valid_reward = jnp.sum(valid_reward_mask.astype(jnp.int32))
-            
-            mean_metrics = {}
-            mean_metrics["mean_training/discriminator_loss"] = jnp.where(
-                num_valid_disc > 0,
-                jnp.sum(disc_losses_array * valid_disc_mask) / num_valid_disc,
-                -1.0
-            )
-            mean_metrics["mean_training/diayn_reward"] = jnp.where(
-                num_valid_reward > 0,
-                jnp.sum(rewards_array * valid_reward_mask) / num_valid_reward,
-                -1.0
-            )
+                per_skill_metrics[f"skill_{skill_idx}_training/dynamics_loss"] = skill_nll
+                per_skill_metrics[f"skill_{skill_idx}_training/dads_reward"] = skill_reward
+                per_skill_nll_list.append(skill_nll)
+                per_skill_reward_list.append(skill_reward)
 
-            # Aggregated training metrics - extract loss values from update functions
-            # These are scalars returned by gradient_update_fn: (loss, params, optimizer_state)
+            # Mean across skills (excluding -1 sentinel for missing skills)
+            nll_arr    = jnp.array(per_skill_nll_list)
+            reward_arr = jnp.array(per_skill_reward_list)
+            valid_nll    = nll_arr    >= 0
+            valid_reward = reward_arr >= 0
+            n_valid_nll    = jnp.sum(valid_nll.astype(jnp.int32))
+            n_valid_reward = jnp.sum(valid_reward.astype(jnp.int32))
+
+            mean_metrics = {
+                "mean_training/dynamics_loss": jnp.where(
+                    n_valid_nll > 0,
+                    jnp.sum(nll_arr * valid_nll) / n_valid_nll,
+                    -1.0,
+                ),
+                "mean_training/dads_reward": jnp.where(
+                    n_valid_reward > 0,
+                    jnp.sum(reward_arr * valid_reward) / n_valid_reward,
+                    -1.0,
+                ),
+            }
+
             metrics = {
-                "critic_loss": critic_loss_val,
-                "actor_loss": actor_loss_val,
-                "alpha_loss": alpha_loss_val,
-                "alpha": jnp.exp(alpha_params),
-                "discriminator_loss": disc_loss_val,
-                "discriminator_entropy": -jnp.mean(log_q),
-                "diayn_reward": jnp.mean(diayn_reward),
+                "critic_loss":   critic_loss_val,
+                "actor_loss":    actor_loss_val,
+                "alpha_loss":    alpha_loss_val,
+                "alpha":         jnp.exp(alpha_params),
+                "dynamics_loss": dyn_loss_val,
+                "dads_reward":   jnp.mean(dads_reward),
                 **per_skill_metrics,
                 **mean_metrics,
             }
@@ -557,8 +559,8 @@ class DIAYN:
                 q_optimizer_state=q_optimizer_state,
                 q_params=q_params,
                 target_q_params=new_target_q_params,
-                discriminator_optimizer_state=disc_optimizer_state,
-                discriminator_params=disc_params,
+                dynamics_optimizer_state=dynamics_optimizer_state,
+                dynamics_params=dynamics_params,
                 gradient_steps=training_state.gradient_steps + 1,
                 env_steps=training_state.env_steps,
                 alpha_optimizer_state=alpha_optimizer_state,
@@ -591,39 +593,34 @@ class DIAYN:
                 current_key, next_key, skill_key = jax.random.split(current_key, 3)
 
                 # ---- Build skill-augmented observation --------------------
-                # env_state.obs is [state | goal] of size (num_envs, env_obs_size)
-                # We keep only the first state_dim dims and append the skill.
                 state_part = env_state.obs[:, :state_dim]          # (N, state_dim)
-                aug_obs = jnp.concatenate([state_part, skills], axis=-1)  # (N, diayn_obs_size)
+                aug_obs = jnp.concatenate([state_part, skills], axis=-1)  # (N, dads_obs_size)
 
                 # ---- Policy step -----------------------------------------
                 actions, policy_extras = policy(aug_obs, current_key)
 
-                # ---- Environment step (uses real env_state, not aug) ------
+                # ---- Environment step ------------------------------------
                 nstate = env.step(env_state, actions)
 
                 # ---- Build next augmented observation --------------------
                 next_state_part = nstate.obs[:, :state_dim]
                 aug_next_obs = jnp.concatenate([next_state_part, skills], axis=-1)
 
-                # Store truncation and traj_id from the new state
                 state_extras = {
                     "truncation": nstate.info["truncation"],
-                    "traj_id": nstate.info["traj_id"],
-                    "skill": skills,   # (N, num_skills) one-hot
+                    "traj_id":    nstate.info["traj_id"],
+                    "skill":      skills,   # (N, num_skills) one-hot
                 }
 
                 transition = Transition(
                     observation=aug_obs,
                     next_observation=aug_next_obs,
                     action=actions,
-                    # Store env reward as placeholder; will be replaced by DIAYN
-                    # intrinsic reward during the gradient update.
-                    reward=nstate.reward,
+                    reward=nstate.reward,   # replaced by DADS reward during gradient update
                     discount=1 - nstate.done,
                     extras={
                         "policy_extras": policy_extras,
-                        "state_extras": state_extras,
+                        "state_extras":  state_extras,
                     },
                 )
 
@@ -633,7 +630,6 @@ class DIAYN:
                     skill_key, (skills.shape[0],), 0, num_skills
                 )
                 new_skills = jax.nn.one_hot(new_skill_idx, num_skills, dtype=jnp.float32)
-                # Keep current skill if episode is ongoing; replace if done.
                 next_skills = jnp.where(
                     nstate.done[:, None],   # (N, 1) broadcast
                     new_skills,
@@ -828,26 +824,22 @@ class DIAYN:
             epoch_training_time = time.time() - t
             training_walltime += epoch_training_time
             sps = (env_steps_per_actor_step * num_training_steps_per_epoch) / epoch_training_time
-            # Convert metrics to regular Python dict to ensure proper iteration
-            # JAX dicts might not iterate correctly, so convert to dict first
+
+            # Convert to a plain Python dict so iteration is reliable.
             metrics_dict = dict(metrics)
-            
-            # Build final metrics dict
-            # Metrics that already have a prefix (like skill_x_training/ or mean_training/) should not be prefixed again
+
+            # Build final metrics dict, preserving existing prefixes.
             final_metrics = {
-                "training/sps": sps,
+                "training/sps":      sps,
                 "training/walltime": training_walltime,
             }
             for name, value in metrics_dict.items():
-                # If the metric name already contains a slash, it already has a prefix, use it as-is
                 if "/" in name:
-                    final_metrics[name] = value
+                    final_metrics[name] = value        # already has a prefix
                 else:
-                    # Otherwise, add training/ prefix
                     final_metrics[f"training/{name}"] = value
-            
-            metrics = final_metrics
-            return training_state, env_state, current_skills, buffer_state, metrics
+
+            return training_state, env_state, current_skills, buffer_state, final_metrics
 
         # ------------------------------------------------------------------
         # Initialisation
@@ -857,13 +849,13 @@ class DIAYN:
 
         training_state = _init_training_state(
             key=global_key,
-            obs_size=diayn_obs_size,
+            obs_size=dads_obs_size,
             local_devices_to_use=local_devices_to_use,
-            diayn_network=diayn_network,
+            dads_network=dads_network,
             alpha_optimizer=alpha_optimizer,
             policy_optimizer=policy_optimizer,
             q_optimizer=q_optimizer,
-            discriminator_optimizer=discriminator_optimizer,
+            dynamics_optimizer=dynamics_optimizer,
         )
         del global_key
 
@@ -884,7 +876,6 @@ class DIAYN:
             return jax.nn.one_hot(idx, num_skills, dtype=jnp.float32)
 
         current_skills = jax.pmap(_init_skills)(skill_keys)
-        # current_skills.shape = (local_devices_to_use, num_envs_per_device, num_skills)
 
         # Replay buffer
         buffer_state = jax.pmap(replay_buffer.init)(
@@ -909,9 +900,8 @@ class DIAYN:
             randomization_fn=v_randomization_fn_eval,
         )
 
-        # Wrap make_policy so it accepts raw env observations (replaces goal
-        # with a fixed skill before passing to the trained policy).
-        eval_make_policy = diayn_eval.make_diayn_eval_policy(
+        # Wrap make_policy so it accepts raw env observations.
+        eval_make_policy = dads_eval.make_dads_eval_policy(
             make_policy, state_dim, num_skills, skill_idx=0
         )
 
@@ -932,7 +922,7 @@ class DIAYN:
             params = _unpmap(
                 (training_state.normalizer_params, training_state.policy_params)
             )
-            metrics = diayn_eval.run_multi_skill_evaluation(
+            metrics = dads_eval.run_multi_skill_evaluation(
                 make_policy,
                 state_dim,
                 num_skills,
@@ -945,7 +935,6 @@ class DIAYN:
                 params,
                 training_metrics={},
             )
-            # Don't render at step 0 - policy is untrained, rendering happens in main loop
             progress_fn(0, metrics, eval_make_policy, params, unwrapped_env, False)
 
         # ------------------------------------------------------------------
@@ -995,14 +984,16 @@ class DIAYN:
                     (training_state.normalizer_params, training_state.policy_params)
                 )
                 # Save checkpoint every 1M steps
-                if config.checkpoint_logdir and (current_step - last_checkpoint_step >= checkpoint_interval):
-                    path = f"{config.checkpoint_logdir}_diayn_{current_step}.pkl"
+                if config.checkpoint_logdir and (
+                    current_step - last_checkpoint_step >= checkpoint_interval
+                ):
+                    path = f"{config.checkpoint_logdir}_dads_{current_step}.pkl"
                     model.save_params(path, params)
                     logging.info(f"Saved checkpoint at step {current_step}")
                     last_checkpoint_step = current_step
 
                 # Run multi-skill evaluation
-                metrics = diayn_eval.run_multi_skill_evaluation(
+                metrics = dads_eval.run_multi_skill_evaluation(
                     make_policy,
                     state_dim,
                     num_skills,
@@ -1020,7 +1011,7 @@ class DIAYN:
                 do_render = (eval_epoch_num % config.visualization_interval) == 0
                 if do_render:
                     render_dir = config.checkpoint_logdir if config.checkpoint_logdir else "./runs"
-                    diayn_eval.render_all_skills(
+                    dads_eval.render_all_skills(
                         make_policy,
                         state_dim,
                         num_skills,
@@ -1031,20 +1022,16 @@ class DIAYN:
                         current_step,
                     )
 
-                # Merge training metrics into eval metrics so progress_fn receives everything.
-                # training_metrics contains training/actor_loss, skill_x_training/..., mean_training/...
-                # metrics contains eval/episode_dist, skill_x_eval/..., etc.
+                # Merge training metrics so progress_fn receives everything.
                 merged_metrics = {**training_metrics, **metrics}
 
-                # Note: We pass do_render=False to progress_fn since we've already rendered
-                # all skills manually above. The progress_fn's render would only render skill 0.
                 progress_fn(
                     current_step,
                     merged_metrics,
                     eval_make_policy,
                     params,
                     unwrapped_env,
-                    False,  # Don't render again - we already rendered all skills
+                    False,  # rendering already done above
                 )
 
         total_steps = current_step
@@ -1053,13 +1040,13 @@ class DIAYN:
         params = _unpmap(
             (training_state.normalizer_params, training_state.policy_params)
         )
-        
-        # Save final checkpoint if checkpoint_logdir is set
+
+        # Save final checkpoint
         if process_id == 0 and config.checkpoint_logdir:
-            path = f"{config.checkpoint_logdir}_diayn_{total_steps}_final.pkl"
+            path = f"{config.checkpoint_logdir}_dads_{total_steps}_final.pkl"
             model.save_params(path, params)
             logging.info(f"Saved final checkpoint at step {total_steps}")
-        
+
         pmap.assert_is_replicated(training_state)
         logging.info("total steps: %s", total_steps)
         pmap.synchronize_hosts()

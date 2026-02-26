@@ -1,4 +1,5 @@
 from .crl import CRL
+from .dads import DADS
 from .diayn import DIAYN
 from .ppo import PPO
 from .sac import SAC

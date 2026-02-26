@@ -200,7 +200,7 @@ class SAC:
     """Soft Actor-Critic (SAC) agent."""
 
     learning_rate: float = 1e-4
-    discounting: float = 0.9
+    discounting: float = 0.99
     batch_size: int = 256
     normalize_observations: bool = True
     reward_scaling: float = 1.0
