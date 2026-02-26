@@ -273,7 +273,9 @@ class MetricsRecorder:
             self.ensure_metric(metrics, key)
         
         # Ensure all metrics exist (set to 0 if missing)
-        for key in metrics.keys():
+        # Convert to list to avoid issues with JAX dict iteration
+        metric_keys = list(metrics.keys())
+        for key in metric_keys:
             self.ensure_metric(metrics, key)
 
         if do_render:

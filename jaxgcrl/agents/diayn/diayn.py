@@ -480,35 +480,62 @@ class DIAYN:
             log_probs = jax.nn.log_softmax(disc_logits, axis=-1)
             
             # Per-skill discriminator loss and reward
+            # Use JAX operations instead of Python if/else to avoid tracer errors
             per_skill_metrics = {}
             per_skill_disc_losses = []
             per_skill_rewards = []
             
             for skill_idx in range(num_skills):
-                mask = skill_indices == skill_idx
-                if jnp.any(mask):
-                    skill_log_probs = log_probs[mask]
-                    skill_targets = skill_indices[mask]
-                    skill_loss = -jnp.mean(skill_log_probs[jnp.arange(skill_log_probs.shape[0]), skill_targets])
-                    skill_reward = jnp.mean(diayn_reward[mask])
-                    
-                    per_skill_metrics[f"skill_{skill_idx}_training/discriminator_loss"] = skill_loss
-                    per_skill_metrics[f"skill_{skill_idx}_training/diayn_reward"] = skill_reward
-                    
-                    # Collect for mean computation (only non-NaN values)
-                    per_skill_disc_losses.append(skill_loss)
-                    per_skill_rewards.append(skill_reward)
-                else:
-                    # Skill not in batch - set to NaN to indicate missing data
-                    per_skill_metrics[f"skill_{skill_idx}_training/discriminator_loss"] = -1
-                    per_skill_metrics[f"skill_{skill_idx}_training/diayn_reward"] = -1
+                mask = skill_indices == skill_idx  # (B,) boolean mask
+                num_samples = jnp.sum(mask.astype(jnp.int32))
+                
+                # Compute loss for this skill: -mean(log_prob of correct skill for samples with this skill)
+                # For each sample, get the log_prob of its skill, then mask and average
+                sample_log_probs = log_probs[jnp.arange(log_probs.shape[0]), skill_indices]  # (B,)
+                skill_loss = jnp.where(
+                    num_samples > 0,
+                    -jnp.sum(sample_log_probs * mask) / num_samples,
+                    -1.0
+                )
+                
+                # Compute reward for this skill: mean reward for samples with this skill
+                skill_reward = jnp.where(
+                    num_samples > 0,
+                    jnp.sum(diayn_reward * mask) / num_samples,
+                    -1.0
+                )
+                
+                per_skill_metrics[f"skill_{skill_idx}_training/discriminator_loss"] = skill_loss
+                per_skill_metrics[f"skill_{skill_idx}_training/diayn_reward"] = skill_reward
+                
+                # Collect for mean computation (only non-negative values, i.e., skills that appeared)
+                per_skill_disc_losses.append(skill_loss)
+                per_skill_rewards.append(skill_reward)
 
-            # Compute mean across skills (only for skills that appeared in batch)
+            # Compute mean across skills (only for skills that appeared in batch, i.e., values >= 0)
+            # Filter out -1 values (missing skills) before computing mean
+            disc_losses_array = jnp.array(per_skill_disc_losses)
+            rewards_array = jnp.array(per_skill_rewards)
+            
+            # Only include values that are not -1 (skills that appeared)
+            valid_disc_mask = disc_losses_array >= 0
+            valid_reward_mask = rewards_array >= 0
+            
+            # Count valid samples and compute mean
+            num_valid_disc = jnp.sum(valid_disc_mask.astype(jnp.int32))
+            num_valid_reward = jnp.sum(valid_reward_mask.astype(jnp.int32))
+            
             mean_metrics = {}
-            if per_skill_disc_losses:
-                mean_metrics["mean_training/discriminator_loss"] = jnp.mean(jnp.array(per_skill_disc_losses))
-            if per_skill_rewards:
-                mean_metrics["mean_training/diayn_reward"] = jnp.mean(jnp.array(per_skill_rewards))
+            mean_metrics["mean_training/discriminator_loss"] = jnp.where(
+                num_valid_disc > 0,
+                jnp.sum(disc_losses_array * valid_disc_mask) / num_valid_disc,
+                -1.0
+            )
+            mean_metrics["mean_training/diayn_reward"] = jnp.where(
+                num_valid_reward > 0,
+                jnp.sum(rewards_array * valid_reward_mask) / num_valid_reward,
+                -1.0
+            )
 
             # Aggregated training metrics - extract loss values from update functions
             # These are scalars returned by gradient_update_fn: (loss, params, optimizer_state)
@@ -801,11 +828,25 @@ class DIAYN:
             epoch_training_time = time.time() - t
             training_walltime += epoch_training_time
             sps = (env_steps_per_actor_step * num_training_steps_per_epoch) / epoch_training_time
-            metrics = {
+            # Convert metrics to regular Python dict to ensure proper iteration
+            # JAX dicts might not iterate correctly, so convert to dict first
+            metrics_dict = dict(metrics)
+            
+            # Build final metrics dict
+            # Metrics that already have a prefix (like skill_x_training/ or mean_training/) should not be prefixed again
+            final_metrics = {
                 "training/sps": sps,
                 "training/walltime": training_walltime,
-                **{f"training/{name}": value for name, value in metrics.items()},
             }
+            for name, value in metrics_dict.items():
+                # If the metric name already contains a slash, it already has a prefix, use it as-is
+                if "/" in name:
+                    final_metrics[name] = value
+                else:
+                    # Otherwise, add training/ prefix
+                    final_metrics[f"training/{name}"] = value
+            
+            metrics = final_metrics
             return training_state, env_state, current_skills, buffer_state, metrics
 
         # ------------------------------------------------------------------
