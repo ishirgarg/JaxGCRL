@@ -892,6 +892,9 @@ class DIAYN:
         # Main training loop
         # ------------------------------------------------------------------
         current_step = 0
+        last_checkpoint_step = 0
+        checkpoint_interval = 1_000_000  # Save policy every 1M steps
+
         for eval_epoch_num in range(num_evals_after_init):
             logging.info("step %s", current_step)
 
@@ -912,9 +915,12 @@ class DIAYN:
                 params = _unpmap(
                     (training_state.normalizer_params, training_state.policy_params)
                 )
-                if config.checkpoint_logdir:
+                # Save checkpoint every 1M steps
+                if config.checkpoint_logdir and (current_step - last_checkpoint_step >= checkpoint_interval):
                     path = f"{config.checkpoint_logdir}_diayn_{current_step}.pkl"
                     model.save_params(path, params)
+                    logging.info(f"Saved checkpoint at step {current_step}")
+                    last_checkpoint_step = current_step
 
                 # Run multi-skill evaluation
                 metrics = diayn_eval.run_multi_skill_evaluation(
@@ -963,6 +969,13 @@ class DIAYN:
         params = _unpmap(
             (training_state.normalizer_params, training_state.policy_params)
         )
+        
+        # Save final checkpoint if checkpoint_logdir is set
+        if process_id == 0 and config.checkpoint_logdir:
+            path = f"{config.checkpoint_logdir}_diayn_{total_steps}_final.pkl"
+            model.save_params(path, params)
+            logging.info(f"Saved final checkpoint at step {total_steps}")
+        
         pmap.assert_is_replicated(training_state)
         logging.info("total steps: %s", total_steps)
         pmap.synchronize_hosts()

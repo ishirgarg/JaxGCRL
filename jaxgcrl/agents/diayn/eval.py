@@ -138,6 +138,11 @@ def run_multi_skill_evaluation(
         if values:
             all_metrics[f"eval/mean_across_skills/{base_key}"] = np.mean(values)
             all_metrics[f"eval/std_across_skills/{base_key}"] = np.std(values)
+            # Also add standard metric names for compatibility with metrics recorder
+            # Map base_key to standard eval/episode_* format
+            if base_key in ["dist", "reward", "reward_ctrl", "reward_dist", "reward_near", 
+                           "reward_survive", "success", "success_any", "success_easy", "success_hard"]:
+                all_metrics[f"eval/episode_{base_key}"] = np.mean(values)
 
     return all_metrics
 

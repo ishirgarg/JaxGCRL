@@ -271,13 +271,18 @@ class MetricsRecorder:
     def progress(self, num_steps, metrics, make_policy, params, env, do_render=True):
         for key in self.metrics_to_collect:
             self.ensure_metric(metrics, key)
+        
+        # Ensure all metrics exist (set to 0 if missing)
+        for key in metrics.keys():
+            self.ensure_metric(metrics, key)
 
         if do_render:
             render(make_policy, params, env, self.exp_dir, self.exp_name, num_steps)
 
+        # Record all metrics
         self.record(
             num_steps,
-            {key: value for key, value in metrics.items() if key in self.metrics_to_collect},
+            metrics,
         )
         self.log_wandb()
         self.print_progress()
