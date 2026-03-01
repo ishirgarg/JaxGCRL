@@ -7,7 +7,7 @@ Contains:
 - DADS intrinsic reward: r(s, z, s') = log q(s'|s,z) - log[(1/K) Σ_z' q(s'|s,z')]
 """
 
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
