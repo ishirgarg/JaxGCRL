@@ -186,6 +186,8 @@ def compute_dads_reward(
     all_skills = jnp.eye(num_skills, dtype=jnp.float32)  # (K, num_skills)
 
     if use_xy_prior:
+        # Extract state without xy for broadcasting (needed for all-skills computation)
+        state_without_xy = jnp.take(states, non_goal_indices, axis=1)  # (B, state_dim - len(goal_indices))
         # Broadcast state without xy and skills
         state_without_xy_bk = jnp.broadcast_to(state_without_xy[:, None, :], (B, num_skills, state_dim - len(goal_indices)))
         skills_bk = jnp.broadcast_to(all_skills[None, :, :], (B, num_skills, num_skills))
