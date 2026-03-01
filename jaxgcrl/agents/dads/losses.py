@@ -23,6 +23,42 @@ _PMAP_AXIS_NAME = "i"
 Transition = Any  # Will be the Transition NamedTuple from dads.py
 
 
+def _prepare_dynamics_inputs(
+    transitions: Transition,
+    state_dim: int,
+    use_xy_prior: bool = False,
+    goal_indices: Optional[jnp.ndarray] = None,
+    non_goal_indices: Optional[jnp.ndarray] = None,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Prepare inputs for dynamics network computation.
+    
+    Extracts states, computes delta_s, and prepares dynamics input.
+    Handles use_xy_prior case by excluding goal_indices from input.
+    
+    Returns:
+        delta_s: State differences, shape (B, output_dim)
+        dynamics_input: Input to dynamics network, shape (B, input_dim)
+        states: Raw states, shape (B, state_dim)
+        next_states: Raw next states, shape (B, state_dim)
+    """
+    states = transitions.observation[:, :state_dim]  # (B, state_dim)
+    next_states = transitions.next_observation[:, :state_dim]  # (B, state_dim)
+    skills = transitions.extras["state_extras"]["skill"]  # (B, num_skills)
+    
+    if use_xy_prior:
+        # Extract state without goal_indices for input
+        state_without_xy = jnp.take(states, non_goal_indices, axis=1)  # (B, state_dim - len(goal_indices))
+        # Only compute delta_s for goal_indices
+        delta_s = next_states[:, goal_indices] - states[:, goal_indices]  # (B, len(goal_indices))
+        # Input: state without goal_indices + skill
+        dynamics_input = jnp.concatenate([state_without_xy, skills], axis=-1)  # (B, state_dim - len(goal_indices) + num_skills)
+    else:
+        delta_s = next_states - states  # (B, state_dim)
+        dynamics_input = jnp.concatenate([states, skills], axis=-1)  # (B, state_dim+num_skills)
+    
+    return delta_s, dynamics_input, states, next_states
+
+
 def _gaussian_log_prob_sum_identity_cov(
     x: jnp.ndarray,
     mean: jnp.ndarray,
@@ -49,6 +85,7 @@ def skill_dynamics_loss_fn(
     transitions: Transition,
     use_xy_prior: bool = False,
     goal_indices: Optional[jnp.ndarray] = None,
+    non_goal_indices: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """Negative log-likelihood loss for the skill dynamics model.
 
@@ -68,27 +105,9 @@ def skill_dynamics_loss_fn(
     Returns:
         Scalar mean NLL loss.
     """
-    states      = transitions.observation[:, :state_dim]       # (B, state_dim)
-    next_states = transitions.next_observation[:, :state_dim]  # (B, state_dim)
-    skills      = transitions.extras["state_extras"]["skill"]  # (B, num_skills)
-    
-    if use_xy_prior:
-        # Extract state without goal_indices for input
-        # Create mask to exclude goal_indices
-        all_indices = jnp.arange(state_dim)
-        # Create boolean mask: True for indices NOT in goal_indices
-        mask = jnp.ones(state_dim, dtype=bool)
-        mask = mask.at[goal_indices].set(False)
-        state_without_xy = states[:, mask]  # (B, state_dim - len(goal_indices))
-        
-        # Only compute delta_s for goal_indices
-        delta_s = next_states[:, goal_indices] - states[:, goal_indices]  # (B, len(goal_indices))
-        
-        # Input: state without goal_indices + skill
-        dynamics_input = jnp.concatenate([state_without_xy, skills], axis=-1)  # (B, state_dim - len(goal_indices) + num_skills)
-    else:
-        delta_s = next_states - states  # (B, state_dim)
-        dynamics_input = jnp.concatenate([states, skills], axis=-1)  # (B, state_dim+num_skills)
+    delta_s, dynamics_input, _, _ = _prepare_dynamics_inputs(
+        transitions, state_dim, use_xy_prior, goal_indices, non_goal_indices
+    )
 
     # Normalize inputs using batch statistics (batch normalization on input)
     input_mean = jnp.mean(dynamics_input, axis=0, keepdims=True)  # (1, input_size)
@@ -116,6 +135,7 @@ def compute_dads_reward(
     transitions: Transition,
     use_xy_prior: bool = False,
     goal_indices: Optional[jnp.ndarray] = None,
+    non_goal_indices: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """Compute DADS intrinsic reward.
 
@@ -140,29 +160,11 @@ def compute_dads_reward(
     Returns:
         Array of intrinsic rewards, shape (batch_size,).
     """
-    states      = transitions.observation[:, :state_dim]       # (B, state_dim)
-    next_states = transitions.next_observation[:, :state_dim]  # (B, state_dim)
-    skills      = transitions.extras["state_extras"]["skill"]  # (B, num_skills)
+    delta_s, dynamics_input, states, _ = _prepare_dynamics_inputs(
+        transitions, state_dim, use_xy_prior, goal_indices, non_goal_indices
+    )
     
     B = states.shape[0]
-
-    if use_xy_prior:
-        # Extract state without goal_indices for input
-        # Create mask to exclude goal_indices
-        all_indices = jnp.arange(state_dim)
-        # Create boolean mask: True for indices NOT in goal_indices
-        mask = jnp.ones(state_dim, dtype=bool)
-        mask = mask.at[goal_indices].set(False)
-        state_without_xy = states[:, mask]  # (B, state_dim - len(goal_indices))
-        
-        # Only compute delta_s for goal_indices
-        delta_s = next_states[:, goal_indices] - states[:, goal_indices]  # (B, len(goal_indices))
-        
-        # Input: state without goal_indices + skill
-        dynamics_input = jnp.concatenate([state_without_xy, skills], axis=-1)  # (B, state_dim - len(goal_indices) + num_skills)
-    else:
-        delta_s = next_states - states  # (B, state_dim)
-        dynamics_input = jnp.concatenate([states, skills], axis=-1)  # (B, state_dim+K)
 
     # Normalize targets using batch statistics (as per paper)
     target_mean = jnp.mean(delta_s, axis=0, keepdims=True)  # (1, output_size)
@@ -229,6 +231,7 @@ def make_skill_dynamics_update_fn(
     dynamics_optimizer: optax.GradientTransformation,
     use_xy_prior: bool = False,
     goal_indices: Optional[jnp.ndarray] = None,
+    non_goal_indices: Optional[jnp.ndarray] = None,
 ):
     """Create the skill dynamics update function.
 
@@ -246,7 +249,8 @@ def make_skill_dynamics_update_fn(
     def loss_fn(dyn_params, transitions):
         return skill_dynamics_loss_fn(
             dads_network, state_dim, dyn_params, transitions,
-            use_xy_prior=use_xy_prior, goal_indices=goal_indices
+            use_xy_prior=use_xy_prior, goal_indices=goal_indices,
+            non_goal_indices=non_goal_indices
         )
 
     return gradients.gradient_update_fn(

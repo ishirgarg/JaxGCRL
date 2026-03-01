@@ -268,6 +268,13 @@ class DADS:
                 "The environment does not have this attribute."
             )
 
+        # Precompute non-goal indices once (outside JIT) for use_xy_prior
+        if self.use_xy_prior:
+            goal_indices_list = goal_indices.tolist() if hasattr(goal_indices, 'tolist') else list(goal_indices)
+            non_goal_indices = jnp.array([i for i in range(state_dim) if i not in goal_indices_list])
+        else:
+            non_goal_indices = None
+
         # Augmented observation size seen by the policy and Q-network
         dads_obs_size: int = state_dim + num_skills
 
@@ -413,6 +420,7 @@ class DADS:
             dads_network, state_dim, dynamics_optimizer,
             use_xy_prior=self.use_xy_prior,
             goal_indices=goal_indices,
+            non_goal_indices=non_goal_indices,
         )
 
         # ------------------------------------------------------------------
@@ -435,31 +443,15 @@ class DADS:
                 transitions,
                 use_xy_prior=self.use_xy_prior,
                 goal_indices=goal_indices,
+                non_goal_indices=non_goal_indices,
             )
 
             # Also compute per-sample log q(s'|s,z) for the actual skill
             # (used for per-skill NLL metrics).
-            states      = transitions.observation[:, :state_dim]
-            next_states = transitions.next_observation[:, :state_dim]
-            skills      = transitions.extras["state_extras"]["skill"]
-            
-            if self.use_xy_prior:
-                # Extract state without goal_indices for input
-                # Create mask to exclude goal_indices
-                all_indices = jnp.arange(state_dim)
-                # Create boolean mask: True for indices NOT in goal_indices
-                mask = jnp.ones(state_dim, dtype=bool)
-                mask = mask.at[goal_indices].set(False)
-                state_without_xy = states[:, mask]  # (B, state_dim - len(goal_indices))
-                
-                # Only compute delta_s for goal_indices
-                delta_s = next_states[:, goal_indices] - states[:, goal_indices]  # (B, len(goal_indices))
-                
-                # Input: state without goal_indices + skill
-                dynamics_input = jnp.concatenate([state_without_xy, skills], axis=-1)
-            else:
-                delta_s = next_states - states  # (B, state_dim)
-                dynamics_input = jnp.concatenate([states, skills], axis=-1)
+            # Reuse the same preprocessing logic as the loss function
+            delta_s, dynamics_input, _, _ = dads_losses._prepare_dynamics_inputs(
+                transitions, state_dim, self.use_xy_prior, goal_indices, non_goal_indices
+            )
             
             # Normalize inputs and targets using batch statistics (as per paper)
             input_mean = jnp.mean(dynamics_input, axis=0, keepdims=True)
@@ -476,9 +468,8 @@ class DADS:
             dyn_mean_norm = (dyn_mean - target_mean) / target_std
             
             # Per-sample NLL: -log q(s'|s,z_actual) with identity covariance
-            per_sample_log_prob = -0.5 * jnp.sum(
-                (delta_s_norm - dyn_mean_norm) ** 2 + jnp.log(2.0 * jnp.pi),
-                axis=-1,
+            per_sample_log_prob = dads_losses._gaussian_log_prob_sum_identity_cov(
+                delta_s_norm, dyn_mean_norm
             )  # (B,)
             per_sample_nll = -per_sample_log_prob  # (B,)
 
