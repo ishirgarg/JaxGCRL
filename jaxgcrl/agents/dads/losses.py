@@ -29,7 +29,7 @@ def _prepare_dynamics_inputs(
     use_xy_prior: bool = False,
     goal_indices: Optional[jnp.ndarray] = None,
     non_goal_indices: Optional[jnp.ndarray] = None,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Prepare inputs for dynamics network computation.
     
     Extracts states, computes delta_s, and prepares dynamics input.
@@ -78,6 +78,54 @@ def _gaussian_log_prob_sum_identity_cov(
     return -0.5 * jnp.sum((x - mean) ** 2 + jnp.log(2.0 * jnp.pi), axis=-1)
 
 
+def compute_per_sample_dynamics_nll(
+    dads_network: DADSNetworks,
+    state_dim: int,
+    dyn_params: Params,
+    transitions: Transition,
+    use_xy_prior: bool = False,
+    goal_indices: Optional[jnp.ndarray] = None,
+    non_goal_indices: Optional[jnp.ndarray] = None,
+) -> jnp.ndarray:
+    """Compute per-sample negative log-likelihood for the dynamics model.
+    
+    This is the shared logic used by both the loss function (for training)
+    and metrics computation (for logging).
+    
+    Args:
+        dads_network: DADS networks container.
+        state_dim:    Dimension of the raw state (no skill appended).
+        dyn_params:   Skill dynamics network parameters.
+        transitions:  Batch of transitions with skill labels in extras.
+        use_xy_prior: If True, only predict goal_indices differences and exclude goal_indices from input.
+        goal_indices: Indices of x-y coordinates. Required if use_xy_prior=True.
+        non_goal_indices: Precomputed indices not in goal_indices. Required if use_xy_prior=True.
+    
+    Returns:
+        Per-sample NLL, shape (batch_size,).
+    """
+    delta_s, dynamics_input, _, _ = _prepare_dynamics_inputs(
+        transitions, state_dim, use_xy_prior, goal_indices, non_goal_indices
+    )
+
+    # Normalize inputs using batch statistics (batch normalization on input)
+    input_mean = jnp.mean(dynamics_input, axis=0, keepdims=True)  # (1, input_size)
+    input_std = jnp.std(dynamics_input, axis=0, keepdims=True) + 1e-8  # (1, input_size)
+    dynamics_input_norm = (dynamics_input - input_mean) / input_std
+
+    # Network outputs mean (covariance is identity)
+    mean = dads_network.skill_dynamics_network.apply(None, dyn_params, dynamics_input_norm)  # (B, output_size)
+
+    # Normalize targets using batch statistics (as per paper)
+    target_mean = jnp.mean(delta_s, axis=0, keepdims=True)  # (1, output_size)
+    target_std = jnp.std(delta_s, axis=0, keepdims=True) + 1e-8  # (1, output_size)
+    delta_s_norm = (delta_s - target_mean) / target_std
+    mean_norm = (mean - target_mean) / target_std
+
+    log_prob = _gaussian_log_prob_sum_identity_cov(delta_s_norm, mean_norm)  # (B,)
+    return -log_prob  # (B,) per-sample NLL
+
+
 def skill_dynamics_loss_fn(
     dads_network: DADSNetworks,
     state_dim: int,
@@ -105,26 +153,12 @@ def skill_dynamics_loss_fn(
     Returns:
         Scalar mean NLL loss.
     """
-    delta_s, dynamics_input, _, _ = _prepare_dynamics_inputs(
-        transitions, state_dim, use_xy_prior, goal_indices, non_goal_indices
+    per_sample_nll = compute_per_sample_dynamics_nll(
+        dads_network, state_dim, dyn_params, transitions,
+        use_xy_prior=use_xy_prior, goal_indices=goal_indices,
+        non_goal_indices=non_goal_indices
     )
-
-    # Normalize inputs using batch statistics (batch normalization on input)
-    input_mean = jnp.mean(dynamics_input, axis=0, keepdims=True)  # (1, input_size)
-    input_std = jnp.std(dynamics_input, axis=0, keepdims=True) + 1e-8  # (1, input_size)
-    dynamics_input_norm = (dynamics_input - input_mean) / input_std
-
-    # Network outputs mean (covariance is identity)
-    mean = dads_network.skill_dynamics_network.apply(None, dyn_params, dynamics_input_norm)  # (B, output_size)
-
-    # Normalize targets using batch statistics (as per paper)
-    target_mean = jnp.mean(delta_s, axis=0, keepdims=True)  # (1, output_size)
-    target_std = jnp.std(delta_s, axis=0, keepdims=True) + 1e-8  # (1, output_size)
-    delta_s_norm = (delta_s - target_mean) / target_std
-    mean_norm = (mean - target_mean) / target_std
-
-    log_prob = _gaussian_log_prob_sum_identity_cov(delta_s_norm, mean_norm)  # (B,)
-    return -jnp.mean(log_prob)
+    return jnp.mean(per_sample_nll)
 
 
 def compute_dads_reward(

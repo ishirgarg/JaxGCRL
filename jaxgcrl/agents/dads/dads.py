@@ -448,30 +448,15 @@ class DADS:
 
             # Also compute per-sample log q(s'|s,z) for the actual skill
             # (used for per-skill NLL metrics).
-            # Reuse the same preprocessing logic as the loss function
-            delta_s, dynamics_input, _, _ = dads_losses._prepare_dynamics_inputs(
-                transitions, state_dim, self.use_xy_prior, goal_indices, non_goal_indices
-            )
+            # Extract skills for per-skill metrics
+            skills = transitions.extras["state_extras"]["skill"]  # (B, num_skills)
             
-            # Normalize inputs and targets using batch statistics (as per paper)
-            input_mean = jnp.mean(dynamics_input, axis=0, keepdims=True)
-            input_std = jnp.std(dynamics_input, axis=0, keepdims=True) + 1e-8
-            dynamics_input_norm = (dynamics_input - input_mean) / input_std
-            
-            target_mean = jnp.mean(delta_s, axis=0, keepdims=True)
-            target_std = jnp.std(delta_s, axis=0, keepdims=True) + 1e-8
-            delta_s_norm = (delta_s - target_mean) / target_std
-            
-            dyn_mean = dads_network.skill_dynamics_network.apply(
-                None, training_state.dynamics_params, dynamics_input_norm
-            )  # (B, output_size) - only mean, covariance is identity
-            dyn_mean_norm = (dyn_mean - target_mean) / target_std
-            
-            # Per-sample NLL: -log q(s'|s,z_actual) with identity covariance
-            per_sample_log_prob = dads_losses._gaussian_log_prob_sum_identity_cov(
-                delta_s_norm, dyn_mean_norm
+            # Reuse the same computation as the loss function
+            per_sample_nll = dads_losses.compute_per_sample_dynamics_nll(
+                dads_network, state_dim, training_state.dynamics_params, transitions,
+                use_xy_prior=self.use_xy_prior, goal_indices=goal_indices,
+                non_goal_indices=non_goal_indices
             )  # (B,)
-            per_sample_nll = -per_sample_log_prob  # (B,)
 
             # Replace the stored (env) reward with the DADS intrinsic reward
             transitions = transitions._replace(reward=dads_reward)
