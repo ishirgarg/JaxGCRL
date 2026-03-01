@@ -190,6 +190,8 @@ class DIAYN:
         h_dim: Hidden layer dimension for all MLPs.
         n_hidden: Number of hidden layers for all MLPs.
         use_ln: Use layer normalisation in MLPs.
+        use_xy_prior: If True, restrict discriminator to only receive x-y state
+            coordinates (at goal_indices). Requires environment to have goal_indices.
     """
 
     num_skills: int = 8
@@ -207,6 +209,7 @@ class DIAYN:
     h_dim: int = 256
     n_hidden: int = 4
     use_ln: bool = False
+    use_xy_prior: bool = False
 
     # ------------------------------------------------------------------
     def train_fn(
@@ -255,6 +258,13 @@ class DIAYN:
         # state_dim: dimensionality of the raw environment state (no goal/skill)
         unwrapped_env = train_env
         state_dim: int = unwrapped_env.state_dim
+        goal_indices = getattr(unwrapped_env, "goal_indices", None)
+
+        if self.use_xy_prior and goal_indices is None:
+            raise ValueError(
+                "use_xy_prior=True requires the environment to have goal_indices. "
+                "The environment does not have this attribute."
+            )
 
         # Augmented observation size seen by the policy and Q-network
         diayn_obs_size: int = state_dim + num_skills
@@ -330,6 +340,8 @@ class DIAYN:
             preprocess_observations_fn=normalize_fn,
             hidden_layer_sizes=[self.h_dim] * self.n_hidden,
             layer_norm=self.use_ln,
+            use_xy_prior=self.use_xy_prior,
+            goal_indices=goal_indices,
         )
         make_policy = diayn_networks.make_inference_fn(diayn_network)
 

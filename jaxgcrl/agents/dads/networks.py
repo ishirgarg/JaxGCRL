@@ -9,7 +9,7 @@ Architecture:
                             where delta_s = s' - s  (size 2 * state_dim)
 """
 
-from typing import Any, Callable, Sequence, Tuple
+from typing import Any, Callable, Optional, Sequence, Tuple
 
 import flax
 import jax
@@ -41,9 +41,10 @@ class MLP(linen.Module):
     activate_final: bool = False
     bias: bool = True
     layer_norm: bool = False
+    batch_norm: bool = False
 
     @linen.compact
-    def __call__(self, data: jnp.ndarray):
+    def __call__(self, data: jnp.ndarray, training: bool = True):
         hidden = data
         for i, hidden_size in enumerate(self.layer_sizes):
             hidden = linen.Dense(
@@ -53,7 +54,9 @@ class MLP(linen.Module):
                 use_bias=self.bias,
             )(hidden)
             if i != len(self.layer_sizes) - 1 or self.activate_final:
-                if self.layer_norm:
+                if self.batch_norm:
+                    hidden = linen.BatchNorm(use_running_average=not training)(hidden)
+                elif self.layer_norm:
                     hidden = linen.LayerNorm()(hidden)
                 hidden = self.activation(hidden)
         return hidden
@@ -132,11 +135,23 @@ def make_skill_dynamics_network(
     hidden_layer_sizes: Sequence[int] = (256, 256),
     activation: ActivationFn = linen.relu,
     layer_norm: bool = False,
+    batch_norm: bool = True,
+    use_xy_prior: bool = False,
+    goal_indices: Optional[jnp.ndarray] = None,
 ) -> networks.FeedForwardNetwork:
     """Creates the skill dynamics network q_phi(s' | s, z).
 
-    The network takes [s | z] as input and outputs (mean, log_std) for the
-    diagonal Gaussian over delta_s = s' - s.  Output size is 2 * state_size.
+    The network takes [s | z] as input and outputs mean for the
+    diagonal Gaussian over delta_s = s' - s with identity covariance.
+    Output size is state_size (only means, no log_std).
+
+    When use_xy_prior=True:
+    - Input: state WITHOUT goal_indices + skill
+    - Output: only goal_indices differences (e.g., 2 outputs for x-y)
+
+    Note: Batch normalization is applied in the loss function using batch statistics
+    (as per paper: "We normalize the output targets using their batch-average and 
+    batch-standard deviation, similar to batch-normalization").
 
     Args:
         state_size: Dimension of the raw environment state (no skill appended).
@@ -144,23 +159,36 @@ def make_skill_dynamics_network(
         hidden_layer_sizes: Hidden layer sizes for the MLP.
         activation: Activation function.
         layer_norm: Whether to use layer normalisation.
+        batch_norm: Whether to use batch normalisation (currently handled in loss function).
+        use_xy_prior: If True, only predict goal_indices differences and exclude goal_indices from input.
+        goal_indices: Indices of x-y coordinates. Required if use_xy_prior=True.
     """
-    input_size = state_size + num_skills
-    output_size = 2 * state_size  # (mean, log_std) each of size state_size
+    if use_xy_prior:
+        if goal_indices is None:
+            raise ValueError("goal_indices must be provided when use_xy_prior=True")
+        # Input: state without goal_indices + skill
+        input_size = (state_size - len(goal_indices)) + num_skills
+        # Output: only goal_indices differences
+        output_size = len(goal_indices)
+    else:
+        input_size = state_size + num_skills
+        output_size = state_size  # Only mean, covariance is fixed to identity
 
     dyn_module = MLP(
         layer_sizes=list(hidden_layer_sizes) + [output_size],
         activation=activation,
         layer_norm=layer_norm,
+        batch_norm=False,  # Batch norm handled via normalization in loss function
     )
 
     def apply(processor_params, dyn_params, state_skill_input):
         # processor_params intentionally unused: dynamics network sees raw [s|z]
-        return dyn_module.apply(dyn_params, state_skill_input)
+        # Note: Input normalization happens in loss function using batch statistics
+        return dyn_module.apply(dyn_params, state_skill_input, training=True)
 
     dummy_input = jnp.zeros((1, input_size))
     return networks.FeedForwardNetwork(
-        init=lambda key: dyn_module.init(key, dummy_input), apply=apply
+        init=lambda key: dyn_module.init(key, dummy_input, training=True), apply=apply
     )
 
 
@@ -198,6 +226,8 @@ def make_dads_networks(
     hidden_layer_sizes: Sequence[int] = (256, 256),
     activation: networks.ActivationFn = linen.relu,
     layer_norm: bool = False,
+    use_xy_prior: bool = False,
+    goal_indices: Optional[jnp.ndarray] = None,
 ) -> DADSNetworks:
     """Build all DADS networks.
 
@@ -239,6 +269,8 @@ def make_dads_networks(
         hidden_layer_sizes=hidden_layer_sizes,
         activation=activation,
         layer_norm=layer_norm,
+        use_xy_prior=use_xy_prior,
+        goal_indices=goal_indices,
     )
     return DADSNetworks(
         policy_network=policy_network,

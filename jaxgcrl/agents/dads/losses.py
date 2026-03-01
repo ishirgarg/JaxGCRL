@@ -7,7 +7,7 @@ Contains:
 - DADS intrinsic reward: r(s, z, s') = log q(s'|s,z) - log[(1/K) Σ_z' q(s'|s,z')]
 """
 
-from typing import Any
+from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -23,25 +23,23 @@ _PMAP_AXIS_NAME = "i"
 Transition = Any  # Will be the Transition NamedTuple from dads.py
 
 
-def _gaussian_log_prob_sum(
+def _gaussian_log_prob_sum_identity_cov(
     x: jnp.ndarray,
     mean: jnp.ndarray,
-    log_std: jnp.ndarray,
 ) -> jnp.ndarray:
-    """Log probability of ``x`` under N(mean, exp(log_std)^2), summed over the last dim.
+    """Log probability of ``x`` under N(mean, I), summed over the last dim.
+
+    Uses identity covariance matrix (as per DADS paper).
 
     Args:
-        x:       Target values, shape (..., D).
-        mean:    Predicted mean,  shape (..., D).
-        log_std: Predicted log-std, shape (..., D).
+        x:    Target values, shape (..., D).
+        mean: Predicted mean,  shape (..., D).
 
     Returns:
         Scalar-per-sample log probability, shape (...,).
     """
-    return -0.5 * jnp.sum(
-        ((x - mean) ** 2) * jnp.exp(-2.0 * log_std) + 2.0 * log_std + jnp.log(2.0 * jnp.pi),
-        axis=-1,
-    )
+    # With identity covariance: log p(x|mean) = -0.5 * ||x - mean||^2 - 0.5*D*log(2*pi)
+    return -0.5 * jnp.sum((x - mean) ** 2 + jnp.log(2.0 * jnp.pi), axis=-1)
 
 
 def skill_dynamics_loss_fn(
@@ -49,16 +47,23 @@ def skill_dynamics_loss_fn(
     state_dim: int,
     dyn_params: Params,
     transitions: Transition,
+    use_xy_prior: bool = False,
+    goal_indices: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """Negative log-likelihood loss for the skill dynamics model.
 
-    Trains q_phi(s' | s, z) = N(s + mean_phi(s,z), diag(exp(log_std_phi(s,z))^2)).
+    Trains q_phi(s' | s, z) = N(mean_phi(s,z), I) with identity covariance.
+
+    As per paper: "We normalize the output targets using their batch-average and 
+    batch-standard deviation, similar to batch-normalization."
 
     Args:
         dads_network: DADS networks container.
         state_dim:    Dimension of the raw state (no skill appended).
         dyn_params:   Skill dynamics network parameters.
         transitions:  Batch of transitions with skill labels in extras.
+        use_xy_prior: If True, only predict goal_indices differences and exclude goal_indices from input.
+        goal_indices: Indices of x-y coordinates. Required if use_xy_prior=True.
 
     Returns:
         Scalar mean NLL loss.
@@ -66,14 +71,40 @@ def skill_dynamics_loss_fn(
     states      = transitions.observation[:, :state_dim]       # (B, state_dim)
     next_states = transitions.next_observation[:, :state_dim]  # (B, state_dim)
     skills      = transitions.extras["state_extras"]["skill"]  # (B, num_skills)
-    delta_s     = next_states - states                         # (B, state_dim)
+    
+    if use_xy_prior:
+        # Extract state without goal_indices for input
+        # Create mask to exclude goal_indices
+        all_indices = jnp.arange(state_dim)
+        # Create boolean mask: True for indices NOT in goal_indices
+        mask = jnp.ones(state_dim, dtype=bool)
+        mask = mask.at[goal_indices].set(False)
+        state_without_xy = states[:, mask]  # (B, state_dim - len(goal_indices))
+        
+        # Only compute delta_s for goal_indices
+        delta_s = next_states[:, goal_indices] - states[:, goal_indices]  # (B, len(goal_indices))
+        
+        # Input: state without goal_indices + skill
+        dynamics_input = jnp.concatenate([state_without_xy, skills], axis=-1)  # (B, state_dim - len(goal_indices) + num_skills)
+    else:
+        delta_s = next_states - states  # (B, state_dim)
+        dynamics_input = jnp.concatenate([states, skills], axis=-1)  # (B, state_dim+num_skills)
 
-    dynamics_input = jnp.concatenate([states, skills], axis=-1)  # (B, state_dim+num_skills)
-    output  = dads_network.skill_dynamics_network.apply(None, dyn_params, dynamics_input)
-    mean    = output[:, :state_dim]   # (B, state_dim)
-    log_std = output[:, state_dim:]   # (B, state_dim)
+    # Normalize inputs using batch statistics (batch normalization on input)
+    input_mean = jnp.mean(dynamics_input, axis=0, keepdims=True)  # (1, input_size)
+    input_std = jnp.std(dynamics_input, axis=0, keepdims=True) + 1e-8  # (1, input_size)
+    dynamics_input_norm = (dynamics_input - input_mean) / input_std
 
-    log_prob = _gaussian_log_prob_sum(delta_s, mean, log_std)  # (B,)
+    # Network outputs mean (covariance is identity)
+    mean = dads_network.skill_dynamics_network.apply(None, dyn_params, dynamics_input_norm)  # (B, output_size)
+
+    # Normalize targets using batch statistics (as per paper)
+    target_mean = jnp.mean(delta_s, axis=0, keepdims=True)  # (1, output_size)
+    target_std = jnp.std(delta_s, axis=0, keepdims=True) + 1e-8  # (1, output_size)
+    delta_s_norm = (delta_s - target_mean) / target_std
+    mean_norm = (mean - target_mean) / target_std
+
+    log_prob = _gaussian_log_prob_sum_identity_cov(delta_s_norm, mean_norm)  # (B,)
     return -jnp.mean(log_prob)
 
 
@@ -83,6 +114,8 @@ def compute_dads_reward(
     num_skills: int,
     dyn_params: Params,
     transitions: Transition,
+    use_xy_prior: bool = False,
+    goal_indices: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """Compute DADS intrinsic reward.
 
@@ -93,12 +126,16 @@ def compute_dads_reward(
 
     This maximises the mutual information I(s'; z | s).
 
+    Uses identity covariance and batch normalization as per paper.
+
     Args:
         dads_network: DADS networks container.
         state_dim:    Dimension of the raw state (no skill appended).
         num_skills:   Number of discrete skills K.
         dyn_params:   Skill dynamics network parameters.
         transitions:  Batch of transitions with skill labels in extras.
+        use_xy_prior: If True, only predict goal_indices differences and exclude goal_indices from input.
+        goal_indices: Indices of x-y coordinates. Required if use_xy_prior=True.
 
     Returns:
         Array of intrinsic rewards, shape (batch_size,).
@@ -106,37 +143,79 @@ def compute_dads_reward(
     states      = transitions.observation[:, :state_dim]       # (B, state_dim)
     next_states = transitions.next_observation[:, :state_dim]  # (B, state_dim)
     skills      = transitions.extras["state_extras"]["skill"]  # (B, num_skills)
-    delta_s     = next_states - states                         # (B, state_dim)
-
+    
     B = states.shape[0]
 
+    if use_xy_prior:
+        # Extract state without goal_indices for input
+        # Create mask to exclude goal_indices
+        all_indices = jnp.arange(state_dim)
+        # Create boolean mask: True for indices NOT in goal_indices
+        mask = jnp.ones(state_dim, dtype=bool)
+        mask = mask.at[goal_indices].set(False)
+        state_without_xy = states[:, mask]  # (B, state_dim - len(goal_indices))
+        
+        # Only compute delta_s for goal_indices
+        delta_s = next_states[:, goal_indices] - states[:, goal_indices]  # (B, len(goal_indices))
+        
+        # Input: state without goal_indices + skill
+        dynamics_input = jnp.concatenate([state_without_xy, skills], axis=-1)  # (B, state_dim - len(goal_indices) + num_skills)
+    else:
+        delta_s = next_states - states  # (B, state_dim)
+        dynamics_input = jnp.concatenate([states, skills], axis=-1)  # (B, state_dim+K)
+
+    # Normalize targets using batch statistics (as per paper)
+    target_mean = jnp.mean(delta_s, axis=0, keepdims=True)  # (1, output_size)
+    target_std = jnp.std(delta_s, axis=0, keepdims=True) + 1e-8  # (1, output_size)
+    delta_s_norm = (delta_s - target_mean) / target_std
+
     # ---- log q(s'|s,z) for the *actual* skill --------------------------------
-    dynamics_input = jnp.concatenate([states, skills], axis=-1)  # (B, state_dim+K)
-    output  = dads_network.skill_dynamics_network.apply(None, dyn_params, dynamics_input)
-    mean    = output[:, :state_dim]
-    log_std = output[:, state_dim:]
-    log_q_z = _gaussian_log_prob_sum(delta_s, mean, log_std)  # (B,)
+    # Normalize input using batch statistics
+    input_mean = jnp.mean(dynamics_input, axis=0, keepdims=True)  # (1, input_size)
+    input_std = jnp.std(dynamics_input, axis=0, keepdims=True) + 1e-8  # (1, input_size)
+    dynamics_input_norm = (dynamics_input - input_mean) / input_std
+    
+    mean = dads_network.skill_dynamics_network.apply(None, dyn_params, dynamics_input_norm)  # (B, output_size)
+    mean_norm = (mean - target_mean) / target_std
+    log_q_z = _gaussian_log_prob_sum_identity_cov(delta_s_norm, mean_norm)  # (B,)
 
     # ---- log q(s'|s,z') for *all* skills z' -----------------------------------
     # Build (B, K) grid: each sample paired with every skill.
     all_skills = jnp.eye(num_skills, dtype=jnp.float32)  # (K, num_skills)
 
-    # Broadcast to (B, K, state_dim) and (B, K, num_skills)
-    states_bk  = jnp.broadcast_to(states[:, None, :],     (B, num_skills, state_dim))
-    skills_bk  = jnp.broadcast_to(all_skills[None, :, :], (B, num_skills, num_skills))
-    delta_s_bk = jnp.broadcast_to(delta_s[:, None, :],    (B, num_skills, state_dim))
+    if use_xy_prior:
+        # Broadcast state without xy and skills
+        state_without_xy_bk = jnp.broadcast_to(state_without_xy[:, None, :], (B, num_skills, state_dim - len(goal_indices)))
+        skills_bk = jnp.broadcast_to(all_skills[None, :, :], (B, num_skills, num_skills))
+        delta_s_bk_norm = jnp.broadcast_to(delta_s_norm[:, None, :], (B, num_skills, len(goal_indices)))
+        
+        # Flatten to (B*K, ...)
+        flat_input = jnp.reshape(jnp.concatenate([state_without_xy_bk, skills_bk], axis=-1),
+                                 (B * num_skills, state_dim - len(goal_indices) + num_skills))
+    else:
+        # Broadcast to (B, K, state_dim) and (B, K, num_skills)
+        states_bk = jnp.broadcast_to(states[:, None, :], (B, num_skills, state_dim))
+        skills_bk = jnp.broadcast_to(all_skills[None, :, :], (B, num_skills, num_skills))
+        delta_s_bk_norm = jnp.broadcast_to(delta_s_norm[:, None, :], (B, num_skills, state_dim))
+        
+        # Flatten to (B*K, ...)
+        flat_input = jnp.reshape(jnp.concatenate([states_bk, skills_bk], axis=-1),
+                                 (B * num_skills, state_dim + num_skills))
+    
+    # Normalize flat input using batch statistics
+    flat_input_mean = jnp.mean(flat_input, axis=0, keepdims=True)  # (1, input_size)
+    flat_input_std = jnp.std(flat_input, axis=0, keepdims=True) + 1e-8  # (1, input_size)
+    flat_input_norm = (flat_input - flat_input_mean) / flat_input_std
 
-    # Flatten to (B*K, ...)
-    flat_input   = jnp.reshape(jnp.concatenate([states_bk, skills_bk], axis=-1),
-                               (B * num_skills, state_dim + num_skills))
-    flat_delta_s = jnp.reshape(delta_s_bk, (B * num_skills, state_dim))
+    flat_mean = dads_network.skill_dynamics_network.apply(None, dyn_params, flat_input_norm)  # (B*K, output_size)
+    flat_mean_norm = (flat_mean - target_mean) / target_std
 
-    flat_output    = dads_network.skill_dynamics_network.apply(None, dyn_params, flat_input)
-    flat_mean      = flat_output[:, :state_dim]
-    flat_log_std   = flat_output[:, state_dim:]
-
-    flat_log_probs = _gaussian_log_prob_sum(flat_delta_s, flat_mean, flat_log_std)  # (B*K,)
-    all_log_probs  = jnp.reshape(flat_log_probs, (B, num_skills))  # (B, K)
+    output_size = len(goal_indices) if use_xy_prior else state_dim
+    flat_log_probs = _gaussian_log_prob_sum_identity_cov(
+        jnp.reshape(delta_s_bk_norm, (B * num_skills, output_size)),
+        flat_mean_norm
+    )  # (B*K,)
+    all_log_probs = jnp.reshape(flat_log_probs, (B, num_skills))  # (B, K)
 
     # log[ (1/K) Σ_{z'} q(s'|s,z') ]  =  logsumexp(all_log_probs) - log(K)
     log_marginal = jax.scipy.special.logsumexp(all_log_probs, axis=-1) - jnp.log(num_skills)
@@ -148,6 +227,8 @@ def make_skill_dynamics_update_fn(
     dads_network: DADSNetworks,
     state_dim: int,
     dynamics_optimizer: optax.GradientTransformation,
+    use_xy_prior: bool = False,
+    goal_indices: Optional[jnp.ndarray] = None,
 ):
     """Create the skill dynamics update function.
 
@@ -155,13 +236,18 @@ def make_skill_dynamics_update_fn(
         dads_network:       DADS networks container.
         state_dim:          Dimension of the raw state (no skill appended).
         dynamics_optimizer: Optimizer for the skill dynamics network.
+        use_xy_prior:       If True, only predict goal_indices differences and exclude goal_indices from input.
+        goal_indices:       Indices of x-y coordinates. Required if use_xy_prior=True.
 
     Returns:
         Update function ``(dyn_params, transitions, optimizer_state, key)``
         → ``(loss, new_params, new_optimizer_state)``.
     """
     def loss_fn(dyn_params, transitions):
-        return skill_dynamics_loss_fn(dads_network, state_dim, dyn_params, transitions)
+        return skill_dynamics_loss_fn(
+            dads_network, state_dim, dyn_params, transitions,
+            use_xy_prior=use_xy_prior, goal_indices=goal_indices
+        )
 
     return gradients.gradient_update_fn(
         loss_fn,

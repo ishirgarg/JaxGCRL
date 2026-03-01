@@ -8,7 +8,7 @@ Architecture:
   - discriminator_network: MLP taking [state]                 -> logits over num_skills
 """
 
-from typing import Any, Callable, Sequence, Tuple
+from typing import Any, Callable, Optional, Sequence, Tuple
 
 import flax
 import jax
@@ -130,12 +130,29 @@ def make_discriminator_network(
     hidden_layer_sizes: Sequence[int] = (256, 256),
     activation: ActivationFn = linen.relu,
     layer_norm: bool = False,
+    use_xy_prior: bool = False,
+    goal_indices: Optional[jnp.ndarray] = None,
 ) -> networks.FeedForwardNetwork:
     """Creates a discriminator q_phi(z | s) -> logits over num_skills classes.
 
     The discriminator takes only the *state* (no skill) and predicts which
     skill was used to produce that state transition.
+
+    Args:
+        state_size: Full state dimension.
+        num_skills: Number of skills.
+        hidden_layer_sizes: Hidden layer sizes.
+        activation: Activation function.
+        layer_norm: Whether to use layer normalization.
+        use_xy_prior: If True, only use x-y coordinates (at goal_indices) as input.
+        goal_indices: Indices of x-y coordinates in the state. Required if use_xy_prior=True.
     """
+    if use_xy_prior:
+        if goal_indices is None:
+            raise ValueError("goal_indices must be provided when use_xy_prior=True")
+        input_size = len(goal_indices)
+    else:
+        input_size = state_size
 
     disc_module = MLP(
         layer_sizes=list(hidden_layer_sizes) + [num_skills],
@@ -146,11 +163,14 @@ def make_discriminator_network(
     def apply(processor_params, disc_params, state):
         # processor_params is intentionally unused: the discriminator sees raw
         # states, not the skill-augmented observation.
+        if use_xy_prior:
+            # Extract only x-y coordinates
+            state = state[:, goal_indices]
         return disc_module.apply(disc_params, state)
 
-    dummy_state = jnp.zeros((1, state_size))
+    dummy_input = jnp.zeros((1, input_size))
     return networks.FeedForwardNetwork(
-        init=lambda key: disc_module.init(key, dummy_state), apply=apply
+        init=lambda key: disc_module.init(key, dummy_input), apply=apply
     )
 
 
@@ -188,6 +208,8 @@ def make_diayn_networks(
     hidden_layer_sizes: Sequence[int] = (256, 256),
     activation: networks.ActivationFn = linen.relu,
     layer_norm: bool = False,
+    use_xy_prior: bool = False,
+    goal_indices: Optional[jnp.ndarray] = None,
 ) -> DIAYNNetworks:
     """Build all DIAYN networks.
 
@@ -229,6 +251,8 @@ def make_diayn_networks(
         hidden_layer_sizes=hidden_layer_sizes,
         activation=activation,
         layer_norm=layer_norm,
+        use_xy_prior=use_xy_prior,
+        goal_indices=goal_indices,
     )
     return DIAYNNetworks(
         policy_network=policy_network,

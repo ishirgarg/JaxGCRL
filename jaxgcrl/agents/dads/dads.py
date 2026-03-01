@@ -191,8 +191,9 @@ class DADS:
         h_dim:             Hidden layer width for all MLPs.
         n_hidden:          Number of hidden layers for all MLPs.
         use_ln:            Use layer normalisation in MLPs.
-        log_std_min:       Lower clip on the dynamics model's log-std output.
-        log_std_max:       Upper clip on the dynamics model's log-std output.
+        use_xy_prior:      If True, restrict dynamics network to only predict goal_indices
+                           differences (e.g., x-y) and exclude goal_indices from input.
+                           Requires environment to have goal_indices.
     """
 
     num_skills: int = 8
@@ -210,6 +211,7 @@ class DADS:
     h_dim: int = 256
     n_hidden: int = 4
     use_ln: bool = False
+    use_xy_prior: bool = False
 
     # ------------------------------------------------------------------
     def train_fn(
@@ -258,6 +260,13 @@ class DADS:
         # state_dim: dimensionality of the raw environment state (no goal/skill)
         unwrapped_env = train_env
         state_dim: int = unwrapped_env.state_dim
+        goal_indices = getattr(unwrapped_env, "goal_indices", None)
+
+        if self.use_xy_prior and goal_indices is None:
+            raise ValueError(
+                "use_xy_prior=True requires the environment to have goal_indices. "
+                "The environment does not have this attribute."
+            )
 
         # Augmented observation size seen by the policy and Q-network
         dads_obs_size: int = state_dim + num_skills
@@ -333,6 +342,8 @@ class DADS:
             preprocess_observations_fn=normalize_fn,
             hidden_layer_sizes=[self.h_dim] * self.n_hidden,
             layer_norm=self.use_ln,
+            use_xy_prior=self.use_xy_prior,
+            goal_indices=goal_indices,
         )
         make_policy = dads_networks.make_inference_fn(dads_network)
 
@@ -399,7 +410,9 @@ class DADS:
         )
 
         dynamics_update = dads_losses.make_skill_dynamics_update_fn(
-            dads_network, state_dim, dynamics_optimizer
+            dads_network, state_dim, dynamics_optimizer,
+            use_xy_prior=self.use_xy_prior,
+            goal_indices=goal_indices,
         )
 
         # ------------------------------------------------------------------
@@ -420,6 +433,8 @@ class DADS:
                 num_skills,
                 training_state.dynamics_params,
                 transitions,
+                use_xy_prior=self.use_xy_prior,
+                goal_indices=goal_indices,
             )
 
             # Also compute per-sample log q(s'|s,z) for the actual skill
@@ -427,18 +442,42 @@ class DADS:
             states      = transitions.observation[:, :state_dim]
             next_states = transitions.next_observation[:, :state_dim]
             skills      = transitions.extras["state_extras"]["skill"]
-            delta_s     = next_states - states
-            dynamics_input = jnp.concatenate([states, skills], axis=-1)
-            dyn_output  = dads_network.skill_dynamics_network.apply(
-                None, training_state.dynamics_params, dynamics_input
-            )
-            dyn_mean    = dyn_output[:, :state_dim]
-            dyn_log_std = dyn_output[:, state_dim:]
-            # Per-sample NLL: -log q(s'|s,z_actual)
+            
+            if self.use_xy_prior:
+                # Extract state without goal_indices for input
+                # Create mask to exclude goal_indices
+                all_indices = jnp.arange(state_dim)
+                # Create boolean mask: True for indices NOT in goal_indices
+                mask = jnp.ones(state_dim, dtype=bool)
+                mask = mask.at[goal_indices].set(False)
+                state_without_xy = states[:, mask]  # (B, state_dim - len(goal_indices))
+                
+                # Only compute delta_s for goal_indices
+                delta_s = next_states[:, goal_indices] - states[:, goal_indices]  # (B, len(goal_indices))
+                
+                # Input: state without goal_indices + skill
+                dynamics_input = jnp.concatenate([state_without_xy, skills], axis=-1)
+            else:
+                delta_s = next_states - states  # (B, state_dim)
+                dynamics_input = jnp.concatenate([states, skills], axis=-1)
+            
+            # Normalize inputs and targets using batch statistics (as per paper)
+            input_mean = jnp.mean(dynamics_input, axis=0, keepdims=True)
+            input_std = jnp.std(dynamics_input, axis=0, keepdims=True) + 1e-8
+            dynamics_input_norm = (dynamics_input - input_mean) / input_std
+            
+            target_mean = jnp.mean(delta_s, axis=0, keepdims=True)
+            target_std = jnp.std(delta_s, axis=0, keepdims=True) + 1e-8
+            delta_s_norm = (delta_s - target_mean) / target_std
+            
+            dyn_mean = dads_network.skill_dynamics_network.apply(
+                None, training_state.dynamics_params, dynamics_input_norm
+            )  # (B, output_size) - only mean, covariance is identity
+            dyn_mean_norm = (dyn_mean - target_mean) / target_std
+            
+            # Per-sample NLL: -log q(s'|s,z_actual) with identity covariance
             per_sample_log_prob = -0.5 * jnp.sum(
-                ((delta_s - dyn_mean) ** 2) * jnp.exp(-2.0 * dyn_log_std)
-                + 2.0 * dyn_log_std
-                + jnp.log(2.0 * jnp.pi),
+                (delta_s_norm - dyn_mean_norm) ** 2 + jnp.log(2.0 * jnp.pi),
                 axis=-1,
             )  # (B,)
             per_sample_nll = -per_sample_log_prob  # (B,)
