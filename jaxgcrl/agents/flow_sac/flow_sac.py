@@ -171,7 +171,7 @@ class FlowSAC:
         prefill_steps_per_skill: Environment steps collected per skill during Phase 1.
         distill_steps:          Number of distillation gradient steps (Phase 2a).
         distill_viz_freq:       Visualise flow policy every N distillation steps.
-        critic_warmup_steps:    Critic-only gradient steps before SAC (Phase 2b).
+        num_warmup_steps:       Environment steps during which only critic is updated (no actor/alpha).
         hutchinson_samples:     Rademacher vectors for Hutchinson trace estimator.
         n_ode_steps:            Fixed Euler steps for CNF ODE integration.
         learning_rate:          Learning rate for all optimisers.
@@ -197,7 +197,7 @@ class FlowSAC:
     prefill_steps_per_skill: int = 5_000
     distill_steps: int = 50_000
     distill_viz_freq: int = 5_000
-    critic_warmup_steps: int = 10_000
+    num_warmup_steps: int = 0
 
     hutchinson_samples: int = 1
     n_ode_steps: int = 10
@@ -269,11 +269,6 @@ class FlowSAC:
                     "(array of candidate goals) to be set on the environment. "
                     "Found neither 'possible_goals' nor a fallback."
                 )
-            goal_dim = goal_set.shape[-1]
-        else:
-            # In pure SAC mode we don't use goal_set directly (the environment
-            # still needs to provide goal-conditioned observations [state | goal]).
-            goal_dim = obs_size - state_dim
 
         if isinstance(train_env, envs.Env):
             wrap_for_training = envs.training.wrap
@@ -301,6 +296,14 @@ class FlowSAC:
 
         obs_size = env.observation_size   # state_dim + goal_dim
         action_size = env.action_size
+        
+        # Calculate goal_dim now that we have obs_size
+        if use_distillation:
+            goal_dim = goal_set.shape[-1]
+        else:
+            # In pure SAC mode, infer goal_dim from observation size
+            goal_dim = obs_size - state_dim
+            
         assert obs_size == state_dim + goal_dim, (
             f"obs_size {obs_size} != state_dim {state_dim} + goal_dim {goal_dim}. "
             "Make sure the environment observation is [state | goal]."
@@ -590,57 +593,12 @@ class FlowSAC:
         )
 
         # ------------------------------------------------------------------
-        # Phase 2b: Critic warmup step (offline)
-        # ------------------------------------------------------------------
-        def _critic_warmup_step(
-            training_state: TrainingState,
-            buffer_state: ReplayBufferState,
-            key: PRNGKey,
-        ) -> Tuple[TrainingState, ReplayBufferState, Metrics]:
-            buffer_state, transitions = replay_buffer.sample(buffer_state)
-            transitions = jax.tree_util.tree_map(
-                lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"), transitions
-            )
-            B_per_dev = self.batch_size // device_count
-            transitions = jax.tree_util.tree_map(lambda x: x[:B_per_dev], transitions)
-
-            key, critic_key = jax.random.split(key)
-            alpha = jnp.exp(training_state.alpha_params)
-
-            loss, new_q_params, new_q_opt_state = critic_update(
-                training_state.q_params,
-                training_state.velocity_params,
-                training_state.normalizer_params,
-                training_state.target_q_params,
-                alpha,
-                transitions,
-                critic_key,
-                optimizer_state=training_state.q_optimizer_state,
-            )
-
-            new_target_q = jax.tree_util.tree_map(
-                lambda x, y: x * (1 - self.tau) + y * self.tau,
-                training_state.target_q_params,
-                new_q_params,
-            )
-
-            new_state = training_state.replace(
-                q_params=new_q_params,
-                q_optimizer_state=new_q_opt_state,
-                target_q_params=new_target_q,
-            )
-            return new_state, buffer_state, {"critic_warmup/critic_loss": loss}
-
-        _critic_warmup_step_pmapped = jax.pmap(
-            _critic_warmup_step, axis_name=_PMAP_AXIS_NAME
-        )
-
-        # ------------------------------------------------------------------
         # Phase 3: SAC fine-tuning update step
         # ------------------------------------------------------------------
         def sac_update_step(
             carry: Tuple[TrainingState, PRNGKey],
             transitions: Transition,
+            in_warmup: bool = False,
         ) -> Tuple[Tuple[TrainingState, PRNGKey], Metrics]:
             training_state, key = carry
             key, key_alpha, key_critic, key_actor = jax.random.split(key, 4)
@@ -660,25 +618,35 @@ class FlowSAC:
             )
 
             # ---- Actor ----------------------------------------------------
-            actor_loss_val, new_vel_params, new_vel_opt_state = actor_update(
-                training_state.velocity_params,
-                training_state.normalizer_params,
-                training_state.q_params,
-                alpha,
-                transitions,
-                key_actor,
-                optimizer_state=training_state.velocity_optimizer_state,
-            )
+            if in_warmup:
+                # During warmup, don't update actor or alpha
+                new_vel_params = training_state.velocity_params
+                new_vel_opt_state = training_state.velocity_optimizer_state
+                actor_loss_val = 0.0
+                
+                new_alpha_params = training_state.alpha_params
+                new_alpha_opt_state = training_state.alpha_optimizer_state
+                alpha_loss_val = 0.0
+            else:
+                actor_loss_val, new_vel_params, new_vel_opt_state = actor_update(
+                    training_state.velocity_params,
+                    training_state.normalizer_params,
+                    training_state.q_params,
+                    alpha,
+                    transitions,
+                    key_actor,
+                    optimizer_state=training_state.velocity_optimizer_state,
+                )
 
-            # ---- Alpha ----------------------------------------------------
-            alpha_loss_val, new_alpha_params, new_alpha_opt_state = alpha_update(
-                training_state.alpha_params,
-                new_vel_params,  # use updated actor params
-                training_state.normalizer_params,
-                transitions,
-                key_alpha,
-                optimizer_state=training_state.alpha_optimizer_state,
-            )
+                # ---- Alpha ----------------------------------------------------
+                alpha_loss_val, new_alpha_params, new_alpha_opt_state = alpha_update(
+                    training_state.alpha_params,
+                    new_vel_params,  # use updated actor params
+                    training_state.normalizer_params,
+                    transitions,
+                    key_alpha,
+                    optimizer_state=training_state.alpha_optimizer_state,
+                )
 
             # ---- Soft target update ----------------------------------------
             new_target_q = jax.tree_util.tree_map(
@@ -756,6 +724,7 @@ class FlowSAC:
             training_state: TrainingState,
             buffer_state: ReplayBufferState,
             key: PRNGKey,
+            in_warmup: bool = False,
         ) -> Tuple[TrainingState, ReplayBufferState, Metrics]:
             exp_key, train_key, sample_key = jax.random.split(key, 3)
             buffer_state, transitions = replay_buffer.sample(buffer_state)
@@ -772,15 +741,17 @@ class FlowSAC:
             )
 
             (training_state, _), metrics = jax.lax.scan(
-                sac_update_step, (training_state, train_key), transitions
+                lambda carry, trans: sac_update_step(carry, trans, in_warmup),
+                (training_state, train_key),
+                transitions
             )
             return training_state, buffer_state, metrics
 
-        def scan_sac_train_steps(n, ts, bs, key):
+        def scan_sac_train_steps(n, ts, bs, key, in_warmup=False):
             def body(carry, _):
                 ts, bs, key = carry
                 key, new_key = jax.random.split(key)
-                ts, bs, metrics = sac_train_steps(ts, bs, key)
+                ts, bs, metrics = sac_train_steps(ts, bs, key, in_warmup)
                 return (ts, bs, new_key), metrics
 
             return jax.lax.scan(body, (ts, bs, key), (), length=n)
@@ -790,6 +761,7 @@ class FlowSAC:
             env_state: State,
             buffer_state: ReplayBufferState,
             key: PRNGKey,
+            in_warmup: bool = False,
         ) -> Tuple[TrainingState, State, ReplayBufferState, Metrics]:
             exp_key, train_key = jax.random.split(key)
             norm_params, env_state, buffer_state = get_experience(
@@ -804,7 +776,7 @@ class FlowSAC:
                 env_steps=training_state.env_steps + env_steps_per_actor_step,
             )
             training_state, buffer_state, metrics = sac_train_steps(
-                training_state, buffer_state, train_key
+                training_state, buffer_state, train_key, in_warmup
             )
             return training_state, env_state, buffer_state, metrics
 
@@ -827,11 +799,15 @@ class FlowSAC:
         ) -> Tuple[TrainingState, State, ReplayBufferState, Metrics]:
             def f(carry, _):
                 ts, es, bs, k = carry
+                # Check if we're in warmup based on current env_steps
+                in_warmup = ts.env_steps < self.num_warmup_steps
                 k, new_key, up_key = jax.random.split(k, 3)
-                ts, es, bs, metrics = sac_training_step(ts, es, bs, k)
-                (ts, bs, up_key), _ = scan_sac_train_steps(
-                    self.train_step_multiplier - 1, ts, bs, up_key
-                )
+                ts, es, bs, metrics = sac_training_step(ts, es, bs, k, in_warmup)
+                # For additional train steps, also pass in_warmup flag
+                if self.train_step_multiplier > 1:
+                    (ts, bs, up_key), _ = scan_sac_train_steps(
+                        self.train_step_multiplier - 1, ts, bs, up_key, in_warmup
+                    )
                 return (ts, es, bs, new_key), metrics
 
             (training_state, env_state, buffer_state, key), metrics = jax.lax.scan(
@@ -1036,37 +1012,6 @@ class FlowSAC:
 
             logging.info("Phase 2a done. Time: %.1fs", time.time() - t0)
 
-            # -------------------- Phase 2b: Critic warmup ---------------------
-            logging.info("=== Phase 2b: Critic warmup (%d steps) ===", self.critic_warmup_steps)
-            t0 = time.time()
-
-            warmup_key, local_key = jax.random.split(local_key)
-
-            for warmup_step in range(self.critic_warmup_steps):
-                warmup_key, step_key = jax.random.split(warmup_key)
-                step_keys = jax.random.split(step_key, local_devices_to_use)
-                training_state, buffer_state, warmup_metrics = _critic_warmup_step_pmapped(
-                    training_state, buffer_state, step_keys
-                )
-                if warmup_step % 500 == 0:
-                    loss_val = float(
-                        jax.tree_util.tree_map(jnp.mean, warmup_metrics)["critic_warmup/critic_loss"]
-                    )
-                    logging.info(
-                        "  warmup step %d / %d  critic_loss=%.4f",
-                        warmup_step,
-                        self.critic_warmup_steps,
-                        loss_val,
-                    )
-
-                # Log metrics to wandb
-                if process_id == 0:
-                    metrics_dict = dict(jax.tree_util.tree_map(jnp.mean, warmup_metrics))
-                    # Use distill_steps as offset so warmup steps don't overlap with distillation steps
-                    wandb.log(metrics_dict, step=self.distill_steps + warmup_step)
-
-            logging.info("Phase 2b done. Time: %.1fs", time.time() - t0)
-
         # ======================================================================
         # PHASE 3: SAC fine-tuning
         # ======================================================================
@@ -1097,7 +1042,8 @@ class FlowSAC:
             )
 
         training_walltime = 0.0
-        current_step = 0
+        current_step = int(_unpmap(training_state.env_steps))
+        current_step_before = current_step
 
         def sac_epoch_with_timing(training_state, env_state, buffer_state, key):
             nonlocal training_walltime
@@ -1120,6 +1066,10 @@ class FlowSAC:
                 final_metrics[key_str] = value
             return training_state, env_state, buffer_state, final_metrics
 
+        # Check if we should log warmup start
+        if current_step < self.num_warmup_steps and self.num_warmup_steps > 0:
+            logging.info("=== Critic warmup: %d env steps (only critic updates) ===", self.num_warmup_steps)
+
         for eval_epoch_num in range(num_evals_after_init):
             logging.info("SAC step %s", current_step)
 
@@ -1130,6 +1080,11 @@ class FlowSAC:
                 training_state, env_state, buffer_state, epoch_keys
             )
             current_step = int(_unpmap(training_state.env_steps))
+            
+            # Log when warmup completes
+            if current_step >= self.num_warmup_steps and current_step_before < self.num_warmup_steps:
+                logging.info("Critic warmup complete. Starting full SAC training.")
+            current_step_before = current_step
 
             if process_id == 0:
                 if config.checkpoint_logdir:
