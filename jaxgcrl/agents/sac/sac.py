@@ -199,7 +199,7 @@ def _init_training_state(
 class SAC:
     """Soft Actor-Critic (SAC) agent."""
 
-    learning_rate: float = 1e-4
+    learning_rate: float = 3e-4
     discounting: float = 0.99
     batch_size: int = 256
     normalize_observations: bool = True
@@ -214,7 +214,7 @@ class SAC:
     h_dim: int = 256
     n_hidden: int = 4
     # layer norm
-    use_ln: bool = False
+    use_ln: bool = True
     # hindsight experience replay
     use_her: bool = True
 

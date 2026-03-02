@@ -2,12 +2,12 @@ from typing import Literal, Optional, Union
 
 from flax.struct import dataclass
 
-from jaxgcrl.agents import CRL, DADS, DIAYN, PPO, SAC, TD3
+from jaxgcrl.agents import CRL, DADS, DIAYN, DistilledSAC, PPO, SAC, TD3
 
 from .env import legal_envs
 
 # agent configurations
-AgentConfig = Union[CRL, DADS, DIAYN, PPO, SAC, TD3]
+AgentConfig = Union[CRL, DADS, DIAYN, DistilledSAC, PPO, SAC, TD3]
 
 
 @dataclass
@@ -75,7 +75,7 @@ class RunConfig:
     visualization_interval: int = 5
 
     vis_length: int = 1000
-    checkpoint_logdir: Optional[str] = None
+    checkpoint_logdir: Optional[str] = "./saved_models"
     max_devices_per_host: int = 1
     cuda: bool = True
 
