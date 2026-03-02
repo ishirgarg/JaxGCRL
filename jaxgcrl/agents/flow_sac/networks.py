@@ -80,7 +80,7 @@ class VelocityModule(linen.Module):
 
 @flax.struct.dataclass
 class FlowPolicyNetworks:
-    """Container for the flow policy + Q-network used by DistilledSAC."""
+    """Container for the flow policy + Q-network used by FlowSAC."""
 
     velocity_network: brax_networks.FeedForwardNetwork   # v(a, t, obs) -> velocity
     q_network: brax_networks.FeedForwardNetwork          # Q(obs, action)  -> (B, n_critics)

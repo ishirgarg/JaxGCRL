@@ -347,6 +347,7 @@ def render(make_policy, params, env, exp_dir, exp_name, num_steps):
             state = jit_env_reset(rng=subkey)
 
     url = html.render(env.sys.tree_replace({"opt.timestep": env.dt}), rollout, height=1024)
+    os.makedirs(exp_dir, exist_ok=True)
     with open(os.path.join(exp_dir, f"{exp_name}_{num_steps}.html"), "w") as file:
         file.write(url)
     # Use exp_name as the wandb key so each skill gets its own video in wandb

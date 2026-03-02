@@ -23,6 +23,7 @@ Key ideas
 
 import functools
 import logging
+import os
 import time
 from typing import Any, Callable, NamedTuple, Optional, Sequence, Tuple, Union
 
@@ -976,7 +977,7 @@ class DADS:
         # ------------------------------------------------------------------
         current_step = 0
         last_checkpoint_step = 0
-        checkpoint_interval = 1_000_000  # Save policy every 1M steps
+        checkpoint_interval = 5_000_000  # Save policy every 1M steps
 
         for eval_epoch_num in range(num_evals_after_init):
             logging.info("step %s", current_step)
@@ -1003,6 +1004,9 @@ class DADS:
                     current_step - last_checkpoint_step >= checkpoint_interval
                 ):
                     path = f"{config.checkpoint_logdir}_dads_{current_step}.pkl"
+                    checkpoint_dir = os.path.dirname(path)
+                    if checkpoint_dir:
+                        os.makedirs(checkpoint_dir, exist_ok=True)
                     model.save_params(path, params)
                     logging.info(f"Saved checkpoint at step {current_step}")
                     last_checkpoint_step = current_step
@@ -1059,6 +1063,9 @@ class DADS:
         # Save final checkpoint
         if process_id == 0 and config.checkpoint_logdir:
             path = f"{config.checkpoint_logdir}_dads_{total_steps}_final.pkl"
+            checkpoint_dir = os.path.dirname(path)
+            if checkpoint_dir:
+                os.makedirs(checkpoint_dir, exist_ok=True)
             model.save_params(path, params)
             logging.info(f"Saved final checkpoint at step {total_steps}")
 

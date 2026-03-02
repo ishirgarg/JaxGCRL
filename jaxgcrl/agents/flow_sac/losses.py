@@ -20,7 +20,7 @@ from .networks import FlowPolicyNetworks, log_prob_of_action, sample_and_log_pro
 
 _PMAP_AXIS_NAME = "i"
 
-# Type alias – the actual NamedTuple lives in distilled_sac.py
+# Type alias – the actual NamedTuple lives in flow_sac.py
 Transition = Any
 
 

@@ -21,6 +21,7 @@ Three-phase training algorithm:
 
 import functools
 import logging
+import os
 import time
 from typing import Any, Callable, NamedTuple, Optional, Sequence, Tuple, Union
 
@@ -47,6 +48,7 @@ from . import losses as flow_losses
 import numpy as np
 from sklearn.manifold import TSNE
 import wandb
+import matplotlib.pyplot as plt
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -78,7 +80,7 @@ class Transition(NamedTuple):
 
 @dataclass
 class TrainingState:
-    """Full training state for the DistilledSAC learner."""
+    """Full training state for the FlowSAC learner."""
 
     # Flow policy
     velocity_optimizer_state: optax.OptState
@@ -145,12 +147,12 @@ def _init_training_state(
 
 
 # ---------------------------------------------------------------------------
-# DistilledSAC agent
+# FlowSAC agent
 # ---------------------------------------------------------------------------
 
 @dataclass
-class DistilledSAC:
-    """Distilled SAC agent with a flow matching policy.
+class FlowSAC:
+    """Flow SAC agent with a flow matching policy.
 
     Takes a pretrained skill-conditioned policy (DIAYN / DADS) and produces a
     goal-conditioned flow matching policy, warm-started via distillation and
@@ -206,11 +208,11 @@ class DistilledSAC:
     learning_rate: float = 3e-4
     discounting: float = 0.99
     batch_size: int = 256
-    normalize_observations: bool = False
+    normalize_observations: bool = True
     reward_scaling: float = 1.0
     tau: float = 0.005
     min_replay_size: int = 0
-    max_replay_size: Optional[int] = 100_000
+    max_replay_size: Optional[int] = 10000
     deterministic_eval: bool = False
     train_step_multiplier: int = 1
     unroll_length: int = 50
@@ -230,7 +232,7 @@ class DistilledSAC:
         ] = None,
         progress_fn: Callable[[int, Metrics], None] = lambda *args: None,
     ):
-        """Run three-phase DistilledSAC training.
+        """Run three-phase FlowSAC training.
 
         Parameters mirror the existing SAC / DIAYN train_fn signatures.
         """
@@ -241,6 +243,11 @@ class DistilledSAC:
         device_count = local_devices_to_use * jax.process_count()
         logging.info("local_device_count: %s; total_device_count: %s", local_devices_to_use, device_count)
 
+        # If no pretrained skill policy is provided, we skip the distillation +
+        # critic-warmup phases and fall back to "vanilla" SAC with the flow
+        # policy as the actor.
+        use_distillation = bool(self.skill_policy_path)
+
         # ------------------------------------------------------------------
         # Environment setup
         # ------------------------------------------------------------------
@@ -248,19 +255,25 @@ class DistilledSAC:
         state_dim: int = unwrapped_env.state_dim
         goal_indices = getattr(unwrapped_env, "goal_indices", None)
 
-        # Goal set for Phase 2a distillation
+        # Goal set for Phase 2a distillation (only required when using a skill policy)
         goal_set = getattr(unwrapped_env, "possible_goals", None)
-        if goal_set is None and goal_indices is not None:
-            # Fall back: use unique goal observations from the environment
-            logging.warning(
-                "env.possible_goals not found; sampling goals from env.goal_indices slice."
-            )
-        if goal_set is None:
-            raise ValueError(
-                "DistilledSAC requires env.possible_goals (array of candidate goals) "
-                "to be set on the environment. Found neither 'possible_goals' nor a fallback."
-            )
-        goal_dim = goal_set.shape[-1]
+        if use_distillation:
+            if goal_set is None and goal_indices is not None:
+                # Fall back: use unique goal observations from the environment
+                logging.warning(
+                    "env.possible_goals not found; sampling goals from env.goal_indices slice."
+                )
+            if goal_set is None:
+                raise ValueError(
+                    "FlowSAC with distillation requires env.possible_goals "
+                    "(array of candidate goals) to be set on the environment. "
+                    "Found neither 'possible_goals' nor a fallback."
+                )
+            goal_dim = goal_set.shape[-1]
+        else:
+            # In pure SAC mode we don't use goal_set directly (the environment
+            # still needs to provide goal-conditioned observations [state | goal]).
+            goal_dim = obs_size - state_dim
 
         if isinstance(train_env, envs.Env):
             wrap_for_training = envs.training.wrap
@@ -344,6 +357,9 @@ class DistilledSAC:
             )
         )
 
+        # Env steps collected per actor-step (used for both prefill and SAC)
+        env_steps_per_actor_step = config.action_repeat * config.num_envs * self.unroll_length
+
         # ------------------------------------------------------------------
         # Optimisers
         # ------------------------------------------------------------------
@@ -386,150 +402,152 @@ class DistilledSAC:
         )
 
         # ------------------------------------------------------------------
-        # Skill policy loading (Phase 1)
+        # Skill policy loading (Phase 1 – only if a skill policy is provided)
         # ------------------------------------------------------------------
-        # Reconstruct the skill-conditioned policy network (DIAYN / DADS).
-        # The policy takes [state | skill_one_hot] as input.
-        skill_h_dim = self.skill_h_dim if self.skill_h_dim is not None else self.h_dim
-        skill_n_hidden = self.skill_n_hidden if self.skill_n_hidden is not None else self.n_hidden
-        skill_obs_size = state_dim + self.num_skills
+        if use_distillation:
+            # Reconstruct the skill-conditioned policy network (DIAYN / DADS).
+            # The policy takes [state | skill_one_hot] as input.
+            skill_h_dim = self.skill_h_dim if self.skill_h_dim is not None else self.h_dim
+            skill_n_hidden = self.skill_n_hidden if self.skill_n_hidden is not None else self.n_hidden
+            skill_obs_size = state_dim + self.num_skills
 
-        if self.skill_policy_type.lower() == "diayn":
-            from jaxgcrl.agents.diayn import networks as diayn_networks
-            skill_network = diayn_networks.make_diayn_networks(
-                observation_size=skill_obs_size,
-                action_size=action_size,
-                state_size=state_dim,
-                num_skills=self.num_skills,
-                hidden_layer_sizes=[skill_h_dim] * skill_n_hidden,
-            )
-            skill_make_policy = diayn_networks.make_inference_fn(skill_network)
-        elif self.skill_policy_type.lower() == "dads":
-            from jaxgcrl.agents.dads import networks as dads_networks
-            skill_network = dads_networks.make_dads_networks(
-                observation_size=skill_obs_size,
-                action_size=action_size,
-                state_size=state_dim,
-                num_skills=self.num_skills,
-                hidden_layer_sizes=[skill_h_dim] * skill_n_hidden,
-            )
-            skill_make_policy = dads_networks.make_inference_fn(skill_network)
-        else:
-            raise ValueError(f"Unknown skill_policy_type: {self.skill_policy_type!r}")
+            if self.skill_policy_type.lower() == "diayn":
+                from jaxgcrl.agents.diayn import networks as diayn_networks
+                skill_network = diayn_networks.make_diayn_networks(
+                    observation_size=skill_obs_size,
+                    action_size=action_size,
+                    state_size=state_dim,
+                    num_skills=self.num_skills,
+                    hidden_layer_sizes=[skill_h_dim] * skill_n_hidden,
+                )
+                skill_make_policy = diayn_networks.make_inference_fn(skill_network)
+            elif self.skill_policy_type.lower() == "dads":
+                from jaxgcrl.agents.dads import networks as dads_networks
+                skill_network = dads_networks.make_dads_networks(
+                    observation_size=skill_obs_size,
+                    action_size=action_size,
+                    state_size=state_dim,
+                    num_skills=self.num_skills,
+                    hidden_layer_sizes=[skill_h_dim] * skill_n_hidden,
+                )
+                skill_make_policy = dads_networks.make_inference_fn(skill_network)
+            else:
+                raise ValueError(f"Unknown skill_policy_type: {self.skill_policy_type!r}")
 
-        # Load pretrained params
-        if self.skill_policy_path:
             logging.info("Loading skill policy from %s", self.skill_policy_path)
             skill_params = model.load_params(self.skill_policy_path)
-            # skill_params = (normalizer_params, policy_params)
-        else:
-            raise ValueError("Skill policy path is required")
 
-        # Build JIT-compiled skill policy inference function
-        # (deterministic=False to keep stochasticity during data collection)
-        _jit_skill_policy = jax.jit(skill_make_policy(skill_params, deterministic=False))
+            # Build JIT-compiled skill policy inference function
+            # (deterministic=False to keep stochasticity during data collection)
+            _jit_skill_policy = jax.jit(skill_make_policy(skill_params, deterministic=False))
 
-        # ------------------------------------------------------------------
-        # Phase 1 helper: actor step with skill policy
-        # ------------------------------------------------------------------
-        env_steps_per_actor_step = config.action_repeat * config.num_envs * self.unroll_length
+            # ------------------------------------------------------------------
+            # Phase 1 helper: actor step with skill policy
+            # ------------------------------------------------------------------
+            def _skill_actor_step(
+                env_state: State,
+                skills: jnp.ndarray,    # (num_envs_per_device, num_skills)
+                normalizer_params,
+                key: PRNGKey,
+            ) -> Tuple[State, Transition, jnp.ndarray]:
+                """One step with skill-conditioned policy; stores SAC-format transition."""
+                key, step_key, skill_key = jax.random.split(key, 3)
 
-        def _skill_actor_step(
-            env_state: State,
-            skills: jnp.ndarray,    # (num_envs_per_device, num_skills)
-            normalizer_params,
-            key: PRNGKey,
-        ) -> Tuple[State, Transition, jnp.ndarray]:
-            """One step with skill-conditioned policy; stores SAC-format transition."""
-            key, step_key, skill_key = jax.random.split(key, 3)
+                # Build skill-augmented obs for the skill policy
+                raw_obs = env_state.obs       # (N, obs_size)  = [state | goal]
+                state_part = raw_obs[:, :state_dim]           # (N, state_dim)
+                aug_obs = jnp.concatenate([state_part, skills], axis=-1)  # (N, skill_obs_size)
 
-            # Build skill-augmented obs for the skill policy
-            raw_obs = env_state.obs       # (N, obs_size)  = [state | goal]
-            state_part = raw_obs[:, :state_dim]           # (N, state_dim)
-            aug_obs = jnp.concatenate([state_part, skills], axis=-1)  # (N, skill_obs_size)
+                # Skill policy action
+                actions, _ = _jit_skill_policy(aug_obs, step_key)
 
-            # Skill policy action
-            actions, _ = _jit_skill_policy(aug_obs, step_key)
+                # Step env
+                nstate = env.step(env_state, actions)
 
-            # Step env
-            nstate = env.step(env_state, actions)
-
-            # SAC-format transition (store full goal-conditioned obs)
-            transition = Transition(
-                observation=raw_obs,                     # [state | goal]
-                next_observation=nstate.obs,
-                action=actions,
-                reward=nstate.reward,                    # task reward
-                discount=1 - nstate.done,
-                extras={
-                    "state_extras": {
-                        "truncation": nstate.info["truncation"],
-                        "traj_id": nstate.info["traj_id"],
+                # SAC-format transition (store full goal-conditioned obs)
+                transition = Transition(
+                    observation=raw_obs,                     # [state | goal]
+                    next_observation=nstate.obs,
+                    action=actions,
+                    reward=nstate.reward,                    # task reward
+                    discount=1 - nstate.done,
+                    extras={
+                        "state_extras": {
+                            "truncation": nstate.info["truncation"],
+                            "traj_id": nstate.info["traj_id"],
+                        },
+                        "policy_extras": {},
                     },
-                    "policy_extras": {},
-                },
-            )
-
-            # Update skills for environments that finished their episode
-            new_skill_idx = jax.random.randint(skill_key, (skills.shape[0],), 0, self.num_skills)
-            new_skills = jax.nn.one_hot(new_skill_idx, self.num_skills, dtype=jnp.float32)
-            next_skills = jnp.where(nstate.done[:, None], new_skills, skills)
-
-            return nstate, transition, next_skills
-
-        # ------------------------------------------------------------------
-        # Phase 1: Prefill replay buffer with skill-policy rollouts
-        # ------------------------------------------------------------------
-        def _prefill_with_skill_policy(
-            env_state: State,
-            buffer_state: ReplayBufferState,
-            normalizer_params,
-            key: PRNGKey,
-            n_steps_per_skill: int,
-        ) -> Tuple[State, ReplayBufferState, running_statistics.RunningStatisticsState]:
-            """Collect n_steps_per_skill * K transitions across all K skills."""
-            total_steps_per_device = (n_steps_per_skill * self.num_skills) // config.num_envs
-            # Each device uses num_envs_per_device envs; each env carries a random skill.
-
-            # initialise random skills for each env
-            key, sk = jax.random.split(key)
-            skill_idx = jax.random.randint(sk, (num_envs_per_device,), 0, self.num_skills)
-            skills = jax.nn.one_hot(skill_idx, self.num_skills, dtype=jnp.float32)
-
-            def f(carry, _):
-                env_state, skills, buf_state, norm_params, key = carry
-                key, step_key = jax.random.split(key)
-
-                def inner_step(carry, _):
-                    env_state, skills, key = carry
-                    key, k = jax.random.split(key)
-                    env_state, transition, skills = _skill_actor_step(env_state, skills, norm_params, k)
-                    return (env_state, skills, key), transition
-
-                (env_state, skills, key), data = jax.lax.scan(
-                    inner_step, (env_state, skills, step_key), (), length=self.unroll_length
                 )
-                # Update normaliser (optional, improves Phase 3 if normalize_observations=True)
-                norm_params = running_statistics.update(
-                    norm_params,
-                    jax.tree_util.tree_map(
-                        lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), data
-                    ).observation,
-                    pmap_axis_name=_PMAP_AXIS_NAME,
+
+                # Update skills for environments that finished their episode
+                new_skill_idx = jax.random.randint(skill_key, (skills.shape[0],), 0, self.num_skills)
+                new_skills = jax.nn.one_hot(new_skill_idx, self.num_skills, dtype=jnp.float32)
+                next_skills = jnp.where(nstate.done[:, None], new_skills, skills)
+
+                return nstate, transition, next_skills
+
+            # ------------------------------------------------------------------
+            # Phase 1: Prefill replay buffer with skill-policy rollouts
+            # ------------------------------------------------------------------
+            def _prefill_with_skill_policy(
+                env_state: State,
+                buffer_state: ReplayBufferState,
+                normalizer_params,
+                key: PRNGKey,
+                n_steps_per_skill: int,
+            ) -> Tuple[State, ReplayBufferState, running_statistics.RunningStatisticsState]:
+                """Collect n_steps_per_skill * K transitions across all K skills."""
+                # Calculate env steps per actor step per device (matching Phase 3 pattern)
+                env_steps_per_actor_step_per_device = (
+                    config.action_repeat * num_envs_per_device * self.unroll_length
                 )
-                buf_state = replay_buffer.insert(buf_state, data)
-                return (env_state, skills, buf_state, norm_params, key), ()
+                total_env_steps_needed = n_steps_per_skill * self.num_skills
+                # Divide by device_count since this function is pmapped across devices
+                env_steps_per_device = total_env_steps_needed // device_count
+                num_actor_steps = max(1, env_steps_per_device // env_steps_per_actor_step_per_device)
+                # Each device uses num_envs_per_device envs; each env carries a random skill.
 
-            (env_state, _, buffer_state, normalizer_params, _), _ = jax.lax.scan(
-                f,
-                (env_state, skills, buffer_state, normalizer_params, key),
-                (),
-                length=max(1, total_steps_per_device // self.unroll_length),
+                # initialise random skills for each env
+                key, sk = jax.random.split(key)
+                skill_idx = jax.random.randint(sk, (num_envs_per_device,), 0, self.num_skills)
+                skills = jax.nn.one_hot(skill_idx, self.num_skills, dtype=jnp.float32)
+
+                def f(carry, _):
+                    env_state, skills, buf_state, norm_params, key = carry
+                    key, step_key = jax.random.split(key)
+
+                    def inner_step(carry, _):
+                        env_state, skills, key = carry
+                        key, k = jax.random.split(key)
+                        env_state, transition, skills = _skill_actor_step(env_state, skills, norm_params, k)
+                        return (env_state, skills, key), transition
+
+                    (env_state, skills, key), data = jax.lax.scan(
+                        inner_step, (env_state, skills, step_key), (), length=self.unroll_length
+                    )
+                    # Update normaliser (optional, improves Phase 3 if normalize_observations=True)
+                    norm_params = running_statistics.update(
+                        norm_params,
+                        jax.tree_util.tree_map(
+                            lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), data
+                        ).observation,
+                        pmap_axis_name=_PMAP_AXIS_NAME,
+                    )
+                    buf_state = replay_buffer.insert(buf_state, data)
+                    return (env_state, skills, buf_state, norm_params, key), ()
+
+                (env_state, _, buffer_state, normalizer_params, _), _ = jax.lax.scan(
+                    f,
+                    (env_state, skills, buffer_state, normalizer_params, key),
+                    (),
+                    length=num_actor_steps,
+                )
+                return env_state, buffer_state, normalizer_params
+
+            _prefill_pmapped = jax.pmap(
+                _prefill_with_skill_policy, axis_name=_PMAP_AXIS_NAME, static_broadcasted_argnums=(4,)
             )
-            return env_state, buffer_state, normalizer_params
-
-        _prefill_pmapped = jax.pmap(_prefill_with_skill_policy, axis_name=_PMAP_AXIS_NAME,
-                                    static_broadcasted_argnums=(4,))
 
         # ------------------------------------------------------------------
         # Phase 2a: Distillation update step (offline, uses only replay buffer)
@@ -932,98 +950,122 @@ class DistilledSAC:
                         unwrapped_env)
 
         # ======================================================================
-        # PHASE 1: Prefill replay buffer with skill-policy rollouts
+        # Optional Phases 1 & 2: Prefill + distillation + critic warmup
         # ======================================================================
-        logging.info("=== Phase 1: Prefill replay buffer ===")
-        t0 = time.time()
+        if use_distillation:
+            # ------------------------- Phase 1: Prefill -----------------------
+            logging.info("=== Phase 1: Prefill replay buffer ===")
+            t0 = time.time()
 
-        prefill_key, local_key = jax.random.split(local_key)
-        prefill_keys = jax.random.split(prefill_key, local_devices_to_use)
+            prefill_key, local_key = jax.random.split(local_key)
+            prefill_keys = jax.random.split(prefill_key, local_devices_to_use)
 
-        # Replicate normaliser and env_state are already distributed via pmap init
-        norm_params_rep = training_state.normalizer_params  # already replicated
+            # Replicate normaliser and env_state are already distributed via pmap init
+            norm_params_rep = training_state.normalizer_params  # already replicated
 
-        env_state, buffer_state, norm_params_rep = _prefill_pmapped(
-            env_state,
-            buffer_state,
-            norm_params_rep,
-            prefill_keys,
-            self.prefill_steps_per_skill,
-        )
-
-        # Update the training state's normalizer_params with the updated stats
-        training_state = training_state.replace(normalizer_params=norm_params_rep)
-
-        replay_size_phase1 = (
-            jnp.sum(jax.vmap(replay_buffer.size)(buffer_state)) * jax.process_count()
-        )
-        logging.info(
-            "Phase 1 done. Replay size: %s. Time: %.1fs",
-            replay_size_phase1,
-            time.time() - t0,
-        )
-
-        # Gather one obs-batch for Phase 2a t-SNE visualisation (on device 0)
-        _obs_sample_for_vis = None
-        if process_id == 0:
-            buf_state_0, sample_transitions = replay_buffer.sample(
-                jax.tree_util.tree_map(lambda x: x[0], buffer_state)
-            )
-            _obs_sample_for_vis = jax.tree_util.tree_map(
-                lambda x: jnp.reshape(x, (-1,) + x.shape[2:])[:64], sample_transitions
-            ).observation
-
-        # ======================================================================
-        # PHASE 2a: Flow policy distillation (NLL)
-        # ======================================================================
-        logging.info("=== Phase 2a: Flow policy distillation (%d steps) ===", self.distill_steps)
-        t0 = time.time()
-
-        # Broadcast goal_set to all devices
-        goal_set_rep = jnp.broadcast_to(goal_set, (local_devices_to_use,) + goal_set.shape)
-
-        distill_key, local_key = jax.random.split(local_key)
-
-        for distill_step in range(self.distill_steps):
-            distill_key, step_key = jax.random.split(distill_key)
-            step_keys = jax.random.split(step_key, local_devices_to_use)
-
-            training_state, buffer_state, distill_metrics = _distillation_step_pmapped(
-                training_state, buffer_state, goal_set_rep, step_keys
+            env_state, buffer_state, norm_params_rep = _prefill_pmapped(
+                env_state,
+                buffer_state,
+                norm_params_rep,
+                prefill_keys,
+                self.prefill_steps_per_skill,
             )
 
-            if distill_step % 500 == 0:
-                loss_val = float(jax.tree_util.tree_map(jnp.mean, distill_metrics)["distillation/nll_loss"])
-                logging.info("  distill step %d / %d  NLL=%.4f", distill_step, self.distill_steps, loss_val)
+            # Update the training state's normalizer_params with the updated stats
+            training_state = training_state.replace(normalizer_params=norm_params_rep)
 
-            if distill_step % self.distill_viz_freq == 0 and process_id == 0 and _obs_sample_for_vis is not None:
-                vel_params_0 = _unpmap(training_state.velocity_params)
-                _visualise_flow_policy(vel_params_0, _obs_sample_for_vis, distill_step, process_id)
-
-        logging.info("Phase 2a done. Time: %.1fs", time.time() - t0)
-
-        # ======================================================================
-        # PHASE 2b: Critic warmup
-        # ======================================================================
-        logging.info("=== Phase 2b: Critic warmup (%d steps) ===", self.critic_warmup_steps)
-        t0 = time.time()
-
-        warmup_key, local_key = jax.random.split(local_key)
-
-        for warmup_step in range(self.critic_warmup_steps):
-            warmup_key, step_key = jax.random.split(warmup_key)
-            step_keys = jax.random.split(step_key, local_devices_to_use)
-            training_state, buffer_state, warmup_metrics = _critic_warmup_step_pmapped(
-                training_state, buffer_state, step_keys
+            replay_size_phase1 = (
+                jnp.sum(jax.vmap(replay_buffer.size)(buffer_state)) * jax.process_count()
             )
-            if warmup_step % 500 == 0:
-                loss_val = float(jax.tree_util.tree_map(jnp.mean, warmup_metrics)["critic_warmup/critic_loss"])
-                logging.info(
-                    "  warmup step %d / %d  critic_loss=%.4f",
-                    warmup_step, self.critic_warmup_steps, loss_val,
+            logging.info(
+                "Phase 1 done. Replay size: %s. Time: %.1fs",
+                replay_size_phase1,
+                time.time() - t0,
+            )
+
+            # Gather one obs-batch for Phase 2a t-SNE visualisation (on device 0)
+            _obs_sample_for_vis = None
+            if process_id == 0:
+                buf_state_0, sample_transitions = replay_buffer.sample(
+                    jax.tree_util.tree_map(lambda x: x[0], buffer_state)
+                )
+                _obs_sample_for_vis = jax.tree_util.tree_map(
+                    lambda x: jnp.reshape(x, (-1,) + x.shape[2:])[:64], sample_transitions
+                ).observation
+
+            # -------------------- Phase 2a: Distillation ----------------------
+            logging.info("=== Phase 2a: Flow policy distillation (%d steps) ===", self.distill_steps)
+            t0 = time.time()
+
+            # Broadcast goal_set to all devices
+            goal_set_rep = jnp.broadcast_to(goal_set, (local_devices_to_use,) + goal_set.shape)
+
+            distill_key, local_key = jax.random.split(local_key)
+
+            for distill_step in range(self.distill_steps):
+                distill_key, step_key = jax.random.split(distill_key)
+                step_keys = jax.random.split(step_key, local_devices_to_use)
+
+                training_state, buffer_state, distill_metrics = _distillation_step_pmapped(
+                    training_state, buffer_state, goal_set_rep, step_keys
                 )
 
-        logging.info("Phase 2b done. Time: %.1fs", time.time() - t0)
+                if distill_step % 500 == 0:
+                    loss_val = float(
+                        jax.tree_util.tree_map(jnp.mean, distill_metrics)["distillation/nll_loss"]
+                    )
+                    logging.info(
+                        "  distill step %d / %d  NLL=%.4f",
+                        distill_step,
+                        self.distill_steps,
+                        loss_val,
+                    )
+
+                # Log metrics to wandb
+                if process_id == 0:
+                    metrics_dict = dict(jax.tree_util.tree_map(jnp.mean, distill_metrics))
+                    wandb.log(metrics_dict, step=distill_step)
+
+                if (
+                    distill_step % self.distill_viz_freq == 0
+                    and process_id == 0
+                    and _obs_sample_for_vis is not None
+                ):
+                    vel_params_0 = _unpmap(training_state.velocity_params)
+                    _visualise_flow_policy(vel_params_0, _obs_sample_for_vis, distill_step, process_id)
+
+            logging.info("Phase 2a done. Time: %.1fs", time.time() - t0)
+
+            # -------------------- Phase 2b: Critic warmup ---------------------
+            logging.info("=== Phase 2b: Critic warmup (%d steps) ===", self.critic_warmup_steps)
+            t0 = time.time()
+
+            warmup_key, local_key = jax.random.split(local_key)
+
+            for warmup_step in range(self.critic_warmup_steps):
+                warmup_key, step_key = jax.random.split(warmup_key)
+                step_keys = jax.random.split(step_key, local_devices_to_use)
+                training_state, buffer_state, warmup_metrics = _critic_warmup_step_pmapped(
+                    training_state, buffer_state, step_keys
+                )
+                if warmup_step % 500 == 0:
+                    loss_val = float(
+                        jax.tree_util.tree_map(jnp.mean, warmup_metrics)["critic_warmup/critic_loss"]
+                    )
+                    logging.info(
+                        "  warmup step %d / %d  critic_loss=%.4f",
+                        warmup_step,
+                        self.critic_warmup_steps,
+                        loss_val,
+                    )
+
+                # Log metrics to wandb
+                if process_id == 0:
+                    metrics_dict = dict(jax.tree_util.tree_map(jnp.mean, warmup_metrics))
+                    # Use distill_steps as offset so warmup steps don't overlap with distillation steps
+                    wandb.log(metrics_dict, step=self.distill_steps + warmup_step)
+
+            logging.info("Phase 2b done. Time: %.1fs", time.time() - t0)
 
         # ======================================================================
         # PHASE 3: SAC fine-tuning
@@ -1095,6 +1137,9 @@ class DistilledSAC:
                         (training_state.normalizer_params, training_state.velocity_params)
                     )
                     path = f"{config.checkpoint_logdir}_dsac_{current_step}.pkl"
+                    checkpoint_dir = os.path.dirname(path)
+                    if checkpoint_dir:
+                        os.makedirs(checkpoint_dir, exist_ok=True)
                     model.save_params(path, params)
 
                 metrics = evaluator.run_evaluation(
@@ -1115,6 +1160,6 @@ class DistilledSAC:
         params = _unpmap((training_state.normalizer_params, training_state.velocity_params))
 
         pmap.assert_is_replicated(training_state)
-        logging.info("DistilledSAC total steps: %s", total_steps)
+        logging.info("FlowSAC total steps: %s", total_steps)
         pmap.synchronize_hosts()
         return make_policy, params, metrics

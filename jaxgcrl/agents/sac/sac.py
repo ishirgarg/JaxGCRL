@@ -19,6 +19,7 @@ See: https://arxiv.org/pdf/1812.05905.pdf
 
 import functools
 import logging
+import os
 import time
 from typing import Any, Callable, NamedTuple, Optional, Sequence, Tuple, Union
 
@@ -698,6 +699,9 @@ class SAC:
                     # Save current policy.
                     params = _unpmap((training_state.normalizer_params, training_state.policy_params))
                     path = f"{config.checkpoint_logdir}_sac_{current_step}.pkl"
+                    checkpoint_dir = os.path.dirname(path)
+                    if checkpoint_dir:
+                        os.makedirs(checkpoint_dir, exist_ok=True)
                     model.save_params(path, params)
 
                 # Run evals.
