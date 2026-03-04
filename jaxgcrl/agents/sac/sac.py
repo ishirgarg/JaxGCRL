@@ -20,11 +20,13 @@ See: https://arxiv.org/pdf/1812.05905.pdf
 import functools
 import logging
 import os
+import pickle
 import time
 from typing import Any, Callable, NamedTuple, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from brax import base, envs
 from brax.io import model
@@ -160,6 +162,71 @@ def _unpmap(v):
     return jax.tree_util.tree_map(lambda x: x[0], v)
 
 
+def _log_analysis_data(
+    training_state: TrainingState,
+    buffer_state: ReplayBufferState,
+    replay_buffer: Any,
+    n_critics: int,
+    checkpoint_logdir: Optional[str],
+    current_step: int,
+):
+    """Log analysis data: replay buffer sample and Q ensemble parameters.
+    
+    Args:
+        training_state: Current training state
+        buffer_state: Current replay buffer state
+        replay_buffer: Replay buffer object
+        n_critics: Number of Q-function critics in the ensemble
+        checkpoint_logdir: Directory to save checkpoints
+        current_step: Current environment step
+    """
+    if checkpoint_logdir is None:
+        logging.warning("checkpoint_logdir is None, skipping analysis data logging")
+        return
+    
+    # Create analysis data directory
+    analysis_dir = os.path.join(checkpoint_logdir, "analysis_data")
+    os.makedirs(analysis_dir, exist_ok=True)
+    
+    # Sample from replay buffer (get a representative sample)
+    # We'll sample a batch to get a snapshot of the buffer
+    buffer_state_unpmapped = _unpmap(buffer_state)
+    sample_buffer_state, transitions_sample = replay_buffer.sample(buffer_state_unpmapped)
+    
+    # Convert JAX arrays to numpy for saving
+    def to_numpy(x):
+        if isinstance(x, jnp.ndarray):
+            # Convert JAX array to numpy array
+            return np.asarray(x)
+        elif isinstance(x, (list, tuple)):
+            return type(x)(to_numpy(item) for item in x)
+        elif isinstance(x, dict):
+            return {k: to_numpy(v) for k, v in x.items()}
+        return x
+    
+    # Save replay buffer sample
+    replay_sample_path = os.path.join(analysis_dir, f"replay_buffer_sample_{current_step}.pkl")
+    replay_sample_data = jax.tree_util.tree_map(to_numpy, transitions_sample)
+    with open(replay_sample_path, "wb") as f:
+        pickle.dump(replay_sample_data, f)
+    logging.info(f"Saved replay buffer sample to {replay_sample_path}")
+    
+    # Save Q ensemble parameters
+    q_params_unpmapped = _unpmap(training_state.q_params)
+    target_q_params_unpmapped = _unpmap(training_state.target_q_params)
+    
+    q_params_path = os.path.join(analysis_dir, f"q_ensemble_params_{current_step}.pkl")
+    q_params_data = {
+        "q_params": jax.tree_util.tree_map(to_numpy, q_params_unpmapped),
+        "target_q_params": jax.tree_util.tree_map(to_numpy, target_q_params_unpmapped),
+        "n_critics": n_critics,
+    }
+    
+    with open(q_params_path, "wb") as f:
+        pickle.dump(q_params_data, f)
+    logging.info(f"Saved Q ensemble parameters to {q_params_path}")
+
+
 def _init_training_state(
     key: PRNGKey,
     obs_size: int,
@@ -218,6 +285,10 @@ class SAC:
     use_ln: bool = True
     # hindsight experience replay
     use_her: bool = True
+    # Q-function ensemble size (number of critics)
+    n_critics: int = 5
+    # Logging interval for analysis data (in env steps)
+    analysis_log_interval: int = 1000000
 
     def train_fn(
         self,
@@ -303,6 +374,7 @@ class SAC:
             preprocess_observations_fn=normalize_fn,
             layer_norm=self.use_ln,
             hidden_layer_sizes=[self.h_dim] * self.n_hidden,
+            n_critics=self.n_critics,
         )
         make_policy = networks.make_inference_fn(sac_network)
 
@@ -682,6 +754,7 @@ class SAC:
         training_walltime = time.time() - t
 
         current_step = 0
+        last_analysis_log_step = 0
         for eval_epoch_num in range(num_evals_after_init):
             logging.info("step %s", current_step)
 
@@ -692,6 +765,21 @@ class SAC:
                 training_state, env_state, buffer_state, epoch_keys
             )
             current_step = int(_unpmap(training_state.env_steps))
+
+            # Periodic analysis data logging
+            if process_id == 0 and self.analysis_log_interval > 0:
+                steps_since_last_log = current_step - last_analysis_log_step
+                if steps_since_last_log >= self.analysis_log_interval:
+                    logging.info(f"Logging analysis data at step {current_step}")
+                    _log_analysis_data(
+                        training_state=training_state,
+                        buffer_state=buffer_state,
+                        replay_buffer=replay_buffer,
+                        n_critics=self.n_critics,
+                        checkpoint_logdir=config.checkpoint_logdir,
+                        current_step=current_step,
+                    )
+                    last_analysis_log_step = current_step
 
             # Eval and logging
             if process_id == 0:

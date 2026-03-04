@@ -156,6 +156,7 @@ def make_sac_networks(
     hidden_layer_sizes: Sequence[int] = (256, 256),
     activation: networks.ActivationFn = linen.relu,
     layer_norm: bool = False,
+    n_critics: int = 2,
 ) -> SACNetworks:
     """Make SAC networks."""
     parametric_action_distribution = distribution.NormalTanhDistribution(event_size=action_size)
@@ -174,6 +175,7 @@ def make_sac_networks(
         hidden_layer_sizes=hidden_layer_sizes,
         activation=activation,
         layer_norm=layer_norm,
+        n_critics=n_critics,
     )
     return SACNetworks(
         policy_network=policy_network,
