@@ -15,6 +15,18 @@ import wandb
 
 from jaxgcrl.agents.crl.losses import energy_fn
 
+# Module-level variable to store checkpoint_logdir for io_callback
+_checkpoint_logdir_global = None
+
+def set_checkpoint_logdir(logdir: str):
+    """Set the checkpoint logdir for use in io_callback functions."""
+    global _checkpoint_logdir_global
+    _checkpoint_logdir_global = logdir
+
+def get_checkpoint_logdir() -> str:
+    """Get the checkpoint logdir."""
+    return _checkpoint_logdir_global
+
 
 # ============================================================================
 # Trajectory Processing Utilities
@@ -807,6 +819,122 @@ def estimate_log_density_knn(goals_batch):
     log_densities = jnp.log(k / goals_batch.shape[0]) - d * jnp.log(knn_distances + 1e-10)
     
     return log_densities
+
+
+def _log_q_value_grid_analysis_impl(
+    states, initial_states, all_q_values, goal_indices, traj_ids, env_steps, num_ensemble, checkpoint_logdir_flag
+):
+    """Implementation function for logging Q-value grid analysis (called via io_callback)."""
+    import pickle
+    import os
+    from pathlib import Path
+    
+    # Check if we should log at this interval
+    if not should_log_at_interval(env_steps, 1000000, 'q_value_grid'):
+        return
+    
+    # Reconstruct save directory from global variable or flag
+    if checkpoint_logdir_flag > 0.5:  # Flag indicates checkpoint_logdir was set
+        checkpoint_logdir = get_checkpoint_logdir()
+        if checkpoint_logdir:
+            save_dir = os.path.join(checkpoint_logdir, "analysis_data")
+        else:
+            # Fallback: try to get from wandb config
+            try:
+                if wandb.run is not None and 'checkpoint_logdir' in wandb.run.config:
+                    checkpoint_logdir = wandb.run.config['checkpoint_logdir']
+                    save_dir = os.path.join(checkpoint_logdir, "analysis_data")
+                else:
+                    save_dir = None
+            except:
+                save_dir = None
+    else:
+        save_dir = None
+    
+    # Convert to numpy
+    states_np = np.asarray(states)
+    initial_states_np = np.asarray(initial_states)
+    all_q_values_np = np.asarray(all_q_values)
+    traj_ids_np = np.asarray(traj_ids)
+    
+    # Compute mean and std across ensemble
+    q_means = np.mean(all_q_values_np, axis=1)  # (num_samples,)
+    q_stds = np.std(all_q_values_np, axis=1)  # (num_samples,)
+    
+    # Extract goal coordinates for candidate states
+    goal_coords = states_np[:, goal_indices]  # (num_samples, goal_dim)
+    x_coords = goal_coords[:, 0]
+    y_coords = goal_coords[:, 1]
+    
+    # Extract goal coordinates for s0 (initial state)
+    s0_goal_coords = initial_states_np[0, goal_indices] if initial_states_np.shape[0] > 0 else None
+    s0_x = s0_goal_coords[0] if s0_goal_coords is not None else None
+    s0_y = s0_goal_coords[1] if s0_goal_coords is not None else None
+    
+    # Create plots
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # Mean plot
+    scatter1 = axes[0].scatter(x_coords, y_coords, c=q_means, cmap='viridis', s=50, alpha=0.7, label='Candidate states')
+    if s0_x is not None and s0_y is not None:
+        axes[0].scatter(s0_x, s0_y, c='red', s=300, marker='*', edgecolors='black', linewidths=2, zorder=5, label='s0 (reset state)')
+    plt.colorbar(scatter1, ax=axes[0], label='Mean Q-value')
+    axes[0].set_xlabel('Goal X coordinate')
+    axes[0].set_ylabel('Goal Y coordinate')
+    axes[0].set_title(f'Q(s0, pi(s0, s), s) Mean (n_critics={num_ensemble})')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+    
+    # Std plot
+    scatter2 = axes[1].scatter(x_coords, y_coords, c=q_stds, cmap='coolwarm', s=50, alpha=0.7, label='Candidate states')
+    if s0_x is not None and s0_y is not None:
+        axes[1].scatter(s0_x, s0_y, c='red', s=300, marker='*', edgecolors='black', linewidths=2, zorder=5, label='s0 (reset state)')
+    plt.colorbar(scatter2, ax=axes[1], label='Std Q-value')
+    axes[1].set_xlabel('Goal X coordinate')
+    axes[1].set_ylabel('Goal Y coordinate')
+    axes[1].set_title(f'Q(s0, pi(s0, s), s) Std (n_critics={num_ensemble})')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+    
+    plt.tight_layout()
+    
+    # Convert to PIL Image
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    buf.seek(0)
+    pil_image = Image.open(buf)
+    plt.close()
+    
+    # Save data for later analysis
+    if save_dir is not None:
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        data_to_save = {
+            'states': states_np,  # Full states
+            'initial_states': initial_states_np,  # s0 for each state
+            'q_values': all_q_values_np,  # Full critic values (num_samples, num_ensemble)
+            'q_means': q_means,
+            'q_stds': q_stds,
+            'goal_coords': goal_coords,
+            'traj_ids': traj_ids_np,
+            'env_steps': int(env_steps),
+            'num_ensemble': num_ensemble,
+        }
+        
+        save_file = save_path / f"q_value_grid_data_{int(env_steps)}.pkl"
+        with open(save_file, 'wb') as f:
+            pickle.dump(data_to_save, f)
+    
+    # Log to wandb
+    metrics = {
+        'q_value_grid/mean_q_mean': float(np.mean(q_means)),
+        'q_value_grid/mean_q_std': float(np.std(q_means)),
+        'q_value_grid/std_q_mean': float(np.mean(q_stds)),
+        'q_value_grid/std_q_std': float(np.std(q_stds)),
+        'q_value_grid/grid_plots': wandb.Image(pil_image),
+    }
+    wandb.log(metrics, step=int(env_steps))
 
 
 def compute_kl_divergence_empirical(desired_goals, achieved_goals, bandwidth=0.1):

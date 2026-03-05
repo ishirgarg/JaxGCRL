@@ -25,6 +25,14 @@ U_MAZE = [
     [1, 1, 1, 1, 1],
 ]
 
+U_MAZE_HARD = [
+    [1, 1, 1, 1, 1],
+    [1, R, 0, 0, 1],
+    [1, 1, 1, 0, 1],
+    [1, G, 0, 0, 1],
+    [1, 1, 1, 1, 1],
+]
+
 CENTER_MAZE = [
     [1, 1, 1, 1, 1, 1, 1],
     [1, G, 1, G, 1, 1, 1],
@@ -194,6 +202,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
         maze_layout = U_MAZE
     elif maze_layout_name == "u_maze_eval":
         maze_layout = U_MAZE_EVAL
+    elif maze_layout_name == "u_maze_hard":
+        maze_layout = U_MAZE_HARD
     elif maze_layout_name == "center_maze":
         maze_layout = CENTER_MAZE
     elif maze_layout_name == "big_maze":

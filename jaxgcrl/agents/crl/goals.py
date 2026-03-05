@@ -1029,7 +1029,7 @@ class QEpistemicGoalProposal(GoalProposer):
             all_q_values = compute_q_values_ensemble(
                 state_expanded, candidate_goals, actor, actor_params,
                 stacked_sa_params, stacked_g_params, sa_encoder, g_encoder,
-                self.energy_fn_name, expand_goals=False
+                self.energy_fn_name, is_goal_as_state=False
             )  # (num_ensemble, num_candidates)
             
             return all_q_values
@@ -1167,6 +1167,13 @@ class MetricPreservationGoalProposal(GoalProposer):
 
         env_goals = train_env.possible_goals  # (num_env_goals, goal_dim)
 
+        # Check if we have an ensemble
+        is_ensemble = isinstance(critic_params["sa_encoder"], list)
+        
+        # Stack ensemble parameters if needed
+        if is_ensemble:
+            stacked_sa_params, stacked_g_params = stack_ensemble_params(critic_params)
+        
         def energy_triplet(state):
             """Compute M[g,h] for a single state and return individual terms."""
             # Optionally zero out everything except goal indices
@@ -1181,32 +1188,69 @@ class MetricPreservationGoalProposal(GoalProposer):
 
             # f(s, a1, g)
             s1 = jnp.repeat(state[None, :], num_cand, axis=0)
-            obs_sg = jnp.concatenate([s1, candidate_goals], axis=1)
-            means, _ = actor.apply(actor_params, obs_sg)
-            a1 = jnp.tanh(means)
-            phi_sg = sa_encoder.apply(critic_params['sa_encoder'], jnp.concatenate([s1, a1], axis=1))
-            psi_g = g_encoder.apply(critic_params['g_encoder'], candidate_goals)
-            f_sag = energy_fn(self.energy_fn_name, phi_sg, psi_g)  # (num_cand,)
+            
+            if is_ensemble:
+                # Compute mean energies across ensemble using utility function
+                f_sag = jax.vmap(
+                    lambda s, g: compute_v_and_sigma_ensemble(
+                        s, g, actor, actor_params,
+                        stacked_sa_params, stacked_g_params, sa_encoder, g_encoder,
+                        self.energy_fn_name, is_goal_as_state=False
+                    )[0]  # Return only mean, not sigma
+                )(s1, candidate_goals)  # (num_cand,)
+            else:
+                obs_sg = jnp.concatenate([s1, candidate_goals], axis=1)
+                means, _ = actor.apply(actor_params, obs_sg)
+                a1 = jnp.tanh(means)
+                phi_sg = sa_encoder.apply(critic_params['sa_encoder'], jnp.concatenate([s1, a1], axis=1))
+                psi_g = g_encoder.apply(critic_params['g_encoder'], candidate_goals)
+                f_sag = energy_fn(self.energy_fn_name, phi_sg, psi_g)  # (num_cand,)
 
             # f(g, a2, h)
             g_exp = jnp.repeat(candidate_goals_full[:, None, :], num_env, axis=1)  # (num_cand, num_env, state_dim)
             h_exp = jnp.repeat(env_goals[None, :, :], num_cand, axis=0)
-            obs_gh = jnp.concatenate([g_exp, h_exp], axis=-1).reshape(num_cand * num_env, -1)
-            means2, _ = actor.apply(actor_params, obs_gh)
-            a2 = jnp.tanh(means2)
-            phi_gh = sa_encoder.apply(critic_params['sa_encoder'],
+            
+            if is_ensemble:
+                # Compute mean energies across ensemble using utility function
+                g_exp_flat = g_exp.reshape(-1, g_exp.shape[-1])  # (num_cand * num_env, state_dim)
+                h_exp_flat = h_exp.reshape(-1, h_exp.shape[-1])  # (num_cand * num_env, goal_dim)
+                f_gah_flat = jax.vmap(
+                    lambda s, g: compute_v_and_sigma_ensemble(
+                        s, g, actor, actor_params,
+                        stacked_sa_params, stacked_g_params, sa_encoder, g_encoder,
+                        self.energy_fn_name, is_goal_as_state=False
+                    )[0]  # Return only mean, not sigma
+                )(g_exp_flat, h_exp_flat)  # (num_cand * num_env,)
+                f_gah = f_gah_flat.reshape(num_cand, num_env)  # (num_cand, num_env)
+            else:
+                obs_gh = jnp.concatenate([g_exp, h_exp], axis=-1).reshape(num_cand * num_env, -1)
+                means2, _ = actor.apply(actor_params, obs_gh)
+                a2 = jnp.tanh(means2)
+                phi_gh = sa_encoder.apply(critic_params['sa_encoder'],
                                       jnp.concatenate([g_exp.reshape(-1, g_exp.shape[-1]), a2], axis=1))
-            psi_h = g_encoder.apply(critic_params['g_encoder'], env_goals)
-            psi_h_rep = jnp.repeat(psi_h[None, :, :], num_cand, axis=0).reshape(num_cand * num_env, -1)
-            f_gah = energy_fn(self.energy_fn_name, phi_gh, psi_h_rep).reshape(num_cand, num_env)
+                psi_h = g_encoder.apply(critic_params['g_encoder'], env_goals)
+                psi_h_rep = jnp.repeat(psi_h[None, :, :], num_cand, axis=0).reshape(num_cand * num_env, -1)
+                f_gah = energy_fn(self.energy_fn_name, phi_gh, psi_h_rep).reshape(num_cand, num_env)
 
             # f(s, a3, h)
             s3 = jnp.repeat(state[None, :], num_env, axis=0)
-            obs_sh = jnp.concatenate([s3, env_goals], axis=1)
-            means3, _ = actor.apply(actor_params, obs_sh)
-            a3 = jnp.tanh(means3)
-            phi_sh = sa_encoder.apply(critic_params['sa_encoder'], jnp.concatenate([s3, a3], axis=1))
-            f_sah = energy_fn(self.energy_fn_name, phi_sh, psi_h)  # (num_env,)
+            
+            if is_ensemble:
+                # Compute mean energies across ensemble using utility function
+                f_sah = jax.vmap(
+                    lambda s, g: compute_v_and_sigma_ensemble(
+                        s, g, actor, actor_params,
+                        stacked_sa_params, stacked_g_params, sa_encoder, g_encoder,
+                        self.energy_fn_name, is_goal_as_state=False
+                    )[0]  # Return only mean, not sigma
+                )(s3, env_goals)  # (num_env,)
+            else:
+                obs_sh = jnp.concatenate([s3, env_goals], axis=1)
+                means3, _ = actor.apply(actor_params, obs_sh)
+                a3 = jnp.tanh(means3)
+                phi_sh = sa_encoder.apply(critic_params['sa_encoder'], jnp.concatenate([s3, a3], axis=1))
+                psi_h = g_encoder.apply(critic_params['g_encoder'], env_goals)
+                f_sah = energy_fn(self.energy_fn_name, phi_sh, psi_h)  # (num_env,)
             
             # Compute M matrix for goal selection
             term1 = f_sag[:, None]  # f(s, a1, g) - shape (num_cand, 1)
@@ -1231,30 +1275,67 @@ class MetricPreservationGoalProposal(GoalProposer):
             num_env = env_goals.shape[0]
 
             s1 = jnp.repeat(state[None, :], num_cand, axis=0)
-            obs_sg = jnp.concatenate([s1, candidate_goals], axis=1)
-            means, _ = actor.apply(actor_params, obs_sg)
-            a1 = jnp.tanh(means)
-            phi_sg = sa_encoder.apply(critic_params['sa_encoder'], jnp.concatenate([s1, a1], axis=1))
-            psi_g = g_encoder.apply(critic_params['g_encoder'], candidate_goals)
-            f_sag = energy_fn(self.energy_fn_name, phi_sg, psi_g)
+            
+            if is_ensemble:
+                # Compute mean energies across ensemble using utility function
+                f_sag = jax.vmap(
+                    lambda s, g: compute_v_and_sigma_ensemble(
+                        s, g, actor, actor_params,
+                        stacked_sa_params, stacked_g_params, sa_encoder, g_encoder,
+                        self.energy_fn_name, is_goal_as_state=False
+                    )[0]  # Return only mean, not sigma
+                )(s1, candidate_goals)  # (num_cand,)
+            else:
+                obs_sg = jnp.concatenate([s1, candidate_goals], axis=1)
+                means, _ = actor.apply(actor_params, obs_sg)
+                a1 = jnp.tanh(means)
+                phi_sg = sa_encoder.apply(critic_params['sa_encoder'], jnp.concatenate([s1, a1], axis=1))
+                psi_g = g_encoder.apply(critic_params['g_encoder'], candidate_goals)
+                f_sag = energy_fn(self.energy_fn_name, phi_sg, psi_g)
 
             g_exp = jnp.repeat(candidate_goals_full[:, None, :], num_env, axis=1)
             h_exp = jnp.repeat(env_goals[None, :, :], num_cand, axis=0)
-            obs_gh = jnp.concatenate([g_exp, h_exp], axis=-1).reshape(num_cand * num_env, -1)
-            means2, _ = actor.apply(actor_params, obs_gh)
-            a2 = jnp.tanh(means2)
-            phi_gh = sa_encoder.apply(critic_params['sa_encoder'],
+            
+            if is_ensemble:
+                # Compute mean energies across ensemble using utility function
+                g_exp_flat = g_exp.reshape(-1, g_exp.shape[-1])  # (num_cand * num_env, state_dim)
+                h_exp_flat = h_exp.reshape(-1, h_exp.shape[-1])  # (num_cand * num_env, goal_dim)
+                f_gah_flat = jax.vmap(
+                    lambda s, g: compute_v_and_sigma_ensemble(
+                        s, g, actor, actor_params,
+                        stacked_sa_params, stacked_g_params, sa_encoder, g_encoder,
+                        self.energy_fn_name, is_goal_as_state=False
+                    )[0]  # Return only mean, not sigma
+                )(g_exp_flat, h_exp_flat)  # (num_cand * num_env,)
+                f_gah = f_gah_flat.reshape(num_cand, num_env)  # (num_cand, num_env)
+            else:
+                obs_gh = jnp.concatenate([g_exp, h_exp], axis=-1).reshape(num_cand * num_env, -1)
+                means2, _ = actor.apply(actor_params, obs_gh)
+                a2 = jnp.tanh(means2)
+                phi_gh = sa_encoder.apply(critic_params['sa_encoder'],
                                       jnp.concatenate([g_exp.reshape(-1, g_exp.shape[-1]), a2], axis=1))
-            psi_h = g_encoder.apply(critic_params['g_encoder'], env_goals)
-            psi_h_rep = jnp.repeat(psi_h[None, :, :], num_cand, axis=0).reshape(num_cand * num_env, -1)
-            f_gah = energy_fn(self.energy_fn_name, phi_gh, psi_h_rep).reshape(num_cand, num_env)
+                psi_h = g_encoder.apply(critic_params['g_encoder'], env_goals)
+                psi_h_rep = jnp.repeat(psi_h[None, :, :], num_cand, axis=0).reshape(num_cand * num_env, -1)
+                f_gah = energy_fn(self.energy_fn_name, phi_gh, psi_h_rep).reshape(num_cand, num_env)
 
             s3 = jnp.repeat(state[None, :], num_env, axis=0)
-            obs_sh = jnp.concatenate([s3, env_goals], axis=1)
-            means3, _ = actor.apply(actor_params, obs_sh)
-            a3 = jnp.tanh(means3)
-            phi_sh = sa_encoder.apply(critic_params['sa_encoder'], jnp.concatenate([s3, a3], axis=1))
-            f_sah = energy_fn(self.energy_fn_name, phi_sh, psi_h)
+            
+            if is_ensemble:
+                # Compute mean energies across ensemble using utility function
+                f_sah = jax.vmap(
+                    lambda s, g: compute_v_and_sigma_ensemble(
+                        s, g, actor, actor_params,
+                        stacked_sa_params, stacked_g_params, sa_encoder, g_encoder,
+                        self.energy_fn_name, is_goal_as_state=False
+                    )[0]  # Return only mean, not sigma
+                )(s3, env_goals)  # (num_env,)
+            else:
+                obs_sh = jnp.concatenate([s3, env_goals], axis=1)
+                means3, _ = actor.apply(actor_params, obs_sh)
+                a3 = jnp.tanh(means3)
+                phi_sh = sa_encoder.apply(critic_params['sa_encoder'], jnp.concatenate([s3, a3], axis=1))
+                psi_h = g_encoder.apply(critic_params['g_encoder'], env_goals)
+                f_sah = energy_fn(self.energy_fn_name, phi_sh, psi_h)
 
             proposed_goal_densities = estimate_log_density_knn(candidate_goals)
             

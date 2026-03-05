@@ -29,6 +29,7 @@ from jaxgcrl.utils.visualize import visualize_goals_2d, visualize_kde_heatmap, v
 from .losses import update_actor_and_alpha, update_critic
 from .networks import Actor, Encoder
 from .goals import GoalProposer, ReplayBufferGoalProposal, MediumEnergyGoalProposal, MetricPreservationGoalProposal, FisherTraceGoalProposal, QEpistemicGoalProposal, MEGAGoalProposal, OMEGAGoalProposal, UCGRGoalProposal,DISCOVERGoalProposal, mix_goals
+from .goals_utils import _log_q_value_grid_analysis_impl, stack_ensemble_params, compute_q_values_ensemble, should_log_at_interval, set_checkpoint_logdir
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -339,6 +340,10 @@ class CRL:
         env_state = jax.jit(train_env.reset)(env_keys)
         train_env.step = jax.jit(train_env.step)
         
+        # Set checkpoint logdir for use in io_callback functions
+        if config.checkpoint_logdir:
+            set_checkpoint_logdir(config.checkpoint_logdir)
+
         # Initialize proposed_goals tracking in env_state.info
         # These will be updated only at episode boundaries
         env_state.info["proposed_goals"] = env_state.obs[:, -len(train_env.goal_indices):]
@@ -550,12 +555,124 @@ class CRL:
 
         def propose_goals_for_new_episodes(env_state, training_state, buffer_state, key):
             """Propose new goals only for environments that just started a new episode."""
-            proposal_key, mix_key = jax.random.split(key)
+            proposal_key, mix_key, log_key = jax.random.split(key, 3)
             
             # Compare current traj_id with stored traj_id to detect resets
             current_traj_id = env_state.info["traj_id"]
             stored_traj_id = env_state.info.get("last_traj_id", current_traj_id - 1)
             is_new_episode = current_traj_id != stored_traj_id  # shape (num_envs,)
+            
+            # Log Q-value grid analysis when resets occur (every million steps)
+            # Use io_callback to check interval and log (side effect)
+            # Optimized to use only one reset state and limit candidate states to avoid memory issues
+            def compute_and_log_q_grid(buffer_state, training_state, env_state, log_key, is_new_episode):
+                # Find the first environment that reset
+                # argmax on boolean array returns first True index, or 0 if all False
+                # But we only call this when jnp.any(is_new_episode) is True, so safe
+                reset_idx = jnp.argmax(is_new_episode.astype(jnp.int32))
+                s0 = env_state.obs[reset_idx, :state_size]  # (state_dim,) - state from environment that reset
+                
+                # Sample candidate states from replay buffer
+                log_buffer_state, replay_sample = replay_buffer.sample(buffer_state)
+                
+                # Extract candidate states from replay buffer
+                candidate_observations = replay_sample.observation  # (num_envs, episode_length, obs_dim)
+                candidate_traj_ids = replay_sample.extras["state_extras"]["traj_id"]
+                
+                # Flatten to get all candidate states
+                if candidate_observations.ndim == 3:
+                    num_envs_buf, episode_length, obs_dim = candidate_observations.shape
+                    candidate_observations_flat = candidate_observations.reshape(-1, obs_dim)
+                    candidate_traj_ids_flat = candidate_traj_ids.flatten()
+                else:
+                    candidate_observations_flat = candidate_observations
+                    candidate_traj_ids_flat = candidate_traj_ids.flatten() if candidate_traj_ids.ndim > 1 else candidate_traj_ids
+                
+                # Extract candidate states (not full observations)
+                candidate_states_all = candidate_observations_flat[:, :state_size]  # (num_candidates_all, state_dim)
+                num_candidates_all = candidate_states_all.shape[0]
+                
+                # Limit number of candidate states to avoid memory issues (sample up to 500)
+                max_candidates = 500
+                if num_candidates_all > max_candidates:
+                    # Randomly sample max_candidates states
+                    indices = jax.random.permutation(log_key, num_candidates_all)[:max_candidates]
+                    candidate_states = candidate_states_all[indices]
+                    candidate_traj_ids_sampled = candidate_traj_ids_flat[indices]
+                else:
+                    candidate_states = candidate_states_all
+                    candidate_traj_ids_sampled = candidate_traj_ids_flat
+                
+                num_candidates = candidate_states.shape[0]
+                
+                # Check if we have an ensemble
+                critic_params = training_state.critic_state.params
+                is_ensemble = isinstance(critic_params["sa_encoder"], list)
+                if is_ensemble:
+                    stacked_sa_params, stacked_g_params = stack_ensemble_params(critic_params)
+                    num_ensemble = len(critic_params["sa_encoder"])
+                else:
+                    num_ensemble = 1
+                    stacked_sa_params = None
+                    stacked_g_params = None
+                
+                # Compute Q(s0, pi(s0, s), s) for all candidate states s
+                # Expand s0 to match number of candidates
+                s0_expanded = jnp.repeat(s0[None, :], num_candidates, axis=0)  # (num_candidates, state_dim)
+                
+                if is_ensemble:
+                    # Extract goal portions from candidate states
+                    candidate_goals = candidate_states[:, train_env.goal_indices]  # (num_candidates, goal_dim)
+                    all_q = compute_q_values_ensemble(
+                        s0_expanded, candidate_goals, actor, training_state.actor_state.params,
+                        stacked_sa_params, stacked_g_params, sa_encoder, g_encoder,
+                        self.energy_fn, expand_goals=False
+                    )  # (num_ensemble, num_candidates)
+                    q_values = all_q.T  # (num_candidates, num_ensemble)
+                else:
+                    # Single critic - compute for all candidates
+                    candidate_goals = candidate_states[:, train_env.goal_indices]  # (num_candidates, goal_dim)
+                    obs_pairs = jnp.concatenate([s0_expanded, candidate_goals], axis=1)  # (num_candidates, obs_dim)
+                    means, _ = actor.apply(training_state.actor_state.params, obs_pairs)
+                    actions = jnp.tanh(means)  # (num_candidates, action_dim)
+                    sa_pairs = jnp.concatenate([s0_expanded, actions], axis=1)  # (num_candidates, state_dim + action_dim)
+                    phi_sa = sa_encoder.apply(critic_params['sa_encoder'], sa_pairs)  # (num_candidates, encoding_dim)
+                    psi_g = g_encoder.apply(critic_params['g_encoder'], candidate_goals)  # (num_candidates, encoding_dim)
+                    from .losses import energy_fn as energy_fn_import
+                    q_values_single = energy_fn_import(self.energy_fn, phi_sa, psi_g)  # (num_candidates,)
+                    q_values = q_values_single[:, None]  # (num_candidates, 1) for consistency
+                
+                # Log via io_callback (check interval inside callback)
+                # Note: Cannot pass Python strings to io_callback, so we pass checkpoint_logdir as a flag
+                # The callback will reconstruct the path
+                checkpoint_logdir_flag = jnp.array(1.0 if config.checkpoint_logdir else 0.0)
+                jax.experimental.io_callback(
+                    _log_q_value_grid_analysis_impl,
+                    None,
+                    candidate_states,  # Candidate states from replay buffer (limited)
+                    s0[None, :],  # Single reset state (s0)
+                    q_values,  # Q-values: (num_candidates, num_ensemble)
+                    train_env.goal_indices,
+                    candidate_traj_ids_sampled,
+                    training_state.env_steps,
+                    num_ensemble,
+                    checkpoint_logdir_flag,
+                )
+                return buffer_state
+            
+            # Only compute and log when at least one environment reset
+            # Use jax.lax.cond to conditionally execute
+            has_reset = jnp.any(is_new_episode)
+            buffer_state = jax.lax.cond(
+                has_reset,
+                lambda bs, ts, es, lk, ine: compute_and_log_q_grid(bs, ts, es, lk, ine),
+                lambda bs, ts, es, lk, ine: bs,  # Return buffer_state unchanged if no reset
+                buffer_state,
+                training_state,
+                env_state,
+                log_key,
+                is_new_episode,
+            )
             
             # Propose new goals
             new_goals, buffer_state = goal_proposer.propose_goals(
