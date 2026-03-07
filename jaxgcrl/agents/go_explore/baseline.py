@@ -57,7 +57,7 @@ class Baseline:
 
     disable_entropy_actor: bool = False
 
-    max_replay_size: int = 100000
+    max_replay_size: int = 10000
     min_replay_size: int = 1000
     unroll_length: int = 50
     h_dim: int = 256
@@ -92,9 +92,7 @@ class Baseline:
         assert config.num_envs * (config.episode_length - 1) % self.batch_size == 0, (
             "num_envs * (episode_length - 1) must be divisible by batch_size"
         )
-        assert (config.episode_length - 1) % self.unroll_length == 0, (
-            f"episode_length ({config.episode_length}) must be divisible by unroll_length ({self.unroll_length})"
-        )
+        # Removed assertion about episode_length / unroll_length since we're using auto-resets with unroll_length
 
     def train_fn(
         self,
@@ -110,24 +108,12 @@ class Baseline:
 
         unwrapped_env = train_env
         
-        # Create goal proposer and modify reset to use it
+        # Create goal proposer (will be used to reset envs when they auto-reset)
         goal_proposer = create_goal_proposer(
             self.goal_proposer_name,
             unwrapped_env,
             config.num_envs,
         )
-        original_reset = unwrapped_env.reset
-        
-        def reset_with_goal_proposer(rng: jax.Array) -> State:
-            """Reset with goal proposer.
-            
-            Args:
-                rng: Single random key (will be vmap'd by training wrapper)
-            """
-            goal = goal_proposer(rng)  # Shape: (goal_dim,)
-            return original_reset(rng, goal=goal)
-        
-        unwrapped_env.reset = reset_with_goal_proposer
         
         train_env = TrajectoryIdWrapper(train_env)
         train_env = envs.training.wrap(
@@ -143,12 +129,8 @@ class Baseline:
             action_repeat=config.action_repeat,
         )
 
-        # NOTE: an actor_step here is a whole config.episode_length long episode
-        # episode_length includes initial state, so we have (episode_length - 1) transitions
-        num_unrolls_per_episode = (config.episode_length - 1) // self.unroll_length
-        env_steps_per_actor_step = config.num_envs * (config.episode_length - 1)
-        
-        # Prefill uses unroll_length (original behavior)
+        # Use unroll_length directly (original behavior with auto-resets)
+        env_steps_per_actor_step = config.num_envs * self.unroll_length
         num_prefill_env_steps = self.min_replay_size * config.num_envs
         num_prefill_actor_steps = int(np.ceil(self.min_replay_size / self.unroll_length))
         
@@ -162,10 +144,6 @@ class Baseline:
             "total_env_steps too small for given num_envs and episode_length"
         )
 
-        logging.info(
-            "num_unrolls_per_episode: %d",
-            num_unrolls_per_episode,
-        )
         logging.info(
             "num_prefill_env_steps: %d",
             num_prefill_env_steps,
@@ -329,6 +307,45 @@ class Baseline:
 
             (env_state, _), data = jax.lax.scan(f, (env_state, key), (), length=self.unroll_length)
 
+            # Check which environments have reset (truncation=True in last timestep)
+            # data.extras["state_extras"]["truncation"] shape: (unroll_length, num_envs)
+            last_truncation = data.extras["state_extras"]["truncation"][-1]  # (num_envs,)
+            
+            # Propose goals for all environments (we'll only use them for ones that reset)
+            reset_key, _ = jax.random.split(key)
+            reset_rngs = jax.random.split(reset_key, config.num_envs)
+            proposed_goals = jax.vmap(goal_proposer)(reset_rngs)  # (num_envs, goal_dim)
+            
+            # Reset environments that have truncated with proposed goals
+            reset_mask = last_truncation.astype(jnp.bool_)  # (num_envs,)
+            
+            # The training wrapper already auto-reset them, so we reset again with our goals
+            def reset_env_with_goal(rng_key, goal, should_reset, current_state):
+                """Reset environment if should_reset is True, otherwise return current_state."""
+                def do_reset():
+                    # Reset through unwrapped_env with proposed goal - this already sets everything correctly
+                    new_state = unwrapped_env.reset(rng_key, goal=goal)
+                    # Update info fields to match what training wrapper would set on reset:
+                    # - first_obs: new observation from reset
+                    # - first_pipeline_state: new pipeline_state from reset
+                    # - steps: reset to 0 (or initial value)
+                    # - truncation: reset to 0/False
+                    # - traj_id: preserve from current_state (maintains trajectory continuity)
+                    new_info = dict(current_state.info)
+                    new_info['first_obs'] = new_state.obs
+                    new_info['first_pipeline_state'] = new_state.pipeline_state
+                    new_info['steps'] = jnp.array(0.0)  # Reset step count
+                    new_info['truncation'] = jnp.array(0.0)  # Reset truncation flag
+                    # traj_id is preserved from current_state
+                    new_state = new_state.replace(info=new_info)
+                    return new_state
+                def no_reset():
+                    return current_state
+                return jax.lax.cond(should_reset, do_reset, no_reset)
+            
+            reset_fn = jax.vmap(reset_env_with_goal, in_axes=(0, 0, 0, 0))
+            env_state = reset_fn(reset_rngs, proposed_goals, reset_mask, env_state)
+            
             buffer_state = replay_buffer.insert(buffer_state, data)
             return env_state, buffer_state
 
@@ -418,24 +435,13 @@ class Baseline:
         def training_step(training_state, env_state, buffer_state, key):
             experience_key1, process_key, training_key = jax.random.split(key, 3)
 
-            # Collect full episode by calling get_experience num_unrolls_per_episode times
-            def collect_unroll(carry, unused):
-                env_state, buffer_state, key = carry
-                key, next_key = jax.random.split(key)
-                env_state, buffer_state = get_experience(
-                    training_state.actor_state,
-                    env_state,
-                    buffer_state,
-                    key,
-                    is_deterministic=False,
-                )
-                return (env_state, buffer_state, next_key), ()
-            
-            (env_state, buffer_state, _), _ = jax.lax.scan(
-                collect_unroll,
-                (env_state, buffer_state, experience_key1),
-                (),
-                length=num_unrolls_per_episode,
+            # Collect unroll_length steps (with auto-resets)
+            env_state, buffer_state = get_experience(
+                training_state.actor_state,
+                env_state,
+                buffer_state,
+                experience_key1,
+                is_deterministic=False,
             )
 
             training_state = training_state.replace(
@@ -513,6 +519,7 @@ class Baseline:
         )
 
         training_walltime = 0
+        last_visualization_step = -1  # Track last step we visualized at
         logging.info("starting training....")
         for ne in range(config.num_evals):
             t = time.time()
@@ -549,16 +556,19 @@ class Baseline:
             elif self.agent_type == "sac":  # SAC
                 make_policy = lambda param: lambda obs, rng: (actor.sample_actions(param, obs, rng, is_deterministic=True), {})
 
-            # Visualize trajectories
-            key, viz_key = jax.random.split(key)
-            buffer_state = all_visualizations(
-                replay_buffer=replay_buffer,
-                buffer_state=buffer_state,
-                env=unwrapped_env,
-                state_size=state_size,
-                goal_indices=tuple(train_env.goal_indices),
-                rng_key=viz_key,
-            )
+            # Visualize trajectories every 1M steps (robust check that handles step skips)
+            # Check if we've crossed a 1M boundary since last visualization
+            if current_step // 1_000_000 > last_visualization_step // 1_000_000:
+                key, viz_key = jax.random.split(key)
+                buffer_state = all_visualizations(
+                    replay_buffer=replay_buffer,
+                    buffer_state=buffer_state,
+                    env=unwrapped_env,
+                    state_size=state_size,
+                    goal_indices=tuple(train_env.goal_indices),
+                    rng_key=viz_key,
+                )
+                last_visualization_step = current_step
 
             progress_fn(
                 current_step,
