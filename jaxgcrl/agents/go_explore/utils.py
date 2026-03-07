@@ -1,9 +1,10 @@
 import functools
 import pickle
-from typing import Any
+from typing import Any, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from etils import epath
 
 
@@ -81,3 +82,86 @@ def flatten_batch(buffer_config, transition, sample_key):
         discount=jnp.squeeze(transition.discount[:-1]),
         extras=extras,
     )
+
+
+def sample_trajectories_from_buffer(
+    replay_buffer,
+    buffer_state,
+    state_size: int,
+    goal_indices: Tuple[int, ...],
+    rng_key: jax.Array,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Sample trajectories from the replay buffer and extract positions.
+    
+    Args:
+        replay_buffer: The replay buffer instance
+        buffer_state: Current buffer state (will be modified by sampling)
+        state_size: Size of state dimension
+        goal_indices: Indices for x, y positions (typically [0, 1])
+        rng_key: Random key for sampling
+        
+    Returns:
+        Tuple of (all_positions, final_positions) where:
+        - all_positions: (N, 2) array of [x, y] positions from all states
+        - final_positions: (M, 2) array of [x, y] positions from final states
+    """
+    # Check buffer size
+    buffer_size = replay_buffer.size(buffer_state)
+    if buffer_size == 0:
+        return np.array([]).reshape(0, 2), np.array([]).reshape(0, 2)
+    
+    # Sample from buffer - use whatever it gives us
+    current_buffer_state, transitions = replay_buffer.sample(buffer_state)
+    
+    # transitions.observation shape: (num_envs, episode_length, obs_size)
+    # transitions.extras["state_extras"]["traj_id"] shape: (num_envs, episode_length)
+    # transitions.extras["state_extras"]["truncation"] shape: (num_envs, episode_length)
+    
+    # Flatten to (num_envs * episode_length, obs_size)
+    obs_flat = jnp.reshape(transitions.observation, (-1, transitions.observation.shape[-1]))
+    traj_id_flat = jnp.reshape(transitions.extras["state_extras"]["traj_id"], (-1,))
+    truncation_flat = jnp.reshape(transitions.extras["state_extras"]["truncation"], (-1,))
+    
+    # Extract x, y positions from observations (first state_size elements contain state)
+    positions = obs_flat[:, :state_size][:, list(goal_indices)]  # (N, 2)
+    
+    # Convert to numpy for easier processing
+    positions_np = np.array(positions)
+    traj_ids_np = np.array(traj_id_flat)
+    truncations_np = np.array(truncation_flat)
+    
+    # Get all positions (for all states plot)
+    all_positions = positions_np
+    
+    # Get final positions (where truncation is True, or last state of each trajectory)
+    final_positions = []
+    unique_traj_ids = np.unique(traj_ids_np)
+    
+    for traj_id in unique_traj_ids:
+        traj_mask = traj_ids_np == traj_id
+        traj_positions = positions_np[traj_mask]
+        traj_truncations = truncations_np[traj_mask]
+        
+        # Find final state: either where truncation is True, or last state
+        final_idx = np.where(traj_truncations)[0]
+        if len(final_idx) > 0:
+            # Use first truncation point as final state
+            final_positions.append(traj_positions[final_idx[0]])
+        else:
+            # Use last state if no truncation found
+            if len(traj_positions) > 0:
+                final_positions.append(traj_positions[-1])
+    
+    if len(final_positions) == 0:
+        final_positions = np.array([]).reshape(0, 2)
+    else:
+        final_positions = np.array(final_positions)
+    
+    # Randomly sample 512 points from all states (keep all final states)
+    if len(all_positions) > 512:
+        rng = np.random.RandomState(seed=42)  # Deterministic sampling
+        indices = rng.choice(len(all_positions), 512, replace=False)
+        all_positions = all_positions[indices]
+    
+    return all_positions, final_positions

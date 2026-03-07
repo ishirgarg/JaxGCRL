@@ -167,6 +167,26 @@ class AntMaze(PipelineEnv):
     ):
         xml_string, possible_starts, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
 
+        # Get maze layout to calculate bounds
+        if maze_layout_name == "u_maze":
+            maze_layout = U_MAZE
+        elif maze_layout_name == "u_maze_eval":
+            maze_layout = U_MAZE_EVAL
+        elif maze_layout_name == "big_maze":
+            maze_layout = BIG_MAZE
+        elif maze_layout_name == "big_maze_eval":
+            maze_layout = BIG_MAZE_EVAL
+        elif maze_layout_name == "hardest_maze":
+            maze_layout = HARDEST_MAZE
+        else:
+            raise ValueError(f"Unknown maze layout: {maze_layout_name}")
+
+        # Calculate x and y bounds based on maze layout dimensions
+        num_rows = len(maze_layout)
+        num_cols = len(maze_layout[0])
+        self.x_bounds = jnp.array([0.0, num_rows * maze_size_scaling])
+        self.y_bounds = jnp.array([0.0, num_cols * maze_size_scaling])
+
         sys = mjcf.loads(xml_string)
         self.possible_starts = possible_starts
         self.possible_goals = possible_goals

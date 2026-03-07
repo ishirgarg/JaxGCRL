@@ -25,6 +25,7 @@ from .types import Actor, Critic, TrainingState, Transition
 from .algorithms import get_algorithm
 from .utils import save_params
 from .losses import update_alpha_sac, update_critic_sac, update_actor_sac
+from .visualization import all_visualizations
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -491,6 +492,17 @@ class Baseline:
                 make_policy = lambda param: lambda obs, rng: actor.apply(param, obs)
             elif self.agent_type == "sac":  # SAC
                 make_policy = lambda param: lambda obs, rng: (actor.sample_actions(param, obs, rng, is_deterministic=True), {})
+
+            # Visualize trajectories
+            key, viz_key = jax.random.split(key)
+            all_visualizations(
+                replay_buffer=replay_buffer,
+                buffer_state=buffer_state,
+                env=unwrapped_env,
+                state_size=state_size,
+                goal_indices=tuple(train_env.goal_indices),
+                rng_key=viz_key,
+            )
 
             progress_fn(
                 current_step,
