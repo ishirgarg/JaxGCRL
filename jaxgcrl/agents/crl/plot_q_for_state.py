@@ -839,13 +839,13 @@ def main():
             sqrt_C = np.sqrt(C)
             
             # Compute mean and std properly
-            # f = mean(exp(Q)) - mean of exponentiated Q-values
+            # f = exp(mean(Q)) - exponentiate after taking mean
             # s = std(Q) - standard deviation BEFORE exponentiating
             if q_matrix_all.ndim == 3 and q_matrix_all.shape[2] > 1:  # Ensemble case
-                # Exponentiate all Q-values first
-                q_exp_all = np.exp(q_matrix_all)  # (num_states, num_states, num_ensemble)
-                # f = mean(exp(Q))
-                q_exp_mean = np.mean(q_exp_all, axis=2)  # (num_states, num_states)
+                # First compute mean of Q-values across ensemble
+                q_mean = np.mean(q_matrix_all, axis=2)  # (num_states, num_states)
+                # Then exponentiate: f = exp(mean(Q))
+                q_exp_mean = np.exp(q_mean)  # (num_states, num_states)
                 # s = std(Q) - compute std BEFORE exponentiating
                 q_exp_std = np.std(q_matrix_all, axis=2)  # (num_states, num_states)
             else:
