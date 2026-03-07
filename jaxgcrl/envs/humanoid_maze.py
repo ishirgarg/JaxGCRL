@@ -153,7 +153,7 @@ class HumanoidMaze(PipelineEnv):
         forward_reward_weight=1.25,
         ctrl_cost_weight=0.1,
         healthy_reward=5.0,
-        terminate_when_unhealthy=True,
+        terminate_when_unhealthy=False,
         healthy_z_range=(1.0, 2.0),
         reset_noise_scale=0.0,
         exclude_current_positions_from_observation=False,

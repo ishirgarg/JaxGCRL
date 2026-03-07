@@ -154,7 +154,7 @@ class AntMaze(PipelineEnv):
         use_contact_forces=False,
         contact_cost_weight=5e-4,
         healthy_reward=1.0,
-        terminate_when_unhealthy=True,
+        terminate_when_unhealthy=False,
         healthy_z_range=(0.2, 1.0),
         contact_force_range=(-1.0, 1.0),
         reset_noise_scale=0.1,
@@ -244,6 +244,7 @@ class AntMaze(PipelineEnv):
         # set the start and target q, qd
         start = self._random_start(rng2)
         q = q.at[:2].set(start)
+
 
         target = self._random_target(rng3)
         q = q.at[-2:].set(target)
