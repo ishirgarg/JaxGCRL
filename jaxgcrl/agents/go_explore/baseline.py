@@ -83,9 +83,13 @@ class Baseline:
         episode_length: the maximum length of an episode
             NOTE: `num_envs * (episode_length - 1)` must be divisible by
             `batch_size` due to the way data is stored in replay buffer.
+            NOTE: `episode_length` must be divisible by `unroll_length`.
         """
         assert config.num_envs * (config.episode_length - 1) % self.batch_size == 0, (
             "num_envs * (episode_length - 1) must be divisible by batch_size"
+        )
+        assert config.episode_length % self.unroll_length == 0, (
+            f"episode_length ({config.episode_length}) must be divisible by unroll_length ({self.unroll_length})"
         )
 
     def train_fn(
@@ -115,17 +119,28 @@ class Baseline:
             action_repeat=config.action_repeat,
         )
 
-        env_steps_per_actor_step = config.num_envs * self.unroll_length
+        # NOTE: an actor_step here is a whole config.episode_length long episode
+        num_unrolls_per_episode = config.episode_length // self.unroll_length
+        env_steps_per_actor_step = config.num_envs * config.episode_length
+        
+        # Prefill uses unroll_length (original behavior)
         num_prefill_env_steps = self.min_replay_size * config.num_envs
-        num_prefill_actor_steps = np.ceil(self.min_replay_size / self.unroll_length)
-        num_training_steps_per_epoch = (config.total_env_steps - num_prefill_env_steps) // (
-            config.num_evals * env_steps_per_actor_step
-        )
+        num_prefill_actor_steps = int(np.ceil(self.min_replay_size / self.unroll_length))
+        
+        # Calculate training steps per epoch
+        # Available env steps for training = total - prefill
+        available_env_steps = config.total_env_steps - num_prefill_env_steps
+        env_steps_per_epoch = available_env_steps // config.num_evals
+        num_training_steps_per_epoch = env_steps_per_epoch // env_steps_per_actor_step
 
         assert num_training_steps_per_epoch > 0, (
             "total_env_steps too small for given num_envs and episode_length"
         )
 
+        logging.info(
+            "num_unrolls_per_episode: %d",
+            num_unrolls_per_episode,
+        )
         logging.info(
             "num_prefill_env_steps: %d",
             num_prefill_env_steps,
@@ -133,6 +148,10 @@ class Baseline:
         logging.info(
             "num_prefill_actor_steps: %d",
             num_prefill_actor_steps,
+        )
+        logging.info(
+            "env_steps_per_epoch: %d",
+            env_steps_per_epoch,
         )
         logging.info(
             "num_training_steps_per_epoch: %d",
@@ -301,8 +320,9 @@ class Baseline:
                     key,
                     is_deterministic=False,
                 )
+                # Prefill uses unroll_length steps per call
                 training_state = training_state.replace(
-                    env_steps=training_state.env_steps + env_steps_per_actor_step,
+                    env_steps=training_state.env_steps + config.num_envs * self.unroll_length,
                 )
                 return (training_state, env_state, buffer_state, new_key), ()
 
@@ -373,13 +393,24 @@ class Baseline:
         def training_step(training_state, env_state, buffer_state, key):
             experience_key1, process_key, training_key = jax.random.split(key, 3)
 
-            # update buffer
-            env_state, buffer_state = get_experience(
-                training_state.actor_state,
-                env_state,
-                buffer_state,
-                experience_key1,
-                is_deterministic=False,
+            # Collect full episode by calling get_experience num_unrolls_per_episode times
+            def collect_unroll(carry, unused):
+                env_state, buffer_state, key = carry
+                key, next_key = jax.random.split(key)
+                env_state, buffer_state = get_experience(
+                    training_state.actor_state,
+                    env_state,
+                    buffer_state,
+                    key,
+                    is_deterministic=False,
+                )
+                return (env_state, buffer_state, next_key), ()
+            
+            (env_state, buffer_state, _), _ = jax.lax.scan(
+                collect_unroll,
+                (env_state, buffer_state, experience_key1),
+                (),
+                length=num_unrolls_per_episode,
             )
 
             training_state = training_state.replace(
