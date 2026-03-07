@@ -21,114 +21,20 @@ from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
-from .losses import update_actor_and_alpha, update_critic
-from .networks import Actor, Encoder
+from .types import Actor, Critic, TrainingState, Transition
+from .algorithms import get_algorithm
+from .utils import save_params
+from .losses import update_alpha_sac, update_critic_sac, update_actor_sac
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
 State = Union[envs.State, envs_v1.State]
 
-
 @dataclass
-class TrainingState:
-    """Contains training state for the learner"""
-
-    env_steps: jnp.ndarray
-    gradient_steps: jnp.ndarray
-    actor_state: TrainState
-    critic_state: TrainState
-    alpha_state: TrainState
-
-
-class Transition(NamedTuple):
-    """Container for a transition"""
-
-    observation: jnp.ndarray
-    action: jnp.ndarray
-    reward: jnp.ndarray
-    discount: jnp.ndarray
-    extras: jnp.ndarray = ()
-
-
-@functools.partial(jax.jit, static_argnames=("buffer_config"))
-def flatten_batch(buffer_config, transition, sample_key):
-    gamma, state_size, goal_indices = buffer_config
-
-    # Because it's vmaped transition.obs.shape is of shape (episode_len, obs_dim)
-    seq_len = transition.observation.shape[0]
-    arrangement = jnp.arange(seq_len)
-    is_future_mask = jnp.array(
-        arrangement[:, None] < arrangement[None], dtype=jnp.float32
-    )  # upper triangular matrix of shape seq_len, seq_len where all non-zero entries are 1
-    discount = gamma ** jnp.array(arrangement[None] - arrangement[:, None], dtype=jnp.float32)
-    probs = is_future_mask * discount
-
-    # probs is an upper triangular matrix of shape seq_len, seq_len of the form:
-    #    [[0.        , 0.99      , 0.98010004, 0.970299  , 0.960596 ],
-    #    [0.        , 0.        , 0.99      , 0.98010004, 0.970299  ],
-    #    [0.        , 0.        , 0.        , 0.99      , 0.98010004],
-    #    [0.        , 0.        , 0.        , 0.        , 0.99      ],
-    #    [0.        , 0.        , 0.        , 0.        , 0.        ]]
-    # assuming seq_len = 5
-    # the same result can be obtained using probs = is_future_mask * (gamma ** jnp.cumsum(is_future_mask, axis=-1))
-
-    single_trajectories = jnp.concatenate(
-        [transition.extras["state_extras"]["traj_id"][:, jnp.newaxis].T] * seq_len,
-        axis=0,
-    )
-    # array of seq_len x seq_len where a row is an array of traj_ids that correspond to the episode index from which that time-step was collected
-    # timesteps collected from the same episode will have the same traj_id. All rows of the single_trajectories are same.
-
-    probs = probs * jnp.equal(single_trajectories, single_trajectories.T) + jnp.eye(seq_len) * 1e-5
-    # ith row of probs will be non zero only for time indices that
-    # 1) are greater than i
-    # 2) have the same traj_id as the ith time index
-
-    goal_index = jax.random.categorical(sample_key, jnp.log(probs))
-    future_state = jnp.take(
-        transition.observation, goal_index[:-1], axis=0
-    )  # the last goal_index cannot be considered as there is no future.
-    future_action = jnp.take(transition.action, goal_index[:-1], axis=0)
-    goal = future_state[:, goal_indices]
-    future_state = future_state[:, :state_size]
-    state = transition.observation[:-1, :state_size]  # all states are considered
-    new_obs = jnp.concatenate([state, goal], axis=1)
-
-    extras = {
-        "policy_extras": {},
-        "state_extras": {
-            "truncation": jnp.squeeze(transition.extras["state_extras"]["truncation"][:-1]),
-            "traj_id": jnp.squeeze(transition.extras["state_extras"]["traj_id"][:-1]),
-        },
-        "state": state,
-        "future_state": future_state,
-        "future_action": future_action,
-    }
-
-    return transition._replace(
-        observation=jnp.squeeze(new_obs),  # this has shape (num_envs, episode_length-1, obs_size)
-        action=jnp.squeeze(transition.action[:-1]),
-        reward=jnp.squeeze(transition.reward[:-1]),
-        discount=jnp.squeeze(transition.discount[:-1]),
-        extras=extras,
-    )
-
-
-def load_params(path: str):
-    with epath.Path(path).open("rb") as fin:
-        buf = fin.read()
-    return pickle.loads(buf)
-
-
-def save_params(path: str, params: Any):
-    """Saves parameters in flax format."""
-    with epath.Path(path).open("wb") as fout:
-        fout.write(pickle.dumps(params))
-
-
-@dataclass
-class CRL:
+class Baseline:
     """Contrastive Reinforcement Learning (CRL) agent."""
+
+    agent_type: Literal["sac", "crl"] = "crl"
 
     policy_lr: float = 3e-4
     critic_lr: float = 3e-4
@@ -161,6 +67,11 @@ class CRL:
 
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
+
+    # SAC specific
+    tau: float = 0.005
+    n_critics: int = 2
+    use_her: bool = True  # Hindsight Experience Replay
 
     def check_config(self, config):
         """
@@ -226,7 +137,7 @@ class CRL:
         random.seed(config.seed)
         np.random.seed(config.seed)
         key = jax.random.PRNGKey(config.seed)
-        key, buffer_key, eval_env_key, env_key, actor_key, sa_key, g_key = jax.random.split(key, 7)
+        key, buffer_key, eval_env_key, env_key, actor_key, critic_key = jax.random.split(key, 6)
 
         env_keys = jax.random.split(env_key, config.num_envs)
         env_state = jax.jit(train_env.reset)(env_keys)
@@ -242,42 +153,35 @@ class CRL:
         )
 
         # Network setup
-        # Actor
-        actor = Actor(
+        actor, critic = get_algorithm(
+            agent_type=self.agent_type,
             action_size=action_size,
-            network_width=self.h_dim,
-            network_depth=self.n_hidden,
+            obs_size=obs_size,
+            state_size=state_size,
+            goal_indices=train_env.goal_indices,
+            h_dim=self.h_dim,
+            n_hidden=self.n_hidden,
             skip_connections=self.skip_connections,
             use_relu=self.use_relu,
+            use_ln=self.use_ln,
+            repr_dim=self.repr_dim,
+            discounting=self.discounting,
+            energy_fn=self.energy_fn,
+            n_critics=self.n_critics,  # SAC-specific
         )
+
+        actor_params = actor.init(actor_key, np.ones([1, obs_size]))
+        critic_params = critic.init(critic_key, np.ones([1, obs_size]))
+
         actor_state = TrainState.create(
             apply_fn=actor.apply,
-            params=actor.init(actor_key, np.ones([1, obs_size])),
+            params=actor_params,
             tx=optax.adam(learning_rate=self.policy_lr),
         )
 
-        # Critic
-        sa_encoder = Encoder(
-            repr_dim=self.repr_dim,
-            network_width=self.h_dim,
-            network_depth=self.n_hidden,
-            skip_connections=self.skip_connections,
-            use_relu=self.use_relu,
-            use_ln=self.use_ln,
-        )
-        sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, state_size + action_size]))
-        g_encoder = Encoder(
-            repr_dim=self.repr_dim,
-            network_width=self.h_dim,
-            network_depth=self.n_hidden,
-            skip_connections=self.skip_connections,
-            use_relu=self.use_relu,
-            use_ln=self.use_ln,
-        )
-        g_encoder_params = g_encoder.init(g_key, np.ones([1, goal_size]))
         critic_state = TrainState.create(
-            apply_fn=None,
-            params={"sa_encoder": sa_encoder_params, "g_encoder": g_encoder_params},
+            apply_fn=critic.apply,
+            params=critic_params,
             tx=optax.adam(learning_rate=self.critic_lr),
         )
 
@@ -290,6 +194,12 @@ class CRL:
             tx=optax.adam(learning_rate=self.alpha_lr),
         )
 
+        # SAC-specific initialization
+        target_critic_params = None
+        if self.agent_type == "sac":
+            # Initialize target Q-network params (copy of critic params)
+            target_critic_params = critic_params
+
         # Trainstate
         training_state = TrainingState(
             env_steps=jnp.zeros(()),
@@ -297,6 +207,7 @@ class CRL:
             actor_state=actor_state,
             critic_state=critic_state,
             alpha_state=alpha_state,
+            target_critic_params=target_critic_params,
         )
 
         # Replay Buffer
@@ -308,6 +219,7 @@ class CRL:
             action=dummy_action,
             reward=0.0,
             discount=0.0,
+            next_observation=dummy_obs if self.agent_type == "sac" else None,  # SAC needs next_observation
             extras={
                 "state_extras": {
                     "truncation": 0.0,
@@ -332,39 +244,28 @@ class CRL:
         )
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
-        def deterministic_actor_step(training_state, env, env_state, extra_fields):
-            means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
-            actions = nn.tanh(means)
-
-            nstate = env.step(env_state, actions)
-            state_extras = {x: nstate.info[x] for x in extra_fields}
-
-            return nstate, Transition(
-                observation=env_state.obs,
-                action=actions,
-                reward=nstate.reward,
-                discount=1 - nstate.done,
-                extras={"state_extras": state_extras},
+        def actor_step(actor_state, env, env_state, key, extra_fields, is_deterministic: bool):
+            actions = jax.lax.cond(
+                is_deterministic,
+                actor.sample_actions_deterministic,
+                actor.sample_actions,
+                actor_state.params,
+                env_state.obs,
+                key
             )
-
-        def actor_step(actor_state, env, env_state, key, extra_fields):
-            means, log_stds = actor.apply(actor_state.params, env_state.obs)
-            stds = jnp.exp(log_stds)
-            actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
-
             nstate = env.step(env_state, actions)
             state_extras = {x: nstate.info[x] for x in extra_fields}
-
             return nstate, Transition(
-                observation=env_state.obs,
-                action=actions,
-                reward=nstate.reward,
+                observation=env_state.obs, 
+                action=actions, 
+                reward=nstate.reward, 
                 discount=1 - nstate.done,
-                extras={"state_extras": state_extras},
+                next_observation=nstate.obs if self.agent_type == "sac" else None,  # SAC needs next_observation
+                extras={"state_extras": state_extras}
             )
 
         @jax.jit
-        def get_experience(actor_state, env_state, buffer_state, key):
+        def get_experience(actor_state, env_state, buffer_state, key, is_deterministic: bool):
             @jax.jit
             def f(carry, unused_t):
                 env_state, current_key = carry
@@ -375,6 +276,7 @@ class CRL:
                     env_state,
                     current_key,
                     extra_fields=("truncation", "traj_id"),
+                    is_deterministic=is_deterministic,
                 )
                 return (env_state, next_key), transition
 
@@ -410,7 +312,10 @@ class CRL:
         @jax.jit
         def update_networks(carry, transitions):
             training_state, key = carry
-            key, critic_key, actor_key = jax.random.split(key, 3)
+            if self.agent_type == "sac":
+                key, alpha_key, critic_key, actor_key = jax.random.split(key, 4)
+            else:
+                key, critic_key, actor_key = jax.random.split(key, 3)
 
             context = dict(
                 **vars(self),
@@ -425,21 +330,39 @@ class CRL:
 
             networks = dict(
                 actor=actor,
-                sa_encoder=sa_encoder,
-                g_encoder=g_encoder,
+                critic=critic,
             )
+            # For CRL, add encoders to networks dict
+            if self.agent_type == "crl":
+                networks["sa_encoder"] = critic.sa_encoder
+                networks["g_encoder"] = critic.g_encoder
 
-            training_state, actor_metrics = update_actor_and_alpha(
-                context, networks, transitions, training_state, actor_key
-            )
-            training_state, critic_metrics = update_critic(
-                context, networks, transitions, training_state, critic_key
-            )
-            training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
-
+            # Update order: match original implementations exactly
+            # CRL: actor (with alpha) then critic (original CRL order)
+            # SAC: alpha, critic, then actor (original SAC order - line 362, 371, 381)
             metrics = {}
-            metrics.update(actor_metrics)
+            if self.agent_type == "crl":
+                training_state, actor_metrics = actor.update(context, networks, transitions, training_state, actor_key)
+                training_state, critic_metrics = critic.update(context, networks, transitions, training_state, critic_key)
+            else:  # SAC
+                # SAC updates: alpha first, then critic, then actor (matching original)
+                training_state, alpha_metrics = update_alpha_sac(context, networks, transitions, training_state, alpha_key)
+                training_state, critic_metrics = critic.update(context, networks, transitions, training_state, critic_key)
+                training_state, actor_metrics = actor.update(context, networks, transitions, training_state, actor_key)
+                metrics.update(alpha_metrics)
             metrics.update(critic_metrics)
+            metrics.update(actor_metrics)
+            
+            # Update target networks for SAC
+            if self.agent_type == "sac" and training_state.target_critic_params is not None:
+                new_target_critic_params = jax.tree_util.tree_map(
+                    lambda x, y: x * (1 - self.tau) + y * self.tau,
+                    training_state.target_critic_params,
+                    training_state.critic_state.params,
+                )
+                training_state = training_state.replace(target_critic_params=new_target_critic_params)
+            
+            training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
 
             return (
                 training_state,
@@ -448,7 +371,7 @@ class CRL:
 
         @jax.jit
         def training_step(training_state, env_state, buffer_state, key):
-            experience_key1, experience_key2, sampling_key, training_key = jax.random.split(key, 4)
+            experience_key1, process_key, training_key = jax.random.split(key, 3)
 
             # update buffer
             env_state, buffer_state = get_experience(
@@ -464,26 +387,13 @@ class CRL:
 
             # sample actor-step worth of transitions
             buffer_state, transitions = replay_buffer.sample(buffer_state)
-
-            # process transitions for training
-            batch_keys = jax.random.split(sampling_key, transitions.observation.shape[0])
-            transitions = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
-                (self.discounting, state_size, tuple(train_env.goal_indices)),
-                transitions,
-                batch_keys,
+            
+            # Process transitions (algorithm-specific: flatten_batch, reshape, permute)
+            transitions, _ = actor.process_transitions(
+                transitions, process_key, self.batch_size, self.discounting, state_size, 
+                tuple(train_env.goal_indices), train_env.goal_reach_thresh, self.use_her
             )
-            transitions = jax.tree_util.tree_map(
-                lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"), transitions
-            )
-
-            # permute transitions
-            permutation = jax.random.permutation(experience_key2, len(transitions.observation))
-            transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
-            transitions = jax.tree_util.tree_map(
-                lambda x: jnp.reshape(x, (-1, self.batch_size) + x.shape[1:]),
-                transitions,
-            )
-
+            
             # take actor-step worth of training-step
             (
                 (
@@ -538,7 +448,7 @@ class CRL:
 
         """Setting up evaluator"""
         evaluator = ActorEvaluator(
-            deterministic_actor_step,
+            lambda ts, env, es, ef: functools.partial(actor_step, key=jax.random.PRNGKey(0), is_deterministic=True)(ts.actor_state, env, es, ef),
             eval_env,
             num_eval_envs=config.num_eval_envs,
             episode_length=config.episode_length,
@@ -575,7 +485,7 @@ class CRL:
             logging.info("step: %d", current_step)
 
             do_render = ne % config.visualization_interval == 0
-            make_policy = lambda param: lambda obs, rng: actor.apply(param, obs)
+            make_policy = lambda param: lambda obs, rng: actor.sample_actions(param, obs, rng)
 
             progress_fn(
                 current_step,
