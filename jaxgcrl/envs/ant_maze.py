@@ -226,7 +226,7 @@ class AntMaze(PipelineEnv):
         q = q.at[:2].set(start)
 
 
-        target = jax.lax.cond(goal is None, lambda: self._random_target(rng3), lambda: goal)
+        target = self._random_target(rng3)
         q = q.at[-2:].set(target)
 
         qd = qd.at[-2:].set(0)
