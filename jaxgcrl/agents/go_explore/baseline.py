@@ -448,7 +448,7 @@ class Baseline:
 
         """Setting up evaluator"""
         evaluator = ActorEvaluator(
-            lambda ts, env, es, ef: actor_step(ts.actor_state, env, es, jax.random.PRNGKey(0), ef, is_deterministic=True),
+            lambda ts, env, es, extra_fields=(): actor_step(ts.actor_state, env, es, jax.random.PRNGKey(0), extra_fields, is_deterministic=True),
             eval_env,
             num_eval_envs=config.num_eval_envs,
             episode_length=config.episode_length,
