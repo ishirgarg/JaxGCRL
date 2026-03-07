@@ -1,14 +1,67 @@
 import jax
 from brax.envs import PipelineEnv, State, Wrapper
 from jax import numpy as jnp
+from typing import Callable, Any, Optional
+
+
+class GoalProposerWrapper(Wrapper):
+    """Wrapper that intercepts reset calls and uses a goal proposer to set goals.
+    
+    The goal proposer can be a simple function `(rng) -> goal` or a more complex
+    function `(rng, goal_proposer_state) -> goal` that takes additional state.
+    
+    For goal proposers that need training state (buffer, critic params, etc.),
+    use `update_goal_proposer_state()` to update the state, and the goal proposer
+    should be a closure that captures this state.
+    """
+    
+    def __init__(
+        self, 
+        env: PipelineEnv, 
+        goal_proposer: Callable[[jax.Array], jnp.ndarray],
+        goal_proposer_state: Optional[Any] = None,
+    ):
+        super().__init__(env)
+        self._goal_proposer = goal_proposer
+        self._goal_proposer_state = goal_proposer_state
+
+    def reset(self, rng: jax.Array) -> State:
+        # Propose a goal using the goal proposer
+        # If goal_proposer_state is set, the goal_proposer should be a closure
+        # that captures it, or we could pass it explicitly here if needed
+        goal = self._goal_proposer(rng)
+        # Reset the environment with the proposed goal
+        return self.env.reset(rng, goal=goal)
+    
+    def update_goal_proposer_state(self, new_state: Any) -> "GoalProposerWrapper":
+        """Create a new wrapper with updated goal proposer state.
+        
+        Since wrappers are typically immutable in JAX, this returns a new wrapper
+        instance. The goal_proposer function should be a closure that captures
+        the state, so updating the state and recreating the closure will work.
+        
+        Args:
+            new_state: New goal proposer state (buffer_state, critic_params, etc.)
+            
+        Returns:
+            New wrapper instance with updated state
+        """
+        return GoalProposerWrapper(
+            self.env,
+            self._goal_proposer,  # Closure should capture new_state
+            goal_proposer_state=new_state,
+        )
 
 
 class TrajectoryIdWrapper(Wrapper):
     def __init__(self, env: PipelineEnv):
         super().__init__(env)
 
-    def reset(self, rng: jax.Array) -> State:
-        state = self.env.reset(rng)
+    def reset(self, rng: jax.Array, goal: jax.Array = None) -> State:
+        if goal is not None:
+            state = self.env.reset(rng, goal=goal)
+        else:
+            state = self.env.reset(rng)
         state.info["traj_id"] = jnp.zeros(rng.shape[:-1])
         return state
 

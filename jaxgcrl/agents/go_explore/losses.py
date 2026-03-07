@@ -107,7 +107,7 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
     state = transitions.observation[:, : config["state_size"]]
     action = transitions.action
     goal = transitions.observation[:, config["state_size"] :]
-    
+
     critic = networks["critic"]
     n_critics = critic.n_critics
     current_params = training_state.critic_state.params
@@ -127,22 +127,22 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
             sa_input = jnp.concatenate([state, action], axis=-1)
             sa_repr = critic.sa_encoders[i].apply(critic_i_params["sa_encoder"], sa_input)
             g_repr = critic.g_encoders[i].apply(critic_i_params["g_encoder"], goal)
-            
+
             # InfoNCE
             logits = energy_fn(config["energy_fn"], sa_repr[:, None, :], g_repr[None, :, :])
             loss = contrastive_loss_fn(config["contrastive_loss_fn"], logits)
-            
+
             # logsumexp regularisation
             logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
             loss += config["logsumexp_penalty_coeff"] * jnp.mean(logsumexp**2)
-            
+
             I = jnp.eye(logits.shape[0])
             correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
             logits_pos = jnp.sum(logits * I) / jnp.sum(I)
             logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
-            
+
             return loss, (logsumexp, correct, logits_pos, logits_neg)
-        
+
         # Compute loss and gradient for this critic only
         critic_i_params = {
             "sa_encoder": current_params[f"sa_encoder_{i}"],
@@ -174,7 +174,7 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
     # Update critic state with all new parameters
     new_critic_state = training_state.critic_state.replace(params=new_params)
     training_state = training_state.replace(critic_state=new_critic_state)
-    
+
     # Average metrics for logging
     metrics = {
         "categorical_accuracy": jnp.mean(jnp.array([jnp.mean(c) for c in corrects])),

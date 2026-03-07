@@ -120,24 +120,24 @@ class CRLCritic(Critic):
         # Create n_critics pairs of encoders
         self.sa_encoders = [
             Encoder(
-                repr_dim=repr_dim,
-                network_width=network_width,
-                network_depth=network_depth,
-                skip_connections=skip_connections,
-                use_relu=use_relu,
-                use_ln=use_ln,
-            )
+            repr_dim=repr_dim,
+            network_width=network_width,
+            network_depth=network_depth,
+            skip_connections=skip_connections,
+            use_relu=use_relu,
+            use_ln=use_ln,
+        )
             for _ in range(n_critics)
         ]
         self.g_encoders = [
             Encoder(
-                repr_dim=repr_dim,
-                network_width=network_width,
-                network_depth=network_depth,
-                skip_connections=skip_connections,
-                use_relu=use_relu,
-                use_ln=use_ln,
-            )
+            repr_dim=repr_dim,
+            network_width=network_width,
+            network_depth=network_depth,
+            skip_connections=skip_connections,
+            use_relu=use_relu,
+            use_ln=use_ln,
+        )
             for _ in range(n_critics)
         ]
         self.energy_fn = energy_fn
@@ -187,7 +187,7 @@ class CRLCritic(Critic):
         q_values = []
         for sa_repr, g_repr in zip(sa_repr_list, g_repr_list):
             q_value = energy_fn(self.energy_fn, sa_repr, g_repr)
-            q_values.append(q_value[..., None])  # Shape: (..., 1)
+        q_values.append(q_value[..., None])  # Shape: (..., 1)
         
         return jnp.concatenate(q_values, axis=-1)  # Shape: (..., n_critics)
     

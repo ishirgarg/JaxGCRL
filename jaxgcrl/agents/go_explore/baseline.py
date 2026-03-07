@@ -17,7 +17,7 @@ from etils import epath
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
 
-from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
+from jaxgcrl.envs.wrappers import GoalProposerWrapper, TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
@@ -26,7 +26,7 @@ from .algorithms import get_algorithm
 from .utils import save_params
 from .losses import update_alpha_sac, update_critic_sac, update_actor_sac
 from .visualization import all_visualizations
-from .goal_proposers import create_goal_proposer
+from .goal_proposers import create_goal_proposer, GoalProposerState
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -108,13 +108,23 @@ class Baseline:
 
         unwrapped_env = train_env
         
+        # Create goal proposer state container (for future goal proposers that need training state)
+        goal_proposer_state = GoalProposerState()
+        
         # Create goal proposer (will be used to reset envs when they auto-reset)
+        # For simple proposers like "random_env_goals", state is not needed
+        # For future proposers that need buffer/critic params, they can access
+        # them via the goal_proposer_state container
         goal_proposer = create_goal_proposer(
             self.goal_proposer_name,
             unwrapped_env,
             config.num_envs,
+            goal_proposer_state=goal_proposer_state,
         )
         
+        # Wrap with GoalProposerWrapper to intercept resets and use goal proposer
+        # This must be before TrajectoryIdWrapper so it intercepts resets from training.wrap
+        train_env = GoalProposerWrapper(train_env, goal_proposer, goal_proposer_state)
         train_env = TrajectoryIdWrapper(train_env)
         train_env = envs.training.wrap(
             train_env,
@@ -167,7 +177,8 @@ class Baseline:
         key, buffer_key, eval_env_key, env_key, actor_key, critic_key = jax.random.split(key, 6)
 
         env_keys = jax.random.split(env_key, config.num_envs)
-        env_state = jax.jit(train_env.reset)(env_keys)
+        # Cannot JIT reset because GoalProposerWrapper uses closures with mutable state
+        env_state = train_env.reset(env_keys)
         train_env.step = jax.jit(train_env.step)
 
         # Dimensions definitions and sanity checks
@@ -307,44 +318,8 @@ class Baseline:
 
             (env_state, _), data = jax.lax.scan(f, (env_state, key), (), length=self.unroll_length)
 
-            # Check which environments have reset (truncation=True in last timestep)
-            # data.extras["state_extras"]["truncation"] shape: (unroll_length, num_envs)
-            last_truncation = data.extras["state_extras"]["truncation"][-1]  # (num_envs,)
-            
-            # Propose goals for all environments (we'll only use them for ones that reset)
-            reset_key, _ = jax.random.split(key)
-            reset_rngs = jax.random.split(reset_key, config.num_envs)
-            proposed_goals = jax.vmap(goal_proposer)(reset_rngs)  # (num_envs, goal_dim)
-            
-            # Reset environments that have truncated with proposed goals
-            reset_mask = last_truncation.astype(jnp.bool_)  # (num_envs,)
-            
-            # The training wrapper already auto-reset them, so we reset again with our goals
-            def reset_env_with_goal(rng_key, goal, should_reset, current_state):
-                """Reset environment if should_reset is True, otherwise return current_state."""
-                def do_reset():
-                    # Reset through unwrapped_env with proposed goal - this already sets everything correctly
-                    new_state = unwrapped_env.reset(rng_key, goal=goal)
-                    # Update info fields to match what training wrapper would set on reset:
-                    # - first_obs: new observation from reset
-                    # - first_pipeline_state: new pipeline_state from reset
-                    # - steps: reset to 0 (or initial value)
-                    # - truncation: reset to 0/False
-                    # - traj_id: preserve from current_state (maintains trajectory continuity)
-                    new_info = dict(current_state.info)
-                    new_info['first_obs'] = new_state.obs
-                    new_info['first_pipeline_state'] = new_state.pipeline_state
-                    new_info['steps'] = jnp.array(0.0)  # Reset step count
-                    new_info['truncation'] = jnp.array(0.0)  # Reset truncation flag
-                    # traj_id is preserved from current_state
-                    new_state = new_state.replace(info=new_info)
-                    return new_state
-                def no_reset():
-                    return current_state
-                return jax.lax.cond(should_reset, do_reset, no_reset)
-            
-            reset_fn = jax.vmap(reset_env_with_goal, in_axes=(0, 0, 0, 0))
-            env_state = reset_fn(reset_rngs, proposed_goals, reset_mask, env_state)
+            # GoalProposerWrapper intercepts all reset calls (including mid-unroll resets from training.wrap)
+            # so we don't need to manually reset here - the wrapper handles it automatically
             
             buffer_state = replay_buffer.insert(buffer_state, data)
             return env_state, buffer_state
@@ -414,6 +389,14 @@ class Baseline:
                 metrics.update(alpha_metrics)
             metrics.update(critic_metrics)
             metrics.update(actor_metrics)
+            
+            # TODO: For future goal proposers that need training state, update goal_proposer_state here:
+            # goal_proposer_state.update(
+            #     buffer_state=buffer_state,
+            #     critic_params=training_state.critic_state.params,
+            #     actor_params=training_state.actor_state.params,
+            #     # ... any other state needed
+            # )
             
             # Update target networks for SAC
             if self.agent_type == "sac" and training_state.target_critic_params is not None:
