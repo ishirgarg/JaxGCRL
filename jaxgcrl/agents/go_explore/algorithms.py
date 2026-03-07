@@ -17,6 +17,36 @@ from .networks import Actor as ActorNetwork, Encoder, QNetwork
 from .types import Actor, Critic, TrainingState, Transition
 from .utils import flatten_batch
 
+
+def _reshape_and_permute_transitions(transitions: Transition, process_key: jnp.ndarray, batch_size: int):
+    """Shared helper to reshape and permute transitions after processing.
+    
+    Args:
+        transitions: Transitions to reshape and permute
+        process_key: Random key for permutation
+        batch_size: Batch size for final reshaping
+        
+    Returns:
+        Tuple of (reshaped_and_permuted_transitions, new_process_key)
+    """
+    # Reshape: flatten (num_envs, episode_length-1, ...) -> (total_transitions, ...)
+    transitions = jax.tree_util.tree_map(
+        lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"), transitions
+    )
+    
+    # Permute transitions
+    permute_key, new_process_key = jax.random.split(process_key)
+    permutation = jax.random.permutation(permute_key, len(transitions.observation))
+    transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
+    
+    # Reshape into batches: (total_transitions, ...) -> (num_batches, batch_size, ...)
+    transitions = jax.tree_util.tree_map(
+        lambda x: jnp.reshape(x, (-1, batch_size) + x.shape[1:]),
+        transitions,
+    )
+    
+    return transitions, new_process_key
+
 class CRLActor(Actor):
     """CRL Actor implementation."""
     
@@ -52,6 +82,10 @@ class CRLActor(Actor):
         means, _ = self.apply(params, obs)
         return nn.tanh(means)
     
+    def apply(self, params, obs):
+        """Apply actor network to get mean and log_std."""
+        return self.network.apply(params, obs)
+    
     def update(self, context: Dict[str, Any], networks: Dict[str, Any], 
                transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
         """Update actor and alpha for CRL."""
@@ -72,23 +106,8 @@ class CRLActor(Actor):
             buffer_config, transitions, batch_keys
         )
         
-        # Reshape: flatten (num_envs, episode_length-1, ...) -> (total_transitions, ...)
-        transitions = jax.tree_util.tree_map(
-            lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"), transitions
-        )
-        
-        # Permute transitions
-        permute_key, new_process_key = jax.random.split(process_key)
-        permutation = jax.random.permutation(permute_key, len(transitions.observation))
-        transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
-        
-        # Reshape into batches: (total_transitions, ...) -> (num_batches, batch_size, ...)
-        transitions = jax.tree_util.tree_map(
-            lambda x: jnp.reshape(x, (-1, batch_size) + x.shape[1:]),
-            transitions,
-        )
-        
-        return transitions, new_process_key
+        # Use shared reshape and permute logic
+        return _reshape_and_permute_transitions(transitions, process_key, batch_size)
 
 
 class CRLCritic(Critic):
@@ -118,6 +137,40 @@ class CRLCritic(Critic):
         self.action_size = action_size
         self.goal_indices = goal_indices
     
+    def compute_representations(self, params, state, action, goal):
+        """Compute sa_repr and g_repr for contrastive loss.
+        
+        Args:
+            params: Critic parameters (dict with sa_encoder and g_encoder)
+            state: State with shape (..., state_size)
+            action: Action with shape (..., action_size)
+            goal: Goal with shape (..., goal_size)
+            
+        Returns:
+            Tuple of (sa_repr, g_repr)
+        """
+        sa_input = jnp.concatenate([state, action], axis=-1)
+        sa_repr = self.sa_encoder.apply(params["sa_encoder"], sa_input)
+        g_repr = self.g_encoder.apply(params["g_encoder"], goal)
+        return sa_repr, g_repr
+    
+    def apply(self, params, obs, actions):
+        """Apply critic to compute Q-values using the API.
+        
+        Args:
+            params: Critic parameters (dict with sa_encoder and g_encoder)
+            obs: Observations with shape (..., obs_size) where obs = [state, goal]
+            actions: Actions with shape (..., action_size)
+            
+        Returns:
+            Q-values with shape (..., 1)
+        """
+        state = obs[..., :self.state_size]
+        goal = obs[..., self.state_size:]
+        sa_repr, g_repr = self.compute_representations(params, state, actions, goal)
+        q_value = energy_fn(self.energy_fn, sa_repr, g_repr)
+        return q_value[..., None]
+    
     def __call__(self, obs, actions):
         """Compute Q-value using encoders and energy function.
         
@@ -129,11 +182,10 @@ class CRLCritic(Critic):
             Q-values with shape (..., 1) - energy between sa_repr and g_repr
         """
         # Extract state and goal from obs
-        # Goal is at the last len(goal_indices) elements of the observation
         state = obs[..., :self.state_size]
         goal = obs[..., self.state_size:]
         
-        # Compute representations using encoders
+        # Compute representations using encoders (no params needed for __call__)
         sa_input = jnp.concatenate([state, actions], axis=-1)
         sa_repr = self.sa_encoder(sa_input)
         g_repr = self.g_encoder(goal)
@@ -260,23 +312,8 @@ class SACActor(Actor):
             # Apply HER to each transition in the batch
             transitions = jax.vmap(apply_her)(transitions)
         
-        # Reshape: flatten (num_envs, episode_length-1, ...) -> (total_transitions, ...)
-        transitions = jax.tree_util.tree_map(
-            lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"), transitions
-        )
-        
-        # Permute transitions
-        permute_key, new_process_key = jax.random.split(process_key)
-        permutation = jax.random.permutation(permute_key, len(transitions.observation))
-        transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
-        
-        # Reshape into batches: (total_transitions, ...) -> (num_batches, batch_size, ...)
-        transitions = jax.tree_util.tree_map(
-            lambda x: jnp.reshape(x, (-1, batch_size) + x.shape[1:]),
-            transitions,
-        )
-        
-        return transitions, new_process_key
+        # Use shared reshape and permute logic
+        return _reshape_and_permute_transitions(transitions, process_key, batch_size)
 
 
 class SACCritic(Critic):

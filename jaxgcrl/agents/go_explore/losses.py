@@ -46,6 +46,7 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
         goal = future_state[:, config["goal_indices"]]
         observation = jnp.concatenate([state, goal], axis=1)
 
+        # Use actor API
         means, log_stds = networks["actor"].apply(actor_params, observation)
         stds = jnp.exp(log_stds)
         x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
@@ -54,14 +55,11 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
         log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
         log_prob = log_prob.sum(-1)  # dimension = B
 
-        sa_encoder_params, g_encoder_params = (
-            critic_params["sa_encoder"],
-            critic_params["g_encoder"],
-        )
-        sa_repr = networks["sa_encoder"].apply(sa_encoder_params, jnp.concatenate([state, action], axis=-1))
-        g_repr = networks["g_encoder"].apply(g_encoder_params, goal)
-
-        qf_pi = energy_fn(config["energy_fn"], sa_repr, g_repr)
+        # Use critic API to compute Q-value - construct obs from state and goal
+        critic = networks["critic"]
+        obs_with_goal = jnp.concatenate([state, goal], axis=1)
+        q_values = critic.apply(critic_params, obs_with_goal, action)
+        qf_pi = q_values.squeeze(-1)  # Remove last dimension to match expected shape
 
         actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - qf_pi)
 
@@ -87,7 +85,7 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
     training_state = training_state.replace(actor_state=new_actor_state, alpha_state=new_alpha_state)
 
     metrics = {
-        "entropy": -log_prob,
+        "entropy": -jnp.mean(log_prob),  # log_prob: (batch_size,), mean to scalar for consistency
         "actor_loss": actor_loss,
         "alpha_loss": alpha_loss,
         "log_alpha": training_state.alpha_state.params["log_alpha"],
@@ -100,18 +98,13 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
                   transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
     """CRL critic update."""
     def critic_loss(critic_params, transitions, key):
-        sa_encoder_params, g_encoder_params = (
-            critic_params["sa_encoder"],
-            critic_params["g_encoder"],
-        )
-
         state = transitions.observation[:, : config["state_size"]]
         action = transitions.action
+        goal = transitions.observation[:, config["state_size"] :]
 
-        sa_repr = networks["sa_encoder"].apply(sa_encoder_params, jnp.concatenate([state, action], axis=-1))
-        g_repr = networks["g_encoder"].apply(
-            g_encoder_params, transitions.observation[:, config["state_size"] :]
-        )
+        # Use critic API to compute representations
+        critic = networks["critic"]
+        sa_repr, g_repr = critic.compute_representations(critic_params, state, action, goal)
 
         # InfoNCE
         logits = energy_fn(config["energy_fn"], sa_repr[:, None, :], g_repr[None, :, :])
@@ -155,6 +148,7 @@ def update_alpha_sac(config: Dict[str, Any], networks: Dict[str, Any],
     def alpha_loss(alpha_params, actor_params, transitions, key):
         # Sample actions from current policy to get log_probs
         obs = transitions.observation
+        # Use actor API
         means, log_stds = networks["actor"].apply(actor_params, obs)
         stds = jnp.exp(log_stds)
         x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
@@ -191,6 +185,7 @@ def update_actor_sac(config: Dict[str, Any], networks: Dict[str, Any],
     """SAC actor update."""
     def actor_loss(actor_params, q_params, alpha, transitions, key):
         obs = transitions.observation
+        # Use actor API
         means, log_stds = networks["actor"].apply(actor_params, obs)
         stds = jnp.exp(log_stds)
         x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
@@ -199,9 +194,9 @@ def update_actor_sac(config: Dict[str, Any], networks: Dict[str, Any],
         log_prob -= jnp.log((1 - jnp.square(actions)) + 1e-6)
         log_prob = log_prob.sum(-1, keepdims=True)
 
-        # Get Q-values for the sampled actions
-        critic_network = networks["critic"]
-        q_values = critic_network.apply(q_params, obs, actions)
+        # Use critic API to get Q-values
+        critic = networks["critic"]
+        q_values = critic.apply(q_params, obs, actions)
         q_value = jnp.min(q_values, axis=-1, keepdims=True)  # Min over critics
 
         actor_loss = jnp.mean(alpha * log_prob - q_value)
@@ -238,13 +233,13 @@ def update_critic_sac(config: Dict[str, Any], networks: Dict[str, Any],
         rewards = transitions.reward
         discounts = transitions.discount
 
-        # Current Q-values
-        critic_network = networks["critic"]
-        actor_network = networks["actor"]
-        q_values = critic_network.apply(q_params, obs, actions)
+        # Use critic API for current Q-values
+        critic = networks["critic"]
+        q_values = critic.apply(q_params, obs, actions)
         
-        # Target Q-values using next state and next action from policy
-        next_means, next_log_stds = actor_network.apply(actor_params, next_obs)
+        # Use actor API for next actions
+        actor = networks["actor"]
+        next_means, next_log_stds = actor.apply(actor_params, next_obs)
         next_stds = jnp.exp(next_log_stds)
         next_x_ts = next_means + next_stds * jax.random.normal(key, shape=next_means.shape, dtype=next_means.dtype)
         next_actions = nn.tanh(next_x_ts)
@@ -252,14 +247,16 @@ def update_critic_sac(config: Dict[str, Any], networks: Dict[str, Any],
         next_log_prob -= jnp.log((1 - jnp.square(next_actions)) + 1e-6)
         next_log_prob = next_log_prob.sum(-1, keepdims=True)
 
-        target_q_values = critic_network.apply(target_q_params, next_obs, next_actions)
-        target_q_value = jnp.min(target_q_values, axis=-1, keepdims=True)  # Min over critics
+        # Use critic API for target Q-values
+        target_q_values = critic.apply(target_q_params, next_obs, next_actions)
+        target_q_value = jnp.min(target_q_values, axis=-1, keepdims=True)  # Min over critics: (batch_size, 1)
         target = rewards[:, None] + config["discounting"] * discounts[:, None] * (
             target_q_value - alpha * next_log_prob
-        )
+        )  # target shape: (batch_size, 1)
 
         # Bellman error for each critic
-        critic_loss = jnp.mean((q_values - target[..., None]) ** 2)
+        # q_values: (batch_size, n_critics), target: (batch_size, 1) -> broadcasts to (batch_size, n_critics)
+        critic_loss = jnp.mean((q_values - target) ** 2)
         return critic_loss
 
     # Use OLD alpha value (before alpha update) - matching original SAC (line 370)

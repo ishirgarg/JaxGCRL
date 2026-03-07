@@ -332,10 +332,6 @@ class Baseline:
                 actor=actor,
                 critic=critic,
             )
-            # For CRL, add encoders to networks dict
-            if self.agent_type == "crl":
-                networks["sa_encoder"] = critic.sa_encoder
-                networks["g_encoder"] = critic.g_encoder
 
             # Update order: match original implementations exactly
             # CRL: actor (with alpha) then critic (original CRL order)
