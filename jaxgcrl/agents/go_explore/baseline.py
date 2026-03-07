@@ -32,7 +32,11 @@ State = Union[envs.State, envs_v1.State]
 
 @dataclass
 class Baseline:
-    """Contrastive Reinforcement Learning (CRL) agent."""
+    """Unified baseline agent supporting both CRL and SAC algorithms.
+    
+    This agent can be configured to run either CRL (Contrastive Reinforcement Learning)
+    or SAC (Soft Actor-Critic) by setting the agent_type parameter.
+    """
 
     agent_type: Literal["sac", "crl"] = "crl"
 
