@@ -57,7 +57,7 @@ class Baseline:
 
     disable_entropy_actor: bool = False
 
-    max_replay_size: int = 10000
+    max_replay_size: int = 100000
     min_replay_size: int = 1000
     unroll_length: int = 50
     h_dim: int = 256
