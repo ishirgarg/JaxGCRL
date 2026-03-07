@@ -3,6 +3,7 @@ from typing import Any, Dict, Tuple
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+from flax.training.train_state import TrainState
 
 from .types import TrainingState, Transition
 
@@ -60,8 +61,9 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
         # Use critic API to compute Q-value - construct obs from state and goal
         critic = networks["critic"]
         obs_with_goal = jnp.concatenate([state, goal], axis=1)
-        q_values = critic.apply(critic_params, obs_with_goal, action)
-        qf_pi = q_values.squeeze(-1)  # Remove last dimension to match expected shape
+        q_values = critic.apply(critic_params, obs_with_goal, action)  # Shape: (batch_size, n_critics)
+        # Use first critic's output for CRL
+        qf_pi = q_values[:, 0]  # Shape: (batch_size,)
 
         actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - qf_pi)
 
@@ -98,43 +100,88 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
 
 def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
                   transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
-    """CRL critic update."""
-    def critic_loss(critic_params, transitions, key):
-        state = transitions.observation[:, : config["state_size"]]
-        action = transitions.action
-        goal = transitions.observation[:, config["state_size"] :]
-
-        # Use critic API to compute representations
-        critic = networks["critic"]
-        sa_repr, g_repr = critic.compute_representations(critic_params, state, action, goal)
-
-        # InfoNCE
-        logits = energy_fn(config["energy_fn"], sa_repr[:, None, :], g_repr[None, :, :])
-        critic_loss = contrastive_loss_fn(config["contrastive_loss_fn"], logits)
-
-        # logsumexp regularisation
-        logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
-        critic_loss += config["logsumexp_penalty_coeff"] * jnp.mean(logsumexp**2)
-
-        I = jnp.eye(logits.shape[0])
-        correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
-        logits_pos = jnp.sum(logits * I) / jnp.sum(I)
-        logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
-
-        return critic_loss, (logsumexp, I, correct, logits_pos, logits_neg)
-
-    (loss, (logsumexp, I, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
-        critic_loss, has_aux=True
-    )(training_state.critic_state.params, transitions, key)
-    new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
+    """CRL critic update with support for multiple critics.
+    
+    Each critic is updated separately with its own gradients, not averaged.
+    """
+    state = transitions.observation[:, : config["state_size"]]
+    action = transitions.action
+    goal = transitions.observation[:, config["state_size"] :]
+    
+    critic = networks["critic"]
+    n_critics = critic.n_critics
+    current_params = training_state.critic_state.params
+    
+    # Update each critic separately
+    new_params = {}
+    critic_losses = []
+    logsumexps = []
+    corrects = []
+    logits_pos_list = []
+    logits_neg_list = []
+    
+    for i in range(n_critics):
+        # Loss function for this specific critic
+        def single_critic_loss(critic_i_params, transitions, key):
+            # Get representations for this critic only
+            sa_input = jnp.concatenate([state, action], axis=-1)
+            sa_repr = critic.sa_encoders[i].apply(critic_i_params["sa_encoder"], sa_input)
+            g_repr = critic.g_encoders[i].apply(critic_i_params["g_encoder"], goal)
+            
+            # InfoNCE
+            logits = energy_fn(config["energy_fn"], sa_repr[:, None, :], g_repr[None, :, :])
+            loss = contrastive_loss_fn(config["contrastive_loss_fn"], logits)
+            
+            # logsumexp regularisation
+            logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
+            loss += config["logsumexp_penalty_coeff"] * jnp.mean(logsumexp**2)
+            
+            I = jnp.eye(logits.shape[0])
+            correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
+            logits_pos = jnp.sum(logits * I) / jnp.sum(I)
+            logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
+            
+            return loss, (logsumexp, correct, logits_pos, logits_neg)
+        
+        # Compute loss and gradient for this critic only
+        critic_i_params = {
+            "sa_encoder": current_params[f"sa_encoder_{i}"],
+            "g_encoder": current_params[f"g_encoder_{i}"],
+        }
+        (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
+            single_critic_loss, has_aux=True
+        )(critic_i_params, transitions, key)
+        
+        # Update this critic's parameters
+        critic_i_state = TrainState.create(
+            apply_fn=None,  # Not needed for gradient update
+            params=critic_i_params,
+            tx=training_state.critic_state.tx,
+        )
+        new_critic_i_state = critic_i_state.apply_gradients(grads=grad)
+        
+        # Store updated parameters
+        new_params[f"sa_encoder_{i}"] = new_critic_i_state.params["sa_encoder"]
+        new_params[f"g_encoder_{i}"] = new_critic_i_state.params["g_encoder"]
+        
+        # Store metrics
+        critic_losses.append(loss)
+        logsumexps.append(logsumexp)
+        corrects.append(correct)
+        logits_pos_list.append(logits_pos)
+        logits_neg_list.append(logits_neg)
+    
+    # Update critic state with all new parameters
+    new_critic_state = training_state.critic_state.replace(params=new_params)
     training_state = training_state.replace(critic_state=new_critic_state)
-
+    
+    # Average metrics for logging
     metrics = {
-        "categorical_accuracy": jnp.mean(correct),
-        "logits_pos": logits_pos,
-        "logits_neg": logits_neg,
-        "logsumexp": logsumexp.mean(),
-        "critic_loss": loss,
+        "categorical_accuracy": jnp.mean(jnp.array([jnp.mean(c) for c in corrects])),
+        "logits_pos": jnp.mean(jnp.array(logits_pos_list)),
+        "logits_neg": jnp.mean(jnp.array(logits_neg_list)),
+        "logsumexp": jnp.mean(jnp.array([ls.mean() for ls in logsumexps])),
+        "critic_loss": jnp.mean(jnp.array(critic_losses)),
     }
 
     return training_state, metrics

@@ -111,75 +111,95 @@ class CRLActor(Actor):
 
 
 class CRLCritic(Critic):
-    """CRL Critic implementation using encoders."""
+    """CRL Critic implementation using encoders with support for multiple critics."""
     
     def __init__(self, repr_dim: int, network_width: int, network_depth: int,
                  skip_connections: int, use_relu: bool, use_ln: bool,
-                 energy_fn: str, state_size: int, action_size: int, goal_indices: tuple):
-        self.sa_encoder = Encoder(
-            repr_dim=repr_dim,
-            network_width=network_width,
-            network_depth=network_depth,
-            skip_connections=skip_connections,
-            use_relu=use_relu,
-            use_ln=use_ln,
-        )
-        self.g_encoder = Encoder(
-            repr_dim=repr_dim,
-            network_width=network_width,
-            network_depth=network_depth,
-            skip_connections=skip_connections,
-            use_relu=use_relu,
-            use_ln=use_ln,
-        )
+                 energy_fn: str, state_size: int, action_size: int, goal_indices: tuple,
+                 n_critics: int = 1):
+        # Create n_critics pairs of encoders
+        self.sa_encoders = [
+            Encoder(
+                repr_dim=repr_dim,
+                network_width=network_width,
+                network_depth=network_depth,
+                skip_connections=skip_connections,
+                use_relu=use_relu,
+                use_ln=use_ln,
+            )
+            for _ in range(n_critics)
+        ]
+        self.g_encoders = [
+            Encoder(
+                repr_dim=repr_dim,
+                network_width=network_width,
+                network_depth=network_depth,
+                skip_connections=skip_connections,
+                use_relu=use_relu,
+                use_ln=use_ln,
+            )
+            for _ in range(n_critics)
+        ]
         self.energy_fn = energy_fn
         self.state_size = state_size
         self.action_size = action_size
         self.goal_indices = goal_indices
+        self.n_critics = n_critics
     
     def compute_representations(self, params, state, action, goal):
-        """Compute sa_repr and g_repr for contrastive loss.
+        """Compute sa_repr and g_repr for contrastive loss for all critics.
         
         Args:
-            params: Critic parameters (dict with sa_encoder and g_encoder)
+            params: Critic parameters (dict with sa_encoder_i and g_encoder_i for each critic i)
             state: State with shape (..., state_size)
             action: Action with shape (..., action_size)
             goal: Goal with shape (..., goal_size)
             
         Returns:
-            Tuple of (sa_repr, g_repr)
+            Tuple of (sa_repr_list, g_repr_list) where each is a list of representations for each critic
         """
         sa_input = jnp.concatenate([state, action], axis=-1)
-        sa_repr = self.sa_encoder.apply(params["sa_encoder"], sa_input)
-        g_repr = self.g_encoder.apply(params["g_encoder"], goal)
-        return sa_repr, g_repr
+        sa_repr_list = []
+        g_repr_list = []
+        for i in range(self.n_critics):
+            sa_repr = self.sa_encoders[i].apply(params[f"sa_encoder_{i}"], sa_input)
+            g_repr = self.g_encoders[i].apply(params[f"g_encoder_{i}"], goal)
+            sa_repr_list.append(sa_repr)
+            g_repr_list.append(g_repr)
+        return sa_repr_list, g_repr_list
     
     def apply(self, params, obs, actions):
-        """Apply critic to compute Q-values using the API.
+        """Apply critic to compute Q-values using the API for all critics.
         
         Args:
-            params: Critic parameters (dict with sa_encoder and g_encoder)
+            params: Critic parameters (dict with sa_encoder_i and g_encoder_i for each critic i)
             obs: Observations with shape (..., obs_size) where obs = [state, goal]
             actions: Actions with shape (..., action_size)
             
         Returns:
-            Q-values with shape (..., 1)
+            Q-values with shape (..., n_critics) - concatenated Q-values from all critics
         """
         state = obs[..., :self.state_size]
         goal = obs[..., self.state_size:]
-        sa_repr, g_repr = self.compute_representations(params, state, actions, goal)
-        q_value = energy_fn(self.energy_fn, sa_repr, g_repr)
-        return q_value[..., None]
+        sa_repr_list, g_repr_list = self.compute_representations(params, state, actions, goal)
+        
+        # Compute Q-value for each critic
+        q_values = []
+        for sa_repr, g_repr in zip(sa_repr_list, g_repr_list):
+            q_value = energy_fn(self.energy_fn, sa_repr, g_repr)
+            q_values.append(q_value[..., None])  # Shape: (..., 1)
+        
+        return jnp.concatenate(q_values, axis=-1)  # Shape: (..., n_critics)
     
     def __call__(self, obs, actions):
-        """Compute Q-value using encoders and energy function.
+        """Compute Q-value using encoders and energy function for all critics.
         
         Args:
             obs: Observations with shape (..., obs_size) where obs = [state, goal]
             actions: Actions with shape (..., action_size)
             
         Returns:
-            Q-values with shape (..., 1) - energy between sa_repr and g_repr
+            Q-values with shape (..., n_critics) - concatenated Q-values from all critics
         """
         # Extract state and goal from obs
         state = obs[..., :self.state_size]
@@ -187,24 +207,33 @@ class CRLCritic(Critic):
         
         # Compute representations using encoders (no params needed for __call__)
         sa_input = jnp.concatenate([state, actions], axis=-1)
-        sa_repr = self.sa_encoder(sa_input)
-        g_repr = self.g_encoder(goal)
+        q_values = []
+        for sa_encoder, g_encoder in zip(self.sa_encoders, self.g_encoders):
+            sa_repr = sa_encoder(sa_input)
+            g_repr = g_encoder(goal)
+            # Compute energy (Q-value)
+            q_value = energy_fn(self.energy_fn, sa_repr, g_repr)
+            q_values.append(q_value[..., None])  # Shape: (..., 1)
         
-        # Compute energy (Q-value)
-        q_value = energy_fn(self.energy_fn, sa_repr, g_repr)
-        return q_value[..., None]  # Add dimension to match SAC's output shape
+        return jnp.concatenate(q_values, axis=-1)  # Shape: (..., n_critics)
     
     def init(self, key, x):
         # x is dummy obs for shape (batch_size, obs_size)
-        key1, key2 = jax.random.split(key)
         # For sa_encoder: input is (state + action)
         dummy_sa = jnp.zeros((x.shape[0], self.state_size + self.action_size))
-        sa_params = self.sa_encoder.init(key1, dummy_sa)
         # For g_encoder: input is goal (last len(goal_indices) elements of obs)
         goal_size = len(self.goal_indices) if len(self.goal_indices) > 0 else (x.shape[-1] - self.state_size)
         dummy_goal = jnp.zeros((x.shape[0], goal_size))
-        g_params = self.g_encoder.init(key2, dummy_goal)
-        return {"sa_encoder": sa_params, "g_encoder": g_params}
+        
+        params = {}
+        keys = jax.random.split(key, self.n_critics * 2)
+        for i in range(self.n_critics):
+            key1, key2 = keys[i * 2], keys[i * 2 + 1]
+            sa_params = self.sa_encoders[i].init(key1, dummy_sa)
+            g_params = self.g_encoders[i].init(key2, dummy_goal)
+            params[f"sa_encoder_{i}"] = sa_params
+            params[f"g_encoder_{i}"] = g_params
+        return params
     
     def update(self, context: Dict[str, Any], networks: Dict[str, Any],
                transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
@@ -376,6 +405,7 @@ def get_algorithm(agent_type: str, **kwargs):
             state_size=kwargs.get("state_size"),
             action_size=kwargs.get("action_size"),
             goal_indices=kwargs.get("goal_indices"),
+            n_critics=kwargs.get("n_critics", 1),
         )
         return actor, critic
     elif agent_type == "sac":
