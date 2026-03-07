@@ -249,13 +249,11 @@ class Baseline:
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
         def actor_step(actor_state, env, env_state, key, extra_fields, is_deterministic: bool):
-            actions = jax.lax.cond(
-                is_deterministic,
-                actor.sample_actions_deterministic,
-                actor.sample_actions,
+            actions = actor.sample_actions(
                 actor_state.params,
                 env_state.obs,
-                key
+                key,
+                is_deterministic=is_deterministic
             )
             nstate = env.step(env_state, actions)
             state_extras = {x: nstate.info[x] for x in extra_fields}
@@ -300,6 +298,7 @@ class Baseline:
                     env_state,
                     buffer_state,
                     key,
+                    is_deterministic=False,
                 )
                 training_state = training_state.replace(
                     env_steps=training_state.env_steps + env_steps_per_actor_step,
@@ -379,6 +378,7 @@ class Baseline:
                 env_state,
                 buffer_state,
                 experience_key1,
+                is_deterministic=False,
             )
 
             training_state = training_state.replace(
@@ -485,7 +485,7 @@ class Baseline:
             logging.info("step: %d", current_step)
 
             do_render = ne % config.visualization_interval == 0
-            make_policy = lambda param: lambda obs, rng: actor.sample_actions(param, obs, rng)
+            make_policy = lambda param: lambda obs, rng: actor.sample_actions(param, obs, rng, is_deterministic=True)
 
             progress_fn(
                 current_step,

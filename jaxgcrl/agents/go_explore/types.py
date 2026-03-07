@@ -14,10 +14,7 @@ class Actor:
     def init(self, key, x):
         pass
 
-    def sample_actions(self, x):
-        pass
-
-    def sample_actions_deterministic(self, x):
+    def sample_actions(self, params, obs, key, is_deterministic: bool):
         pass
 
     def update(self,  context, networks, transitions, training_state, actor_key):

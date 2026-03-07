@@ -71,16 +71,16 @@ class CRLActor(Actor):
     def init(self, key, x):
         return self.network.init(key, x)
     
-    def sample_actions(self, params, obs, key):
+    def sample_actions(self, params, obs, key, is_deterministic: bool = False):
         means, log_stds = self.apply(params, obs)
-        stds = jnp.exp(log_stds)
-        x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
-        actions = nn.tanh(x_ts)
+        # Use JAX cond to select between deterministic and stochastic actions
+        is_det_jax = jnp.array(is_deterministic, dtype=bool)
+        actions = jax.lax.cond(
+            is_det_jax,
+            lambda: nn.tanh(means),  # Deterministic: just use mean
+            lambda: nn.tanh(means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)),  # Stochastic: add noise
+        )
         return actions
-    
-    def sample_actions_deterministic(self, params, obs, key):
-        means, _ = self.apply(params, obs)
-        return nn.tanh(means)
     
     def apply(self, params, obs):
         """Apply actor network to get mean and log_std."""
@@ -235,16 +235,16 @@ class SACActor(Actor):
     def apply(self, params, x):
         return self.network.apply(params, x)
     
-    def sample_actions(self, params, obs, key):
+    def sample_actions(self, params, obs, key, is_deterministic: bool = False):
         means, log_stds = self.apply(params, obs)
-        stds = jnp.exp(log_stds)
-        x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
-        actions = nn.tanh(x_ts)
+        # Use JAX cond to select between deterministic and stochastic actions
+        is_det_jax = jnp.array(is_deterministic, dtype=bool)
+        actions = jax.lax.cond(
+            is_det_jax,
+            lambda: nn.tanh(means),  # Deterministic: just use mean
+            lambda: nn.tanh(means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)),  # Stochastic: add noise
+        )
         return actions
-    
-    def sample_actions_deterministic(self, params, obs, key):
-        means, _ = self.apply(params, obs)
-        return nn.tanh(means)
     
     def update(self, context: Dict[str, Any], networks: Dict[str, Any],
                transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
