@@ -343,7 +343,7 @@ class Baseline:
             if self.agent_type == "crl":
                 training_state, actor_metrics = actor.update(context, networks, transitions, training_state, actor_key)
                 training_state, critic_metrics = critic.update(context, networks, transitions, training_state, critic_key)
-            else:  # SAC
+            else if self.agent_type == "sac":  # SAC
                 # SAC updates: alpha first, then critic, then actor (matching original)
                 training_state, alpha_metrics = update_alpha_sac(context, networks, transitions, training_state, alpha_key)
                 training_state, critic_metrics = critic.update(context, networks, transitions, training_state, critic_key)
@@ -485,7 +485,12 @@ class Baseline:
             logging.info("step: %d", current_step)
 
             do_render = ne % config.visualization_interval == 0
-            make_policy = lambda param: lambda obs, rng: actor.sample_actions(param, obs, rng, is_deterministic=True)
+            # For CRL: return (mean, log_std) from actor.apply (matches CRL's pattern)
+            # For SAC: return (action, {}) from actor.sample_actions (matches SAC's pattern)
+            if self.agent_type == "crl":
+                make_policy = lambda param: lambda obs, rng: actor.apply(param, obs)
+            elif self.agent_type == "sac":  # SAC
+                make_policy = lambda param: lambda obs, rng: (actor.sample_actions(param, obs, rng, is_deterministic=True), {})
 
             progress_fn(
                 current_step,
