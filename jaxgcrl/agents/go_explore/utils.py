@@ -90,7 +90,7 @@ def sample_trajectories_from_buffer(
     state_size: int,
     goal_indices: Tuple[int, ...],
     rng_key: jax.Array,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Sample trajectories from the replay buffer and extract positions.
     
@@ -102,14 +102,15 @@ def sample_trajectories_from_buffer(
         rng_key: Random key for sampling
         
     Returns:
-        Tuple of (all_positions, final_positions) where:
+        Tuple of (all_positions, final_positions, goal_positions) where:
         - all_positions: (N, 2) array of [x, y] positions from all states
         - final_positions: (M, 2) array of [x, y] positions from final states
+        - goal_positions: (N, 2) array of [x, y] goal positions from all observations
     """
     # Check buffer size
     buffer_size = replay_buffer.size(buffer_state)
     if buffer_size == 0:
-        return np.array([]).reshape(0, 2), np.array([]).reshape(0, 2)
+        return np.array([]).reshape(0, 2), np.array([]).reshape(0, 2), np.array([]).reshape(0, 2)
     
     # Sample from buffer - use whatever it gives us
     current_buffer_state, transitions = replay_buffer.sample(buffer_state)
@@ -126,8 +127,14 @@ def sample_trajectories_from_buffer(
     # Extract x, y positions from observations (first state_size elements contain state)
     positions = obs_flat[:, :state_size][:, list(goal_indices)]  # (N, 2)
     
+    # Extract goal positions from latter part of observation
+    # Goals are at state_size:state_size+goal_size (observation = [state, goal])
+    goal_size = len(goal_indices)
+    goal_positions = obs_flat[:, -goal_size:]  # (N, goal_size)
+    
     # Convert to numpy for easier processing
     positions_np = np.array(positions)
+    goal_positions_np = np.array(goal_positions)
     traj_ids_np = np.array(traj_id_flat)
     truncations_np = np.array(truncation_flat)
     
@@ -163,5 +170,6 @@ def sample_trajectories_from_buffer(
         rng = np.random.RandomState(seed=42)  # Deterministic sampling
         indices = rng.choice(len(all_positions), 512, replace=False)
         all_positions = all_positions[indices]
+        goal_positions_np = goal_positions_np[indices]
     
-    return all_positions, final_positions
+    return all_positions, final_positions, goal_positions_np

@@ -131,17 +131,19 @@ def plot_positions_with_heatmap(
 def visualize_trajectories(
     all_positions: np.ndarray,
     final_positions: np.ndarray,
+    goal_positions: np.ndarray,
     x_bounds: jnp.ndarray,
     y_bounds: jnp.ndarray,
     save_path: str = None,
-    figsize: Tuple[int, int] = (16, 8),
+    figsize: Tuple[int, int] = (24, 8),
 ) -> plt.Figure:
     """
-    Create visualization with two plots: all states and final states.
+    Create visualization with three plots: all states, final states, and goals.
     
     Args:
         all_positions: (N, 2) array of [x, y] positions from all states
         final_positions: (M, 2) array of [x, y] positions from final states
+        goal_positions: (N, 2) array of [x, y] goal positions from all observations
         x_bounds: [x_min, x_max] bounds for x-axis
         y_bounds: [y_min, y_max] bounds for y-axis
         save_path: Path to save the figure (optional)
@@ -150,7 +152,7 @@ def visualize_trajectories(
     Returns:
         Matplotlib figure
     """
-    fig, axes = plt.subplots(1, 2, figsize=figsize)
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
     
     # Plot 1: All states
     num_all_points = len(all_positions)
@@ -176,6 +178,19 @@ def visualize_trajectories(
         alpha_points=0.4,
         alpha_heatmap=0.5,
         point_size=2.0,
+    )
+    
+    # Plot 3: Goals
+    num_goal_points = len(goal_positions)
+    plot_positions_with_heatmap(
+        goal_positions,
+        x_bounds,
+        y_bounds,
+        title=f'Goals in Trajectories (n={num_goal_points})',
+        ax=axes[2],
+        alpha_points=0.3,
+        alpha_heatmap=0.5,
+        point_size=1.0,
     )
     
     plt.tight_layout()
@@ -218,7 +233,7 @@ def all_visualizations(
     if buffer_size == 0:
         return
     
-    all_positions, final_positions = sample_trajectories_from_buffer(
+    all_positions, final_positions, goal_positions = sample_trajectories_from_buffer(
         replay_buffer,
         buffer_state,
         state_size=state_size,
@@ -227,13 +242,14 @@ def all_visualizations(
     )
     
     # Only visualize if we have data
-    if len(all_positions) == 0 and len(final_positions) == 0:
+    if len(all_positions) == 0 and len(final_positions) == 0 and len(goal_positions) == 0:
         return
     
     # Create visualization (don't save to file)
     fig = visualize_trajectories(
         all_positions,
         final_positions,
+        goal_positions,
         env.x_bounds,
         env.y_bounds,
         save_path=None,
