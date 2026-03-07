@@ -232,8 +232,14 @@ class AntMaze(PipelineEnv):
         if self._use_contact_forces:
             raise NotImplementedError("use_contact_forces not implemented.")
 
-    def reset(self, rng: jax.Array) -> State:
-        """Resets the environment to an initial state."""
+    def reset(self, rng: jax.Array, goal: jax.Array = None) -> State:
+        """Resets the environment to an initial state.
+        
+        Args:
+            rng: Random key
+            goal: Optional goal position. If provided, uses this goal instead of sampling randomly.
+                  Shape should be (2,) for single env or (num_envs, 2) for batched.
+        """
 
         rng, rng1, rng2, rng3 = jax.random.split(rng, 4)
 
@@ -245,8 +251,11 @@ class AntMaze(PipelineEnv):
         start = self._random_start(rng2)
         q = q.at[:2].set(start)
 
-
-        target = self._random_target(rng3)
+        # Use provided goal or sample randomly
+        if goal is not None:
+            target = goal
+        else:
+            target = self._random_target(rng3)
         q = q.at[-2:].set(target)
 
         qd = qd.at[-2:].set(0)

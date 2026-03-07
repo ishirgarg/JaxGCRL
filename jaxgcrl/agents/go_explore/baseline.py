@@ -26,6 +26,7 @@ from .algorithms import get_algorithm
 from .utils import save_params
 from .losses import update_alpha_sac, update_critic_sac, update_actor_sac
 from .visualization import all_visualizations
+from .goal_proposers import create_goal_proposer
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -58,7 +59,7 @@ class Baseline:
 
     max_replay_size: int = 10000
     min_replay_size: int = 1000
-    unroll_length: int = 62
+    unroll_length: int = 50
     h_dim: int = 256
     n_hidden: int = 4
     skip_connections: int = 4
@@ -78,6 +79,9 @@ class Baseline:
     n_critics: int = 2
     use_her: bool = True  # Hindsight Experience Replay
 
+    # goal proposer for training
+    goal_proposer_name: Literal["random_env_goals"] = "random_env_goals"
+
     def check_config(self, config):
         """
         episode_length: the maximum length of an episode
@@ -88,7 +92,7 @@ class Baseline:
         assert config.num_envs * (config.episode_length - 1) % self.batch_size == 0, (
             "num_envs * (episode_length - 1) must be divisible by batch_size"
         )
-        assert config.episode_length % self.unroll_length == 0, (
+        assert (config.episode_length - 1) % self.unroll_length == 0, (
             f"episode_length ({config.episode_length}) must be divisible by unroll_length ({self.unroll_length})"
         )
 
@@ -105,6 +109,26 @@ class Baseline:
         self.check_config(config)
 
         unwrapped_env = train_env
+        
+        # Create goal proposer and modify reset to use it
+        goal_proposer = create_goal_proposer(
+            self.goal_proposer_name,
+            unwrapped_env,
+            config.num_envs,
+        )
+        original_reset = unwrapped_env.reset
+        
+        def reset_with_goal_proposer(rng: jax.Array) -> State:
+            """Reset with goal proposer.
+            
+            Args:
+                rng: Single random key (will be vmap'd by training wrapper)
+            """
+            goal = goal_proposer(rng)  # Shape: (goal_dim,)
+            return original_reset(rng, goal=goal)
+        
+        unwrapped_env.reset = reset_with_goal_proposer
+        
         train_env = TrajectoryIdWrapper(train_env)
         train_env = envs.training.wrap(
             train_env,
@@ -120,8 +144,9 @@ class Baseline:
         )
 
         # NOTE: an actor_step here is a whole config.episode_length long episode
-        num_unrolls_per_episode = config.episode_length // self.unroll_length
-        env_steps_per_actor_step = config.num_envs * config.episode_length
+        # episode_length includes initial state, so we have (episode_length - 1) transitions
+        num_unrolls_per_episode = (config.episode_length - 1) // self.unroll_length
+        env_steps_per_actor_step = config.num_envs * (config.episode_length - 1)
         
         # Prefill uses unroll_length (original behavior)
         num_prefill_env_steps = self.min_replay_size * config.num_envs
