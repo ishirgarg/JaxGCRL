@@ -90,7 +90,7 @@ def sample_trajectories_from_buffer(
     state_size: int,
     goal_indices: Tuple[int, ...],
     rng_key: jax.Array,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[Any, np.ndarray, np.ndarray, np.ndarray]:
     """
     Sample trajectories from the replay buffer and extract positions.
     
@@ -102,7 +102,8 @@ def sample_trajectories_from_buffer(
         rng_key: Random key for sampling
         
     Returns:
-        Tuple of (all_positions, final_positions, goal_positions) where:
+        Tuple of (buffer_state, all_positions, final_positions, goal_positions) where:
+        - buffer_state: Updated buffer state after sampling
         - all_positions: (N, 2) array of [x, y] positions from all states
         - final_positions: (M, 2) array of [x, y] positions from final states
         - goal_positions: (N, 2) array of [x, y] goal positions from all observations
@@ -110,7 +111,7 @@ def sample_trajectories_from_buffer(
     # Check buffer size
     buffer_size = replay_buffer.size(buffer_state)
     if buffer_size == 0:
-        return np.array([]).reshape(0, 2), np.array([]).reshape(0, 2), np.array([]).reshape(0, 2)
+        return buffer_state, np.array([]).reshape(0, 2), np.array([]).reshape(0, 2), np.array([]).reshape(0, 2)
     
     # Sample from buffer - use whatever it gives us
     current_buffer_state, transitions = replay_buffer.sample(buffer_state)
@@ -172,4 +173,102 @@ def sample_trajectories_from_buffer(
         all_positions = all_positions[indices]
         goal_positions_np = goal_positions_np[indices]
     
-    return all_positions, final_positions, goal_positions_np
+    return current_buffer_state, all_positions, final_positions, goal_positions_np
+
+
+def sample_trajectory_sequences(
+    replay_buffer,
+    buffer_state,
+    state_size: int,
+    goal_indices: Tuple[int, ...],
+    rng_key: jax.Array,
+    num_trajectories: int = 4,
+) -> Tuple[Any, np.ndarray, np.ndarray]:
+    """
+    Sample full trajectory sequences from the replay buffer.
+    
+    Args:
+        replay_buffer: The replay buffer instance
+        buffer_state: Current buffer state (will be modified by sampling)
+        state_size: Size of state dimension
+        goal_indices: Indices for x, y positions (typically [0, 1])
+        rng_key: Random key for sampling
+        num_trajectories: Number of trajectories to extract (default: 4)
+        
+    Returns:
+        Tuple of (buffer_state, trajectory_states, trajectory_goals) where:
+        - buffer_state: Updated buffer state after sampling
+        - trajectory_states: (num_trajectories, 8, 2) array of [x, y] positions
+          [start, 6 intermediate states, final]
+        - trajectory_goals: (num_trajectories, 2) array of [x, y] goal positions
+    """
+    # Check buffer size
+    buffer_size = replay_buffer.size(buffer_state)
+    if buffer_size == 0:
+        return buffer_state, np.array([]).reshape(0, 8, 2), np.array([]).reshape(0, 2)
+    
+    # Sample from buffer
+    current_buffer_state, transitions = replay_buffer.sample(buffer_state)
+    
+    # Flatten to (num_envs * episode_length, obs_size)
+    obs_flat = jnp.reshape(transitions.observation, (-1, transitions.observation.shape[-1]))
+    traj_id_flat = jnp.reshape(transitions.extras["state_extras"]["traj_id"], (-1,))
+    truncation_flat = jnp.reshape(transitions.extras["state_extras"]["truncation"], (-1,))
+    
+    # Extract positions and goals
+    positions = obs_flat[:, :state_size][:, list(goal_indices)]  # (N, 2)
+    goal_size = len(goal_indices)
+    goal_positions = obs_flat[:, -goal_size:]  # (N, goal_size)
+    
+    # Convert to numpy
+    positions_np = np.array(positions)
+    goal_positions_np = np.array(goal_positions)
+    traj_ids_np = np.array(traj_id_flat)
+    truncations_np = np.array(truncation_flat)
+    
+    # Group by trajectory ID and extract sequences
+    unique_traj_ids = np.unique(traj_ids_np)
+    num_trajectories = min(num_trajectories, len(unique_traj_ids))
+    
+    trajectory_states = []
+    trajectory_goals = []
+    
+    for i in range(num_trajectories):
+        traj_id = unique_traj_ids[i]
+        traj_mask = traj_ids_np == traj_id
+        traj_positions = positions_np[traj_mask]
+        traj_goals = goal_positions_np[traj_mask]
+        traj_truncations = truncations_np[traj_mask]
+        
+        if len(traj_positions) == 0:
+            continue
+        
+        # Get goal (should be constant within trajectory, take first)
+        goal = traj_goals[0]
+        
+        # Find final state index
+        final_idx = np.where(traj_truncations)[0]
+        if len(final_idx) > 0:
+            final_idx = final_idx[0]
+        else:
+            final_idx = len(traj_positions) - 1
+        
+        # Extract states: start, 6 intermediate (evenly spaced), final
+        traj_length = final_idx + 1
+        if traj_length < 8:
+            # If trajectory is shorter than 8, pad with final state
+            states = np.zeros((8, 2))
+            states[:traj_length] = traj_positions[:traj_length]
+            states[traj_length:] = traj_positions[final_idx]
+        else:
+            # Evenly sample 6 intermediate states between start and final
+            indices = np.linspace(0, final_idx, 8, dtype=int)
+            states = traj_positions[indices]
+        
+        trajectory_states.append(states)
+        trajectory_goals.append(goal)
+    
+    if len(trajectory_states) == 0:
+        return current_buffer_state, np.array([]).reshape(0, 8, 2), np.array([]).reshape(0, 2)
+    
+    return current_buffer_state, np.array(trajectory_states), np.array(trajectory_goals)

@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import gaussian_kde
 import wandb
-from .utils import sample_trajectories_from_buffer
+from .utils import sample_trajectories_from_buffer, sample_trajectory_sequences
 
 
 def create_kde_heatmap(
@@ -128,22 +128,114 @@ def plot_positions_with_heatmap(
     return ax
 
 
+def plot_trajectory_sequences(
+    trajectory_states: np.ndarray,
+    trajectory_goals: np.ndarray,
+    x_bounds: jnp.ndarray,
+    y_bounds: jnp.ndarray,
+    fig: plt.Figure = None,
+) -> plt.Figure:
+    """
+    Plot trajectory sequences in a 2x2 grid, showing start, intermediate states, final state, and goal.
+    
+    Args:
+        trajectory_states: (num_trajectories, 8, 2) array of [x, y] positions
+                         [start, 6 intermediate states, final]
+        trajectory_goals: (num_trajectories, 2) array of [x, y] goal positions
+        x_bounds: [x_min, x_max] bounds for x-axis
+        y_bounds: [y_min, y_max] bounds for y-axis
+        fig: Matplotlib figure (creates new if None)
+        
+    Returns:
+        Matplotlib figure
+    """
+    if fig is None:
+        fig, axes = plt.subplots(2, 2, figsize=(16, 16))
+    else:
+        # Extract axes from existing figure if it has a 2x2 grid
+        axes = fig.subplots(2, 2) if len(fig.axes) == 0 else np.array(fig.axes).reshape(2, 2)
+    
+    if len(trajectory_states) == 0:
+        return fig
+    
+    # Colors for different trajectories
+    colors = ['blue', 'green', 'red', 'purple']
+    
+    # Set bounds
+    x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
+    y_min, y_max = float(y_bounds[0]), float(y_bounds[1])
+    
+    # Plot each trajectory in its own subplot
+    num_trajectories = min(len(trajectory_states), 4)
+    for i in range(num_trajectories):
+        row = i // 2
+        col = i % 2
+        ax = axes[row, col]
+        
+        states = trajectory_states[i]
+        goal = trajectory_goals[i]
+        color = colors[i % len(colors)]
+        
+        # Plot trajectory path: start -> intermediate -> final
+        # States shape: (8, 2) = [start, 6 intermediate, final]
+        ax.plot(states[:, 0], states[:, 1], 'o-', color=color, 
+                linewidth=2, markersize=6, alpha=0.7)
+        
+        # Mark start state
+        ax.plot(states[0, 0], states[0, 1], 'o', color=color, 
+                markersize=10, markeredgecolor='black', markeredgewidth=2, label='Start')
+        
+        # Mark final state
+        ax.plot(states[-1, 0], states[-1, 1], 's', color=color, 
+                markersize=10, markeredgecolor='black', markeredgewidth=2, label='Final')
+        
+        # Plot line from final state to goal (different style)
+        ax.plot([states[-1, 0], goal[0]], [states[-1, 1], goal[1]], 
+                '--', color=color, linewidth=2, alpha=0.5, label='To Goal')
+        
+        # Mark goal
+        ax.plot(goal[0], goal[1], '*', color=color, 
+                markersize=15, markeredgecolor='black', markeredgewidth=1, label='Goal')
+        
+        # Set bounds and labels for each subplot
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_xlabel('X Position', fontsize=10)
+        ax.set_ylabel('Y Position', fontsize=10)
+        ax.set_title(f'Trajectory {i+1}', fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect('equal', adjustable='box')
+        ax.legend(loc='best', fontsize=8)
+    
+    # Hide unused subplots if we have fewer than 4 trajectories
+    for i in range(num_trajectories, 4):
+        row = i // 2
+        col = i % 2
+        axes[row, col].axis('off')
+    
+    return fig
+
+
 def visualize_trajectories(
     all_positions: np.ndarray,
     final_positions: np.ndarray,
     goal_positions: np.ndarray,
+    trajectory_states: np.ndarray,
+    trajectory_goals: np.ndarray,
     x_bounds: jnp.ndarray,
     y_bounds: jnp.ndarray,
     save_path: str = None,
-    figsize: Tuple[int, int] = (24, 8),
+    figsize: Tuple[int, int] = (24, 16),
 ) -> plt.Figure:
     """
-    Create visualization with three plots: all states, final states, and goals.
+    Create visualization with three plots in first row and 2x2 grid of trajectories in second row.
     
     Args:
         all_positions: (N, 2) array of [x, y] positions from all states
         final_positions: (M, 2) array of [x, y] positions from final states
         goal_positions: (N, 2) array of [x, y] goal positions from all observations
+        trajectory_states: (num_trajectories, 8, 2) array of trajectory sequences
+        trajectory_goals: (num_trajectories, 2) array of goal positions for trajectories
         x_bounds: [x_min, x_max] bounds for x-axis
         y_bounds: [y_min, y_max] bounds for y-axis
         save_path: Path to save the figure (optional)
@@ -152,7 +244,13 @@ def visualize_trajectories(
     Returns:
         Matplotlib figure
     """
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
+    
+    # First row: 3 plots (all states, final states, goals)
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax3 = fig.add_subplot(gs[0, 2])
     
     # Plot 1: All states
     num_all_points = len(all_positions)
@@ -161,7 +259,7 @@ def visualize_trajectories(
         x_bounds,
         y_bounds,
         title=f'All States in Trajectories (n={num_all_points})',
-        ax=axes[0],
+        ax=ax1,
         alpha_points=0.2,
         alpha_heatmap=0.4,
         point_size=0.5,
@@ -174,7 +272,7 @@ def visualize_trajectories(
         x_bounds,
         y_bounds,
         title=f'Final States of Trajectories (n={num_final_points})',
-        ax=axes[1],
+        ax=ax2,
         alpha_points=0.4,
         alpha_heatmap=0.5,
         point_size=2.0,
@@ -187,11 +285,74 @@ def visualize_trajectories(
         x_bounds,
         y_bounds,
         title=f'Goals in Trajectories (n={num_goal_points})',
-        ax=axes[2],
+        ax=ax3,
         alpha_points=0.3,
         alpha_heatmap=0.5,
         point_size=1.0,
     )
+    
+    # Second row: 2x2 grid for trajectory sequences (spans columns 0-1)
+    traj_gs = gs[1, :2].subgridspec(2, 2, hspace=0.3, wspace=0.3)
+    traj_axes = []
+    for i in range(2):
+        row = []
+        for j in range(2):
+            row.append(fig.add_subplot(traj_gs[i, j]))
+        traj_axes.append(row)
+    traj_axes = np.array(traj_axes)
+    
+    # Plot trajectories in 2x2 grid
+    if len(trajectory_states) > 0:
+        x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
+        y_min, y_max = float(y_bounds[0]), float(y_bounds[1])
+        
+        colors = ['blue', 'green', 'red', 'purple']
+        num_trajectories = min(len(trajectory_states), 4)
+        
+        for i in range(num_trajectories):
+            row = i // 2
+            col = i % 2
+            ax = traj_axes[row, col]
+            
+            states = trajectory_states[i]
+            goal = trajectory_goals[i]
+            color = colors[i % len(colors)]
+            
+            # Plot trajectory path: start -> intermediate -> final
+            ax.plot(states[:, 0], states[:, 1], 'o-', color=color, 
+                    linewidth=2, markersize=6, alpha=0.7)
+            
+            # Mark start state
+            ax.plot(states[0, 0], states[0, 1], 'o', color=color, 
+                    markersize=10, markeredgecolor='black', markeredgewidth=2, label='Start')
+            
+            # Mark final state
+            ax.plot(states[-1, 0], states[-1, 1], 's', color=color, 
+                    markersize=10, markeredgecolor='black', markeredgewidth=2, label='Final')
+            
+            # Plot line from final state to goal (different style)
+            ax.plot([states[-1, 0], goal[0]], [states[-1, 1], goal[1]], 
+                    '--', color=color, linewidth=2, alpha=0.5, label='To Goal')
+            
+            # Mark goal
+            ax.plot(goal[0], goal[1], '*', color=color, 
+                    markersize=15, markeredgecolor='black', markeredgewidth=1, label='Goal')
+            
+            # Set bounds and labels for each subplot
+            ax.set_xlim(x_min, x_max)
+            ax.set_ylim(y_min, y_max)
+            ax.set_xlabel('X Position', fontsize=10)
+            ax.set_ylabel('Y Position', fontsize=10)
+            ax.set_title(f'Trajectory {i+1}', fontsize=12, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.set_aspect('equal', adjustable='box')
+            ax.legend(loc='best', fontsize=8)
+        
+        # Hide unused subplots if we have fewer than 4 trajectories
+        for i in range(num_trajectories, 4):
+            row = i // 2
+            col = i % 2
+            traj_axes[row, col].axis('off')
     
     plt.tight_layout()
     
@@ -209,7 +370,7 @@ def all_visualizations(
     state_size: int,
     goal_indices: Tuple[int, ...],
     rng_key: jax.Array,
-) -> None:
+) -> Any:
     """
     Create all trajectory visualizations from the replay buffer.
     
@@ -223,17 +384,20 @@ def all_visualizations(
         state_size: Size of state dimension
         goal_indices: Indices for x, y positions (typically [0, 1])
         rng_key: Random key for sampling
+        
+    Returns:
+        Updated buffer_state after sampling operations
     """
     # Check if environment has bounds (maze environments)
     if not (hasattr(env, 'x_bounds') and hasattr(env, 'y_bounds')):
-        return
+        return buffer_state
     
     # Sample trajectories from buffer
     buffer_size = replay_buffer.size(buffer_state)
     if buffer_size == 0:
-        return
+        return buffer_state
     
-    all_positions, final_positions, goal_positions = sample_trajectories_from_buffer(
+    buffer_state, all_positions, final_positions, goal_positions = sample_trajectories_from_buffer(
         replay_buffer,
         buffer_state,
         state_size=state_size,
@@ -241,15 +405,27 @@ def all_visualizations(
         rng_key=rng_key,
     )
     
+    # Sample trajectory sequences for detailed plotting
+    buffer_state, trajectory_states, trajectory_goals = sample_trajectory_sequences(
+        replay_buffer,
+        buffer_state,
+        state_size=state_size,
+        goal_indices=goal_indices,
+        rng_key=rng_key,
+        num_trajectories=4,
+    )
+    
     # Only visualize if we have data
     if len(all_positions) == 0 and len(final_positions) == 0 and len(goal_positions) == 0:
-        return
+        return buffer_state
     
     # Create visualization (don't save to file)
     fig = visualize_trajectories(
         all_positions,
         final_positions,
         goal_positions,
+        trajectory_states,
+        trajectory_goals,
         env.x_bounds,
         env.y_bounds,
         save_path=None,
@@ -257,3 +433,5 @@ def all_visualizations(
     
     wandb.log({"trajectory_visualization": wandb.Image(fig)})
     plt.close(fig)
+    
+    return buffer_state

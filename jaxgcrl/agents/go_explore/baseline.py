@@ -551,7 +551,7 @@ class Baseline:
 
             # Visualize trajectories
             key, viz_key = jax.random.split(key)
-            all_visualizations(
+            buffer_state = all_visualizations(
                 replay_buffer=replay_buffer,
                 buffer_state=buffer_state,
                 env=unwrapped_env,
