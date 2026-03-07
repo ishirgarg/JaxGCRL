@@ -59,7 +59,7 @@ class Baseline:
     min_replay_size: int = 1000
     unroll_length: int = 62
     h_dim: int = 256
-    n_hidden: int = 2
+    n_hidden: int = 4
     skip_connections: int = 4
     use_relu: bool = False
 
@@ -67,7 +67,7 @@ class Baseline:
     repr_dim: int = 64
 
     # layer norm
-    use_ln: bool = False
+    use_ln: bool = True
 
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
