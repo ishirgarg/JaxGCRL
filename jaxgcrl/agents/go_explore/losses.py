@@ -49,7 +49,9 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
         # Use actor API
         means, log_stds = networks["actor"].apply(actor_params, observation)
         stds = jnp.exp(log_stds)
-        x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
+        # Split key before stochastic operation
+        key, noise_key = jax.random.split(key)
+        x_ts = means + stds * jax.random.normal(noise_key, shape=means.shape, dtype=means.dtype)
         action = nn.tanh(x_ts)
         log_prob = jax.scipy.stats.norm.logpdf(x_ts, loc=means, scale=stds)
         log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
@@ -151,7 +153,9 @@ def update_alpha_sac(config: Dict[str, Any], networks: Dict[str, Any],
         # Use actor API
         means, log_stds = networks["actor"].apply(actor_params, obs)
         stds = jnp.exp(log_stds)
-        x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
+        # Split key before stochastic operation
+        key, noise_key = jax.random.split(key)
+        x_ts = means + stds * jax.random.normal(noise_key, shape=means.shape, dtype=means.dtype)
         actions = nn.tanh(x_ts)
         log_prob = jax.scipy.stats.norm.logpdf(x_ts, loc=means, scale=stds)
         log_prob -= jnp.log((1 - jnp.square(actions)) + 1e-6)
@@ -159,8 +163,11 @@ def update_alpha_sac(config: Dict[str, Any], networks: Dict[str, Any],
         
         # Alpha loss: -alpha * (log_prob + target_entropy)
         # Original SAC: alpha_loss = -alpha * mean(log_prob + target_entropy)
+        # CRITICAL: stop_gradient prevents alpha update from affecting actor params
         alpha = jnp.exp(alpha_params["log_alpha"])
-        alpha_loss = -alpha * jnp.mean(log_prob + config["target_entropy"])
+        alpha_loss = -alpha * jnp.mean(
+            jax.lax.stop_gradient(log_prob + config["target_entropy"])
+        )
         return alpha_loss
     
     alpha_loss_val, alpha_grad = jax.value_and_grad(alpha_loss)(
@@ -188,7 +195,9 @@ def update_actor_sac(config: Dict[str, Any], networks: Dict[str, Any],
         # Use actor API
         means, log_stds = networks["actor"].apply(actor_params, obs)
         stds = jnp.exp(log_stds)
-        x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
+        # Split key before stochastic operation
+        key, noise_key = jax.random.split(key)
+        x_ts = means + stds * jax.random.normal(noise_key, shape=means.shape, dtype=means.dtype)
         actions = nn.tanh(x_ts)
         log_prob = jax.scipy.stats.norm.logpdf(x_ts, loc=means, scale=stds)
         log_prob -= jnp.log((1 - jnp.square(actions)) + 1e-6)
@@ -241,7 +250,9 @@ def update_critic_sac(config: Dict[str, Any], networks: Dict[str, Any],
         actor = networks["actor"]
         next_means, next_log_stds = actor.apply(actor_params, next_obs)
         next_stds = jnp.exp(next_log_stds)
-        next_x_ts = next_means + next_stds * jax.random.normal(key, shape=next_means.shape, dtype=next_means.dtype)
+        # Split key before stochastic operation
+        key, noise_key = jax.random.split(key)
+        next_x_ts = next_means + next_stds * jax.random.normal(noise_key, shape=next_means.shape, dtype=next_means.dtype)
         next_actions = nn.tanh(next_x_ts)
         next_log_prob = jax.scipy.stats.norm.logpdf(next_x_ts, loc=next_means, scale=next_stds)
         next_log_prob -= jnp.log((1 - jnp.square(next_actions)) + 1e-6)

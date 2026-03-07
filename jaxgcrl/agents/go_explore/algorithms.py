@@ -395,6 +395,7 @@ def get_algorithm(agent_type: str, **kwargs):
             network_depth=kwargs.get("n_hidden", 4),
             use_relu=kwargs.get("use_relu", False),
             use_ln=kwargs.get("use_ln", True),
+            n_critics=kwargs.get("n_critics", 2),
         )
         return actor, critic
     else:
