@@ -217,11 +217,8 @@ class Baseline:
             tx=optax.adam(learning_rate=self.policy_lr),
         )
 
-        critic_state = TrainState.create(
-            apply_fn=critic.apply,
-            params=critic_params,
-            tx=optax.adam(learning_rate=self.critic_lr),
-        )
+        # Create separate TrainState for each critic using the critic's class method
+        critic_states = critic.create_critic_states(critic_params, self.critic_lr)
 
         # Entropy coefficient
         target_entropy = -0.5 * action_size
@@ -243,7 +240,7 @@ class Baseline:
             env_steps=jnp.zeros(()),
             gradient_steps=jnp.zeros(()),
             actor_state=actor_state,
-            critic_state=critic_state,
+            critic_states=critic_states,
             alpha_state=alpha_state,
             target_critic_params=target_critic_params,
         )
@@ -400,10 +397,16 @@ class Baseline:
             
             # Update target networks for SAC
             if self.agent_type == "sac" and training_state.target_critic_params is not None:
+                # Reconstruct full critic params from separate critic states (SAC structure)
+                full_critic_params = {}
+                for i, critic_i_state in enumerate(training_state.critic_states):
+                    for layer_name, layer_params in critic_i_state.params.items():
+                        full_critic_params[f"critic_{i}_{layer_name}"] = layer_params
+                
                 new_target_critic_params = jax.tree_util.tree_map(
                     lambda x, y: x * (1 - self.tau) + y * self.tau,
                     training_state.target_critic_params,
-                    training_state.critic_state.params,
+                    full_critic_params,
                 )
                 training_state = training_state.replace(target_critic_params=new_target_critic_params)
             
@@ -563,10 +566,22 @@ class Baseline:
             )
 
             # Prepare params for return (and optionally save if checkpointing)
+            # Reconstruct full critic params from separate critic states
+            # CRL uses sa_encoder_{i}/g_encoder_{i}, SAC uses critic_{i}_hidden_{j}/critic_{i}_output
+            full_critic_params = {}
+            for i, critic_i_state in enumerate(training_state.critic_states):
+                for layer_name, layer_params in critic_i_state.params.items():
+                    # Check if this is CRL structure (sa_encoder/g_encoder) or SAC structure (hidden/output)
+                    if layer_name in ["sa_encoder", "g_encoder"]:
+                        full_critic_params[f"{layer_name}_{i}"] = layer_params
+                    else:
+                        # SAC structure: add critic_{i}_ prefix
+                        full_critic_params[f"critic_{i}_{layer_name}"] = layer_params
+            
             params = (
                 training_state.alpha_state.params,
                 training_state.actor_state.params,
-                training_state.critic_state.params,
+                full_critic_params,
             )
             
             if config.checkpoint_logdir:

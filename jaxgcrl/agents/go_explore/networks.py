@@ -58,11 +58,6 @@ class Actor(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        if self.use_ln:
-            normalize = lambda x: nn.LayerNorm()(x)
-        else:
-            normalize = lambda x: x
-
         if self.use_relu:
             activation = nn.relu
         else:
@@ -73,8 +68,9 @@ class Actor(nn.Module):
 
         logging.info("actor input shape: %s", x.shape)
         for i in range(self.network_depth):
-            x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
-            x = normalize(x)
+            x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init, name=f"hidden_{i}")(x)
+            if self.use_ln:
+                x = nn.LayerNorm(name=f"ln_{i}")(x)
             x = activation(x)
 
             if self.skip_connections:
@@ -110,11 +106,6 @@ class QNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray, actions: jnp.ndarray):
-        if self.use_ln:
-            normalize = lambda x: nn.LayerNorm()(x)
-        else:
-            normalize = lambda x: x
-
         if self.use_relu:
             activation = nn.relu
         else:
@@ -133,7 +124,8 @@ class QNetwork(nn.Module):
             for j in range(self.network_depth):
                 q = nn.Dense(self.network_width, kernel_init=lecun_uniform, bias_init=bias_init, name=f"critic_{i}_hidden_{j}")(q)
                 if j != self.network_depth - 1:  # Don't normalize/activate final layer
-                    q = normalize(q)
+                    if self.use_ln:
+                        q = nn.LayerNorm(name=f"critic_{i}_ln_{j}")(q)
                     q = activation(q)
             # Final output layer
             q = nn.Dense(1, kernel_init=lecun_uniform, bias_init=bias_init, name=f"critic_{i}_output")(q)

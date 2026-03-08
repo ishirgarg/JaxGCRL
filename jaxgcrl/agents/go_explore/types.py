@@ -1,4 +1,4 @@
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple, Optional, Tuple
 
 import flax.linen as nn
 import jax.numpy as jnp
@@ -33,6 +33,18 @@ class Critic:
 
     def update(self,  context, networks, transitions, training_state, critic_key):
         pass
+    
+    def create_critic_states(self, critic_params: dict, learning_rate: float) -> Tuple[TrainState, ...]:
+        """Create separate TrainState for each critic from full critic params.
+        
+        Args:
+            critic_params: Full critic parameters (structure depends on critic type)
+            learning_rate: Learning rate for optimizer
+            
+        Returns:
+            Tuple of TrainState objects, one for each critic
+        """
+        raise NotImplementedError("Subclasses must implement create_critic_states")
 
 @dataclass
 class TrainingState:
@@ -41,7 +53,7 @@ class TrainingState:
     env_steps: jnp.ndarray
     gradient_steps: jnp.ndarray
     actor_state: TrainState
-    critic_state: TrainState
+    critic_states: Tuple[TrainState, ...]  # Separate TrainState for each critic
     alpha_state: Optional[TrainState] = None
     # SAC-specific fields
     target_critic_params: Optional[Any] = None  # Params for target Q-network

@@ -1,9 +1,10 @@
 import functools
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import optax
 from flax.training.train_state import TrainState
 
 from .losses import (
@@ -235,6 +236,22 @@ class CRLCritic(Critic):
             params[f"g_encoder_{i}"] = g_params
         return params
     
+    def create_critic_states(self, critic_params: dict, learning_rate: float) -> Tuple[TrainState, ...]:
+        """Create separate TrainState for each critic from full critic params (CRL structure)."""
+        critic_states = []
+        for i in range(self.n_critics):
+            critic_i_params = {
+                "sa_encoder": critic_params[f"sa_encoder_{i}"],
+                "g_encoder": critic_params[f"g_encoder_{i}"],
+            }
+            critic_i_state = TrainState.create(
+                apply_fn=None,  # Not needed for individual critic updates
+                params=critic_i_params,
+                tx=optax.adam(learning_rate=learning_rate),
+            )
+            critic_states.append(critic_i_state)
+        return tuple(critic_states)
+    
     def update(self, context: Dict[str, Any], networks: Dict[str, Any],
                transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
         """Update critic for CRL."""
@@ -368,10 +385,33 @@ class SACCritic(Critic):
     def init(self, key, x):
         # x is dummy obs for shape
         dummy_action = jnp.zeros((x.shape[0], self.action_size))
-        return self.network.init(key, x, dummy_action)
+        # network.init() returns {"params": {...}}, but we need to return just the inner dict
+        # to match the pattern used by create_critic_states and CRL
+        variables = self.network.init(key, x, dummy_action)
+        return variables["params"]
     
     def apply(self, params, obs, actions):
-        return self.network.apply(params, obs, actions)
+        # params is the inner dict (unwrapped), need to wrap it for Flax network.apply()
+        return self.network.apply({"params": params}, obs, actions)
+    
+    def create_critic_states(self, critic_params: dict, learning_rate: float) -> Tuple[TrainState, ...]:
+        """Create separate TrainState for each critic from full critic params (SAC structure)."""
+        critic_states = []
+        for i in range(self.n_critics):
+            # SAC structure: critic_{i}_hidden_{j} and critic_{i}_output
+            critic_i_params = {}
+            for key, value in critic_params.items():
+                if key.startswith(f"critic_{i}_"):
+                    # Remove the "critic_{i}_" prefix to get the layer name
+                    layer_name = key[len(f"critic_{i}_"):]
+                    critic_i_params[layer_name] = value
+            critic_i_state = TrainState.create(
+                apply_fn=None,  # Not needed for individual critic updates
+                params=critic_i_params,
+                tx=optax.adam(learning_rate=learning_rate),
+            )
+            critic_states.append(critic_i_state)
+        return tuple(critic_states)
     
     def update(self, context: Dict[str, Any], networks: Dict[str, Any],
                transitions: Transition, training_state: TrainingState, key: jnp.ndarray):

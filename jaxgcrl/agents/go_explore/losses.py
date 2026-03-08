@@ -61,6 +61,7 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
         # Use critic API to compute Q-value - construct obs from state and goal
         critic = networks["critic"]
         obs_with_goal = jnp.concatenate([state, goal], axis=1)
+        # critic_params is already the full reconstructed params structure
         q_values = critic.apply(critic_params, obs_with_goal, action)  # Shape: (batch_size, n_critics)
         # Use first critic's output for CRL
         qf_pi = q_values[:, 0]  # Shape: (batch_size,)
@@ -74,9 +75,15 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
         alpha_loss = alpha * jnp.mean(jax.lax.stop_gradient(-log_prob - config["target_entropy"]))
         return jnp.mean(alpha_loss)
 
+    # Reconstruct full critic params from separate critic states for actor loss (CRL uses sa_encoder_{i}/g_encoder_{i})
+    full_critic_params = {}
+    for i, critic_i_state in enumerate(training_state.critic_states):
+        full_critic_params[f"sa_encoder_{i}"] = critic_i_state.params["sa_encoder"]
+        full_critic_params[f"g_encoder_{i}"] = critic_i_state.params["g_encoder"]
+    
     (actor_loss, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
         training_state.actor_state.params,
-        training_state.critic_state.params,
+        full_critic_params,
         training_state.alpha_state.params["log_alpha"],
         transitions,
         key,
@@ -102,7 +109,8 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
                   transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
     """CRL critic update with support for multiple critics.
     
-    Each critic is updated separately with its own gradients, not averaged.
+    All critics are updated through a single backprop pass, but each maintains
+    its own TrainState and optimizer state (decoupled).
     """
     state = transitions.observation[:, : config["state_size"]]
     action = transitions.action
@@ -110,22 +118,24 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
 
     critic = networks["critic"]
     n_critics = critic.n_critics
-    current_params = training_state.critic_state.params
     
-    # Update each critic separately
-    new_params = {}
-    new_opt_state = {}
-    critic_losses = []
-    logsumexps = []
-    corrects = []
-    logits_pos_list = []
-    logits_neg_list = []
+    # Collect all critic parameters into a tuple for single backprop
+    all_critic_params = tuple(critic_i_state.params for critic_i_state in training_state.critic_states)
     
-    for i in range(n_critics):
-        # Loss function for this specific critic
-        def single_critic_loss(critic_i_params, transitions, key):
-            # Get representations for this critic only
-            sa_input = jnp.concatenate([state, action], axis=-1)
+    # Loss function that computes loss for all critics in one pass
+    def all_critics_loss(critic_params_tuple, transitions, key):
+        """Compute loss for all critics simultaneously."""
+        sa_input = jnp.concatenate([state, action], axis=-1)
+        
+        # Compute loss for each critic
+        losses = []
+        logsumexps = []
+        corrects = []
+        logits_pos_list = []
+        logits_neg_list = []
+        
+        for i, critic_i_params in enumerate(critic_params_tuple):
+            # Get representations for this critic
             sa_repr = critic.sa_encoders[i].apply(critic_i_params["sa_encoder"], sa_input)
             g_repr = critic.g_encoders[i].apply(critic_i_params["g_encoder"], goal)
 
@@ -141,54 +151,31 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
             correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
             logits_pos = jnp.sum(logits * I) / jnp.sum(I)
             logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
-
-            return loss, (logsumexp, correct, logits_pos, logits_neg)
-
-        # Compute loss and gradient for this critic only
-        critic_i_params = {
-            "sa_encoder": current_params[f"sa_encoder_{i}"],
-            "g_encoder": current_params[f"g_encoder_{i}"],
-        }
-        (loss, (logsumexp, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
-            single_critic_loss, has_aux=True
-        )(critic_i_params, transitions, key)
+            
+            losses.append(loss)
+            logsumexps.append(logsumexp)
+            corrects.append(correct)
+            logits_pos_list.append(logits_pos)
+            logits_neg_list.append(logits_neg)
         
-        # Extract optimizer state for this critic (preserve existing opt_state)
-        # The opt_state structure matches the params structure
-        critic_i_opt_state = {
-            "sa_encoder": training_state.critic_state.opt_state[f"sa_encoder_{i}"],
-            "g_encoder": training_state.critic_state.opt_state[f"g_encoder_{i}"],
-        }
-        
-        # Create TrainState with existing optimizer state (not a fresh one)
-        critic_i_state = TrainState(
-            step=training_state.critic_state.step,
-            apply_fn=None,  # Not needed for gradient update
-            params=critic_i_params,
-            tx=training_state.critic_state.tx,
-            opt_state=critic_i_opt_state,
-        )
-        new_critic_i_state = critic_i_state.apply_gradients(grads=grad)
-        
-        # Store updated parameters and optimizer state
-        new_params[f"sa_encoder_{i}"] = new_critic_i_state.params["sa_encoder"]
-        new_params[f"g_encoder_{i}"] = new_critic_i_state.params["g_encoder"]
-        new_opt_state[f"sa_encoder_{i}"] = new_critic_i_state.opt_state["sa_encoder"]
-        new_opt_state[f"g_encoder_{i}"] = new_critic_i_state.opt_state["g_encoder"]
-        
-        # Store metrics
-        critic_losses.append(loss)
-        logsumexps.append(logsumexp)
-        corrects.append(correct)
-        logits_pos_list.append(logits_pos)
-        logits_neg_list.append(logits_neg)
+        # Return total loss (sum of all critic losses) and metrics
+        total_loss = sum(losses)
+        metrics = (logsumexps, corrects, logits_pos_list, logits_neg_list, losses)
+        return total_loss, metrics
     
-    # Update critic state with all new parameters and optimizer state
-    new_critic_state = training_state.critic_state.replace(
-        params=new_params,
-        opt_state=new_opt_state,
-    )
-    training_state = training_state.replace(critic_state=new_critic_state)
+    # Compute gradients for all critics in one backprop pass
+    (total_loss, (logsumexps, corrects, logits_pos_list, logits_neg_list, critic_losses)), all_grads = jax.value_and_grad(
+        all_critics_loss, has_aux=True
+    )(all_critic_params, transitions, key)
+    
+    # Apply gradients to each critic's TrainState separately (preserves optimizer state)
+    new_critic_states = []
+    for i, (critic_i_state, grad) in enumerate(zip(training_state.critic_states, all_grads)):
+        new_critic_i_state = critic_i_state.apply_gradients(grads=grad)
+        new_critic_states.append(new_critic_i_state)
+    
+    # Update training state with all updated critic states
+    training_state = training_state.replace(critic_states=tuple(new_critic_states))
 
     # Average metrics for logging
     metrics = {
@@ -276,9 +263,16 @@ def update_actor_sac(config: Dict[str, Any], networks: Dict[str, Any],
     # Use OLD alpha value (before alpha update) - matching original SAC
     alpha = jnp.exp(training_state.alpha_state.params["log_alpha"]) if training_state.alpha_state else 0.0
     
+    # Reconstruct full critic params from separate critic states for SAC actor loss
+    # SAC uses critic_{i}_hidden_{j}/critic_{i}_output structure
+    full_critic_params = {}
+    for i, critic_i_state in enumerate(training_state.critic_states):
+        for layer_name, layer_params in critic_i_state.params.items():
+            full_critic_params[f"critic_{i}_{layer_name}"] = layer_params
+    
     (actor_loss_val, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
         training_state.actor_state.params,
-        training_state.critic_state.params,
+        full_critic_params,
         alpha,
         transitions,
         key,
@@ -296,63 +290,110 @@ def update_actor_sac(config: Dict[str, Any], networks: Dict[str, Any],
 
 def update_critic_sac(config: Dict[str, Any], networks: Dict[str, Any],
                       transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
-    """SAC critic update."""
-    def critic_loss(q_params, actor_params, target_q_params, alpha, transitions, key):
-        obs = transitions.observation
-        next_obs = transitions.next_observation
-        actions = transitions.action
-        rewards = transitions.reward
-        discounts = transitions.discount
+    """SAC critic update with support for multiple critics.
+    
+    Each critic is updated separately with its own TrainState, preserving optimizer state.
+    """
+    obs = transitions.observation
+    next_obs = transitions.next_observation
+    actions = transitions.action
+    rewards = transitions.reward
+    discounts = transitions.discount
 
-        # Use critic API for current Q-values
-        critic = networks["critic"]
-        q_values = critic.apply(q_params, obs, actions)
-        
-        # Use actor API for next actions
-        actor = networks["actor"]
-        next_means, next_log_stds = actor.apply(actor_params, next_obs)
-        next_stds = jnp.exp(next_log_stds)
-        # Split key before stochastic operation
-        key, noise_key = jax.random.split(key)
-        next_x_ts = next_means + next_stds * jax.random.normal(noise_key, shape=next_means.shape, dtype=next_means.dtype)
-        next_actions = nn.tanh(next_x_ts)
-        next_log_prob = jax.scipy.stats.norm.logpdf(next_x_ts, loc=next_means, scale=next_stds)
-        next_log_prob -= jnp.log((1 - jnp.square(next_actions)) + 1e-6)
-        next_log_prob = next_log_prob.sum(-1, keepdims=True)
-
-        # Use critic API for target Q-values
-        target_q_values = critic.apply(target_q_params, next_obs, next_actions)
-        target_q_value = jnp.min(target_q_values, axis=-1, keepdims=True)  # Min over critics: (batch_size, 1)
-        target = rewards[:, None] + config["discounting"] * discounts[:, None] * (
-            target_q_value - alpha * next_log_prob
-        )  # target shape: (batch_size, 1)
-
-        # Bellman error for each critic
-        # q_values: (batch_size, n_critics), target: (batch_size, 1) -> broadcasts to (batch_size, n_critics)
-        critic_loss = jnp.mean((q_values - target) ** 2)
-        return critic_loss
-
-    # Use OLD alpha value (before alpha update) - matching original SAC (line 370)
-    # Original uses training_state.alpha_params (old) even after alpha_update returns new params
+    critic = networks["critic"]
+    n_critics = critic.n_critics
+    
+    # Use OLD alpha value (before alpha update) - matching original SAC
     alpha = jnp.exp(training_state.alpha_state.params["log_alpha"]) if training_state.alpha_state else 0.0
     
-    # target_critic_params is always set for SAC (initialized in baseline.py line 201)
-    # This function is only called for SAC via SACCritic.update
+    # target_critic_params is always set for SAC (initialized in baseline.py)
+    # It already has the full structure with critic_{i}_{layer_name} keys, so use it directly
     target_q_params = training_state.target_critic_params
     
-    critic_loss_val, critic_grad = jax.value_and_grad(critic_loss)(
-        training_state.critic_state.params,
-        training_state.actor_state.params,
-        target_q_params,
-        alpha,
-        transitions,
-        key,
-    )
-    new_critic_state = training_state.critic_state.apply_gradients(grads=critic_grad)
-    training_state = training_state.replace(critic_state=new_critic_state)
+    # Use actor API for next actions (shared across all critics)
+    actor = networks["actor"]
+    next_means, next_log_stds = actor.apply(training_state.actor_state.params, next_obs)
+    next_stds = jnp.exp(next_log_stds)
+    key, noise_key = jax.random.split(key)
+    next_x_ts = next_means + next_stds * jax.random.normal(noise_key, shape=next_means.shape, dtype=next_means.dtype)
+    next_actions = nn.tanh(next_x_ts)
+    next_log_prob = jax.scipy.stats.norm.logpdf(next_x_ts, loc=next_means, scale=next_stds)
+    next_log_prob -= jnp.log((1 - jnp.square(next_actions)) + 1e-6)
+    next_log_prob = next_log_prob.sum(-1, keepdims=True)
 
+    # Use critic API for target Q-values (min over all critics)
+    target_q_values = critic.apply(target_q_params, next_obs, next_actions)
+    target_q_value = jnp.min(target_q_values, axis=-1, keepdims=True)  # Min over critics: (batch_size, 1)
+    target = rewards[:, None] + config["discounting"] * discounts[:, None] * (
+        target_q_value - alpha * next_log_prob
+    )  # target shape: (batch_size, 1)
+    
+    # Reconstruct full current critic params for computing Q-values
+    full_current_critic_params = {}
+    for i, critic_i_state in enumerate(training_state.critic_states):
+        for layer_name, layer_params in critic_i_state.params.items():
+            full_current_critic_params[f"critic_{i}_{layer_name}"] = layer_params
+    
+    # Update each critic separately using its own TrainState
+    new_critic_states = []
+    critic_losses = []
+    
+    for i in range(n_critics):
+        # Get current critic state and params
+        critic_i_state = training_state.critic_states[i]
+        critic_i_params = critic_i_state.params
+        
+        # Get other critics' params as a dict (for reconstructing full params structure)
+        # Use stop_gradient to prevent gradients from flowing to other critics
+        other_critics_params_dict = {}
+        for j in range(n_critics):
+            if j != i:
+                for layer_name, layer_params in training_state.critic_states[j].params.items():
+                    other_critics_params_dict[f"critic_{j}_{layer_name}"] = jax.lax.stop_gradient(layer_params)
+        
+        # Loss function for this specific critic
+        # Pass critic_idx as a parameter to avoid closure issues with JAX
+        def single_critic_loss(critic_i_params, other_params_dict, critic_idx, target_val, transitions, key):
+            # Reconstruct full params with this critic's params and other critics' params
+            full_params = {}
+            # Add this critic's params
+            for layer_name, layer_params in critic_i_params.items():
+                full_params[f"critic_{critic_idx}_{layer_name}"] = layer_params
+            # Add other critics' params (already stop_gradient'd)
+            full_params.update(other_params_dict)
+            
+            # Use critic API for current Q-value for this critic only
+            # critic.apply() expects inner dict and will wrap it internally
+            q_values = critic.apply(full_params, obs, actions)  # Shape: (batch_size, n_critics)
+            q_value = q_values[:, critic_idx:critic_idx+1]  # Shape: (batch_size, 1) - only this critic's Q-value
+            
+            # Bellman error for this critic
+            critic_loss = jnp.mean((q_value - target_val) ** 2)
+            return critic_loss
+
+        # Compute loss and gradient for this critic
+        loss, grad = jax.value_and_grad(single_critic_loss)(
+            critic_i_params,
+            other_critics_params_dict,
+            i,  # Pass i as a parameter
+            target,
+            transitions,
+            key,
+        )
+        
+        # Apply gradients using this critic's TrainState (preserves optimizer state automatically)
+        new_critic_i_state = critic_i_state.apply_gradients(grads=grad)
+        new_critic_states.append(new_critic_i_state)
+        
+        # Store metrics
+        critic_losses.append(loss)
+    
+    # Update training state with all updated critic states
+    training_state = training_state.replace(critic_states=tuple(new_critic_states))
+
+    # Average metrics for logging
     metrics = {
-        "critic_loss": critic_loss_val,
+        "critic_loss": jnp.mean(jnp.array(critic_losses)),
     }
 
     return training_state, metrics
