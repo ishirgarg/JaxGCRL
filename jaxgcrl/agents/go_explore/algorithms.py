@@ -187,7 +187,7 @@ class CRLCritic(Critic):
         q_values = []
         for sa_repr, g_repr in zip(sa_repr_list, g_repr_list):
             q_value = energy_fn(self.energy_fn, sa_repr, g_repr)
-        q_values.append(q_value[..., None])  # Shape: (..., 1)
+            q_values.append(q_value[..., None])  # Shape: (..., 1)
         
         return jnp.concatenate(q_values, axis=-1)  # Shape: (..., n_critics)
     

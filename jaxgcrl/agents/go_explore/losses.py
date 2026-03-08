@@ -114,6 +114,7 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
     
     # Update each critic separately
     new_params = {}
+    new_opt_state = {}
     critic_losses = []
     logsumexps = []
     corrects = []
@@ -152,17 +153,28 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
             single_critic_loss, has_aux=True
         )(critic_i_params, transitions, key)
         
-        # Update this critic's parameters
-        critic_i_state = TrainState.create(
+        # Extract optimizer state for this critic (preserve existing opt_state)
+        # The opt_state structure matches the params structure
+        critic_i_opt_state = {
+            "sa_encoder": training_state.critic_state.opt_state[f"sa_encoder_{i}"],
+            "g_encoder": training_state.critic_state.opt_state[f"g_encoder_{i}"],
+        }
+        
+        # Create TrainState with existing optimizer state (not a fresh one)
+        critic_i_state = TrainState(
+            step=training_state.critic_state.step,
             apply_fn=None,  # Not needed for gradient update
             params=critic_i_params,
             tx=training_state.critic_state.tx,
+            opt_state=critic_i_opt_state,
         )
         new_critic_i_state = critic_i_state.apply_gradients(grads=grad)
         
-        # Store updated parameters
+        # Store updated parameters and optimizer state
         new_params[f"sa_encoder_{i}"] = new_critic_i_state.params["sa_encoder"]
         new_params[f"g_encoder_{i}"] = new_critic_i_state.params["g_encoder"]
+        new_opt_state[f"sa_encoder_{i}"] = new_critic_i_state.opt_state["sa_encoder"]
+        new_opt_state[f"g_encoder_{i}"] = new_critic_i_state.opt_state["g_encoder"]
         
         # Store metrics
         critic_losses.append(loss)
@@ -171,8 +183,11 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
         logits_pos_list.append(logits_pos)
         logits_neg_list.append(logits_neg)
     
-    # Update critic state with all new parameters
-    new_critic_state = training_state.critic_state.replace(params=new_params)
+    # Update critic state with all new parameters and optimizer state
+    new_critic_state = training_state.critic_state.replace(
+        params=new_params,
+        opt_state=new_opt_state,
+    )
     training_state = training_state.replace(critic_state=new_critic_state)
 
     # Average metrics for logging
