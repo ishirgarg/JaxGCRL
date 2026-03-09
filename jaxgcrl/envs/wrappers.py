@@ -26,12 +26,29 @@ class GoalProposerWrapper(Wrapper):
         self._goal_proposer_state = goal_proposer_state
 
     def reset(self, rng: jax.Array) -> State:
-        # Propose a goal using the goal proposer
-        # If goal_proposer_state is set, the goal_proposer should be a closure
-        # that captures it, or we could pass it explicitly here if needed
-        goal = self._goal_proposer(rng)
+        """Proposes goal and resets environment.
+        
+        Note: reset() is called by training.wrap, so we can't change its signature.
+        We get buffer_state from goal_proposer_state (Python dict read), but pass it as an
+        explicit JAX argument to the goal proposer. This ensures JAX sees the current value
+        on every call, not a trace-time constant from the closure.
+        """
+        # Get current buffer_state from goal_proposer_state (Python dict read)
+        current_buffer_state = self._goal_proposer_state.get('buffer_state') if self._goal_proposer_state else None
+        
+        # Pass buffer_state as explicit JAX argument to goal proposer
+        # This is critical: buffer_state must be a JAX argument, not read from Python dict inside closure
+        # Otherwise JAX traces it as a constant and never sees updates
+        goal, updated_buffer_state = self._goal_proposer(rng, current_buffer_state)
+        
         # Reset the environment with the proposed goal
-        return self.env.reset(rng, goal=goal)
+        state = self.env.reset(rng, goal=goal)
+        
+        # Update goal_proposer_state with updated_buffer_state for next reset
+        if self._goal_proposer_state is not None:
+            self._goal_proposer_state.update(buffer_state=updated_buffer_state)
+        
+        return state
     
     def update_goal_proposer_state(self, new_state: Any) -> "GoalProposerWrapper":
         """Create a new wrapper with updated goal proposer state.

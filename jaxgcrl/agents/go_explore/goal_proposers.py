@@ -2,6 +2,7 @@ from typing import Callable, Dict, Any, Optional
 
 import jax
 import jax.numpy as jnp
+from jaxgcrl.agents.go_explore.utils import sample_trajectories_from_buffer
 
 
 class GoalProposerState:
@@ -60,7 +61,7 @@ def create_goal_proposer(
     env,
     num_envs: int,
     goal_proposer_state: Optional[GoalProposerState] = None,
-) -> Callable[[jax.Array], jnp.ndarray]:
+) -> Callable:
     """
     Factory function to create a goal proposer function.
     
@@ -89,7 +90,15 @@ def create_goal_proposer(
                 return goal
     """
     if goal_proposer_name == "random_env_goals":
-        return create_random_env_goals_proposer(env, num_envs, goal_proposer_state)
+        proposer_fn = create_random_env_goals_proposer(env, num_envs, goal_proposer_state)
+        # Wrap to take buffer_state and return (goal, buffer_state) for consistency
+        def wrapped_proposer(rng, buffer_state):
+            goal = proposer_fn(rng)
+            # For non-buffer proposers, return buffer_state unchanged (or None if not available)
+            return goal, buffer_state
+        return wrapped_proposer
+    elif goal_proposer_name == "random_final_states":
+        return create_random_final_states_proposer(env, num_envs, goal_proposer_state)
     else:
         raise ValueError(f"Unknown goal proposer: {goal_proposer_name}")
 
@@ -129,5 +138,65 @@ def create_random_env_goals_proposer(
         idx = jax.random.randint(rng, (), 0, len(possible_goals))
         goal = possible_goals[idx]  # Shape: (goal_dim,)
         return goal
+    
+    return propose_goal
+
+
+def create_random_final_states_proposer(
+    env,
+    num_envs: int,
+    goal_proposer_state: Optional[GoalProposerState] = None,
+) -> Callable[[jax.Array, Any], tuple[jnp.ndarray, Any]]:
+    """
+    Creates a goal proposer that samples random goals from final states of trajectories
+    in the replay buffer. Falls back to random env goals if buffer is not available.
+    
+    Args:
+        env: The environment instance
+        num_envs: Number of parallel environments (not used, kept for API consistency)
+        goal_proposer_state: State container that must contain:
+                           - 'replay_buffer': The replay buffer instance
+                           - 'state_size': Size of state dimension
+                           - 'goal_indices': Indices in state that represent the goal
+        
+    Returns:
+        A function that takes (rng, buffer_state) and returns (goal, updated_buffer_state).
+    """
+    # Extract static values at closure creation time (these don't change during training)
+    # These are captured in the closure, which is fine since they're static
+    replay_buffer = goal_proposer_state.get('replay_buffer') if goal_proposer_state else None
+    state_size = goal_proposer_state.get('state_size') if goal_proposer_state else None
+    goal_indices = goal_proposer_state.get('goal_indices') if goal_proposer_state else None
+    
+    # Create fallback random env goals proposer
+    random_env_goals_proposer = create_random_env_goals_proposer(env, num_envs, goal_proposer_state)
+    
+    def propose_goal(rng: jax.Array, buffer_state: Any) -> tuple[jnp.ndarray, Any]:
+        """Returns (goal, updated_buffer_state).
+        
+        Critical: buffer_state is passed as an explicit JAX argument, not read from Python dict.
+        This ensures JAX sees the current value on every call, not a trace-time constant.
+        Static values (replay_buffer, state_size, goal_indices) are captured in closure.
+        """
+        # If replay_buffer is not available yet (e.g., during initial reset), fallback to random env goals
+        if replay_buffer is None or buffer_state is None:
+            jax.debug.print("Goal proposer: fallback - replay_buffer={}, buffer_state={}", 
+                           replay_buffer is not None, buffer_state is not None)
+            goal = random_env_goals_proposer(rng)
+            return goal, buffer_state
+        
+        updated_buffer_state, _, final_positions, _ = sample_trajectories_from_buffer(
+            replay_buffer, buffer_state, state_size, tuple(goal_indices), rng
+        )
+       
+        if len(final_positions) == 0:
+            jax.debug.print("Goal proposer: fallback - no final positions")
+            goal = random_env_goals_proposer(rng)
+        else:
+            jax.debug.print("Goal proposer: using final states - {} final positions", len(final_positions))
+            idx = jax.random.randint(rng, (), 0, len(final_positions))
+            goal = jnp.array(final_positions[idx])
+        
+        return goal, updated_buffer_state
     
     return propose_goal

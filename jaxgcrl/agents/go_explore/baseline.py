@@ -80,7 +80,7 @@ class Baseline:
     use_her: bool = True  # Hindsight Experience Replay
 
     # goal proposer for training
-    goal_proposer_name: Literal["random_env_goals"] = "random_env_goals"
+    goal_proposer_name: Literal["random_env_goals", "random_final_states"] = "random_env_goals"
 
     def check_config(self, config):
         """
@@ -111,10 +111,15 @@ class Baseline:
         # Create goal proposer state container (for future goal proposers that need training state)
         goal_proposer_state = GoalProposerState()
         
+        # Initialize goal_proposer_state with values available now (before buffer is created)
+        # These will be updated later with buffer_state and replay_buffer
+        goal_proposer_state.update(
+            state_size=unwrapped_env.state_dim,
+            goal_indices=unwrapped_env.goal_indices,
+        )
+        
         # Create goal proposer (will be used to reset envs when they auto-reset)
-        # For simple proposers like "random_env_goals", state is not needed
-        # For future proposers that need buffer/critic params, they can access
-        # them via the goal_proposer_state container
+        # All proposers get access to the same state, even if they don't use it
         goal_proposer = create_goal_proposer(
             self.goal_proposer_name,
             unwrapped_env,
@@ -279,6 +284,13 @@ class Baseline:
         )
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
+        # Update goal proposer state with buffer-related values (now that buffer is created)
+        # state_size and goal_indices were already set earlier
+        goal_proposer_state.update(
+            replay_buffer=replay_buffer,
+            buffer_state=buffer_state,
+        )
+
         def actor_step(actor_state, env, env_state, key, extra_fields, is_deterministic: bool):
             actions = actor.sample_actions(
                 actor_state.params,
@@ -299,9 +311,14 @@ class Baseline:
 
         @jax.jit
         def get_experience(actor_state, env_state, buffer_state, key, is_deterministic: bool):
+            # Update goal_proposer_state with current buffer_state BEFORE the scan
+            # This ensures that when reset() is called during the scan, it can pass the current
+            # buffer_state as an explicit JAX argument to the goal proposer
+            goal_proposer_state.update(buffer_state=buffer_state)
+            
             @jax.jit
             def f(carry, unused_t):
-                env_state, current_key = carry
+                env_state, buffer_state, current_key = carry
                 current_key, next_key = jax.random.split(current_key)
                 env_state, transition = actor_step(
                     actor_state,
@@ -311,14 +328,24 @@ class Baseline:
                     extra_fields=("truncation", "traj_id"),
                     is_deterministic=is_deterministic,
                 )
-                return (env_state, next_key), transition
+                # buffer_state flows through the scan carry (JAX-compatible)
+                # When reset() is called during step(), it reads buffer_state from goal_proposer_state
+                # and passes it as explicit JAX arg to goal proposer (not from Python dict inside closure)
+                return (env_state, buffer_state, next_key), transition
 
-            (env_state, _), data = jax.lax.scan(f, (env_state, key), (), length=self.unroll_length)
+            (env_state, buffer_state, _), data = jax.lax.scan(f, (env_state, buffer_state, key), (), length=self.unroll_length)
 
             # GoalProposerWrapper intercepts all reset calls (including mid-unroll resets from training.wrap)
             # so we don't need to manually reset here - the wrapper handles it automatically
             
             buffer_state = replay_buffer.insert(buffer_state, data)
+            
+            # Update goal_proposer_state with final buffer_state (outside JIT, after scan completes)
+            # This ensures goal_proposer_state has the latest state for the next get_experience call
+            # The goal proposer receives buffer_state as an explicit JAX argument, so it always sees
+            # the current value (not a trace-time constant from Python dict)
+            goal_proposer_state.update(buffer_state=buffer_state)
+            
             return env_state, buffer_state
 
         def prefill_replay_buffer(training_state, env_state, buffer_state, key):
@@ -387,14 +414,6 @@ class Baseline:
             metrics.update(critic_metrics)
             metrics.update(actor_metrics)
             
-            # TODO: For future goal proposers that need training state, update goal_proposer_state here:
-            # goal_proposer_state.update(
-            #     buffer_state=buffer_state,
-            #     critic_params=training_state.critic_state.params,
-            #     actor_params=training_state.actor_state.params,
-            #     # ... any other state needed
-            # )
-            
             # Update target networks for SAC
             if self.agent_type == "sac" and training_state.target_critic_params is not None:
                 # Reconstruct full critic params from separate critic states (SAC structure)
@@ -422,6 +441,7 @@ class Baseline:
             experience_key1, process_key, training_key = jax.random.split(key, 3)
 
             # Collect unroll_length steps (with auto-resets)
+            # get_experience will extract and use updated buffer_state from resets (stored in state.info)
             env_state, buffer_state = get_experience(
                 training_state.actor_state,
                 env_state,
@@ -511,6 +531,11 @@ class Baseline:
             t = time.time()
 
             key, epoch_key = jax.random.split(key)
+
+            # Initialize goal_proposer_state with current buffer_state at start of epoch
+            # It will be updated immediately after each step in get_experience
+            # All proposers get updated state, even if they don't use it
+            goal_proposer_state.update(buffer_state=buffer_state)
 
             training_state, env_state, buffer_state, metrics = training_epoch(
                 training_state, env_state, buffer_state, epoch_key
