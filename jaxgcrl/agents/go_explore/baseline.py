@@ -17,7 +17,13 @@ from etils import epath
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
 
-from jaxgcrl.envs.wrappers import GoalProposerWrapper, TrajectoryIdWrapper
+from jaxgcrl.envs.wrappers import (
+    EvalAutoResetWrapper,
+    TrainAutoResetWrapper,
+    TrajectoryIdWrapper,
+    EpisodeWrapper,
+    VmapWrapper,
+)
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
@@ -26,7 +32,7 @@ from .algorithms import get_algorithm
 from .utils import save_params
 from .losses import update_alpha_sac, update_critic_sac, update_actor_sac
 from .visualization import all_visualizations
-from .goal_proposers import create_goal_proposer, GoalProposerState
+from .goal_proposers import create_goal_proposer
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -108,41 +114,60 @@ class Baseline:
 
         unwrapped_env = train_env
         
-        # Create goal proposer state container (for future goal proposers that need training state)
-        goal_proposer_state = GoalProposerState()
+        # Compute dimensions early (needed for dummy transition before wrapper creation)
+        action_size = train_env.action_size
+        state_size = train_env.state_dim
+        goal_size = len(train_env.goal_indices)
+        obs_size = state_size + goal_size
         
-        # Initialize goal_proposer_state with values available now (before buffer is created)
-        # These will be updated later with buffer_state and replay_buffer
-        goal_proposer_state.update(
-            state_size=unwrapped_env.state_dim,
-            goal_indices=unwrapped_env.goal_indices,
+        # Create dummy transition for initial state.info (before first reset)
+        # This ensures transitions_sample is always a valid Transition object, not None
+        # Shape must match: (num_envs, episode_length, obs_size) for observation
+        dummy_obs = jnp.zeros((config.num_envs, config.episode_length, obs_size))
+        dummy_action = jnp.zeros((config.num_envs, config.episode_length, action_size))
+        dummy_reward = jnp.zeros((config.num_envs, config.episode_length))
+        dummy_discount = jnp.zeros((config.num_envs, config.episode_length))
+        dummy_next_obs = jnp.zeros((config.num_envs, config.episode_length, obs_size)) if self.agent_type == "sac" else None
+        dummy_extras = {
+            "state_extras": {
+                "traj_id": jnp.zeros((config.num_envs, config.episode_length), dtype=jnp.float32),
+                "truncation": jnp.zeros((config.num_envs, config.episode_length), dtype=jnp.float32)
+            }
+        }
+        initial_dummy_transition = Transition(
+            observation=dummy_obs,
+            action=dummy_action,
+            reward=dummy_reward,
+            discount=dummy_discount,
+            next_observation=dummy_next_obs,
+            extras=dummy_extras
         )
         
         # Create goal proposer (will be used to reset envs when they auto-reset)
-        # All proposers get access to the same state, even if they don't use it
+        # Pass state_size and goal_indices directly (static config, no container needed)
         goal_proposer = create_goal_proposer(
             self.goal_proposer_name,
             unwrapped_env,
             config.num_envs,
-            goal_proposer_state=goal_proposer_state,
+            state_size=unwrapped_env.state_dim,
+            goal_indices=unwrapped_env.goal_indices,
         )
         
-        # Wrap with GoalProposerWrapper to intercept resets and use goal proposer
-        # This must be before TrajectoryIdWrapper so it intercepts resets from training.wrap
-        train_env = GoalProposerWrapper(train_env, goal_proposer, goal_proposer_state)
+        # Wrap envs explicitly (mirrors brax.envs.training.wrap), but with TrajectoryIdWrapper innermost:
+        # inner -> outer: TrajectoryIdWrapper -> VmapWrapper -> EpisodeWrapper -> (Train/Eval)AutoResetWrapper
         train_env = TrajectoryIdWrapper(train_env)
-        train_env = envs.training.wrap(
+        train_env = VmapWrapper(train_env)
+        train_env = EpisodeWrapper(train_env, config.episode_length, config.action_repeat)
+        train_env = TrainAutoResetWrapper(
             train_env,
-            episode_length=config.episode_length,
-            action_repeat=config.action_repeat,
+            goal_proposer=goal_proposer,
+            initial_dummy_transitions_sample=initial_dummy_transition,
         )
 
         eval_env = TrajectoryIdWrapper(eval_env)
-        eval_env = envs.training.wrap(
-            eval_env,
-            episode_length=config.episode_length,
-            action_repeat=config.action_repeat,
-        )
+        eval_env = VmapWrapper(eval_env)
+        eval_env = EpisodeWrapper(eval_env, config.episode_length, config.action_repeat)
+        eval_env = EvalAutoResetWrapper(eval_env)
 
         # Use unroll_length directly (original behavior with auto-resets)
         env_steps_per_actor_step = config.num_envs * self.unroll_length
@@ -182,15 +207,16 @@ class Baseline:
         key, buffer_key, eval_env_key, env_key, actor_key, critic_key = jax.random.split(key, 6)
 
         env_keys = jax.random.split(env_key, config.num_envs)
-        # Cannot JIT reset because GoalProposerWrapper uses closures with mutable state
+        # Initialize transitions_sample in state.info (Brax pattern, JIT-compatible)
+        # This ensures it's always present, avoiding Python conditionals in reset()
+        # The wrapper will use initial_dummy_transition on first reset if not in state.info
         env_state = train_env.reset(env_keys)
+        # Initialize transitions_sample and rng with dummy transition and env_keys in state.info
+        info = env_state.info.copy() if hasattr(env_state.info, 'copy') else dict(env_state.info)
+        info['transitions_sample'] = initial_dummy_transition
+        info['rng'] = env_keys
+        env_state = env_state.replace(info=info)
         train_env.step = jax.jit(train_env.step)
-
-        # Dimensions definitions and sanity checks
-        action_size = train_env.action_size
-        state_size = train_env.state_dim
-        goal_size = len(train_env.goal_indices)
-        obs_size = state_size + goal_size
         assert obs_size == train_env.observation_size, (
             f"obs_size: {obs_size}, observation_size: {train_env.observation_size}"
         )
@@ -284,12 +310,6 @@ class Baseline:
         )
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
-        # Update goal proposer state with buffer-related values (now that buffer is created)
-        # state_size and goal_indices were already set earlier
-        goal_proposer_state.update(
-            replay_buffer=replay_buffer,
-        )
-
         def actor_step(actor_state, env, env_state, key, extra_fields, is_deterministic: bool):
             actions = actor.sample_actions(
                 actor_state.params,
@@ -357,37 +377,16 @@ class Baseline:
                 key,
             )
             
-            # Update goal_proposer_state with transitions_sample
-            # Note: We always pass transitions_sample (even if dummy) because we can't
-            # use Python conditionals on traced values. The goal proposer will check
-            # if it's valid and handle dummy transitions appropriately.
-            # 
-            # However, the goal proposer checks `if transitions_sample is None`, so we
-            # need to pass None when buffer is empty. Since we can't use Python if on
-            # traced buffer_size, we'll use the fact that buffer_size is a concrete
-            # value at the Python level (even when traced, we can extract it).
-            # 
-            # Actually, when get_experience is called from JIT, buffer_size is traced,
-            # so we can't extract it. The solution is to always pass transitions_sample
-            # and modify the goal proposer to handle dummy transitions.
-            # 
-            # For now, we'll pass transitions_sample always, and the goal proposer
-            # will need to check if it's a dummy (e.g., by checking if it has valid data).
-            # But the goal proposer checks `is None`, so we need a different approach.
-            #
-            # Simplest: Extract buffer_size as a Python int before JIT tracing
-            # But buffer_size is already computed, so we can use it if it's concrete.
-            # When called from JIT, it's traced, so we can't.
-            #
-            # Final solution: Always pass transitions_sample. The goal proposer will
-            # receive it and check if it's None. Since we're passing a dummy transition
-            # (not None), we need to modify the goal proposer to also check for dummy transitions.
-            # But for now, let's just pass it and see if the goal proposer handles it.
-            # Actually, the goal proposer checks `if transitions_sample is None`, so
-            # if we pass a dummy transition, it won't be None and will try to process it.
-            # The goal proposer should handle empty/invalid data gracefully.
-            
-            goal_proposer_state.update(transitions_sample=transitions_sample)
+            # Store transitions_sample in env_state.info using Brax pattern
+            # This makes it part of the JAX PyTree and JIT-compatible
+            # transitions_sample will flow through state.info in step() and be available in reset()
+            # Update rng keys once per experience (fresh keys for each experience, reused within experience)
+            info = env_state.info.copy() if hasattr(env_state.info, 'copy') else dict(env_state.info)
+            info['transitions_sample'] = transitions_sample
+            key, subkeys = jax.random.split(key, 2)
+            env_keys = jax.random.split(subkeys, config.num_envs)
+            info['rng'] = env_keys
+            env_state = env_state.replace(info=info)
             
             @jax.jit
             def f(carry, unused_t):
@@ -401,9 +400,9 @@ class Baseline:
                     extra_fields=("truncation", "traj_id"),
                     is_deterministic=is_deterministic,
                 )
-                # buffer_state flows through the scan carry (JAX-compatible)
-                # When reset() is called during step(), it reads transitions_sample
-                # from goal_proposer_state and passes it as explicit JAX arg to goal proposer
+                # transitions_sample flows through state.info (JAX PyTree, JIT-compatible)
+                # When reset() is called during step() (auto-reset), it reads transitions_sample
+                # from state.info and passes it to goal proposer
                 return (env_state, buffer_state, next_key), transition
 
             (env_state, buffer_state, _), data = jax.lax.scan(f, (env_state, buffer_state, key), (), length=self.unroll_length)
