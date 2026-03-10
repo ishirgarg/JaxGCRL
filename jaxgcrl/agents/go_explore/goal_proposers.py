@@ -10,9 +10,9 @@ def create_goal_proposer(
     goal_proposer_name: str,
     env,
     num_envs: int,
+    num_candidates: int,
     state_size: Optional[int] = None,
     goal_indices: Optional[tuple] = None,
-    num_candidates: int,
 ) -> Callable:
     """
     Factory function to create a goal proposer function.
@@ -26,19 +26,19 @@ def create_goal_proposer(
         num_candidates: Number of candidate goals to filter before final selection
         
     Returns:
-        A goal proposer function that takes (rng, transitions_sample) and returns goal.
-        transitions_sample is passed from state.info (Brax pattern, JIT-compatible).
+        A goal proposer function that takes (rng, start_state, info) and returns goal.
+        This will be partialized by the wrapper to only need (rng, start_state).
+        The entire info dict is passed through (not vmapped over).
     """
     if goal_proposer_name == "random_env_goals":
         proposer_fn = create_random_env_goals_proposer(env, num_envs)
-        # Wrap to take (rng, transitions_sample) and return goal for consistency
-        def wrapped_proposer(rng, transitions_sample):
+        # Wrap to take (rng, start_state, info) - start_state and info ignored
+        def wrapped_proposer(rng: jax.Array, start_state: jnp.ndarray, info: Dict[str, Any]) -> jnp.ndarray:
             goal = proposer_fn(rng)
-            # For non-buffer proposers, transitions_sample is ignored
             return goal
         return wrapped_proposer
     elif goal_proposer_name == "rb":
-        return create_rb_goal_proposer(env, num_envs, state_size, goal_indices, num_candidates)
+        return create_rb_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices)
     else:
         raise ValueError(f"Unknown goal proposer: {goal_proposer_name}")
 
@@ -63,11 +63,14 @@ def create_random_env_goals_proposer(
 def create_rb_goal_proposer(
     env,
     num_envs: int,
+    num_candidates: int,
     state_size: Optional[int] = None,
     goal_indices: Optional[tuple] = None,
-    num_candidates: int,
-) -> Callable[[jax.Array, Any], jnp.ndarray]:
-    def propose_goal(rng: jax.Array, transitions_sample: Any) -> jnp.ndarray:
+) -> Callable[[jax.Array, jnp.ndarray, Dict[str, Any]], jnp.ndarray]:
+    def propose_goal(rng: jax.Array, start_state: jnp.ndarray, info: Dict[str, Any]) -> jnp.ndarray:
+        # Extract transitions_sample from info dict
+        transitions_sample = info.get('transitions_sample')
+        
         # transitions_sample.observation shape: (num_envs, episode_length, obs_size)
         # Flatten to (num_envs * episode_length, obs_size)
         obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
@@ -75,13 +78,12 @@ def create_rb_goal_proposer(
         
         # First select num_candidates random states, then randomly select from those
         num_states = positions.shape[0]
-        num_to_sample = jnp.minimum(num_candidates, num_states)
         rng1, rng2 = jax.random.split(rng, 2)
-        candidate_indices = jax.random.randint(rng1, (num_to_sample,), 0, num_states)
+        candidate_indices = jax.random.randint(rng1, (num_candidates,), 0, num_states)
         candidate_positions = positions[candidate_indices]  # (num_candidates, goal_dim)
         
         # Randomly select one from candidates
-        idx = jax.random.randint(rng2, (), 0, num_to_sample)
+        idx = jax.random.randint(rng2, (), 0, num_candidates)
         goal = candidate_positions[idx]
         
         return goal

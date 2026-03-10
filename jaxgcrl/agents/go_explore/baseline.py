@@ -29,7 +29,7 @@ from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
 from .types import Actor, Critic, TrainingState, Transition
 from .algorithms import get_algorithm
-from .utils import save_params
+from .utils import save_params, create_dummy_transition
 from .losses import update_alpha_sac, update_critic_sac, update_actor_sac
 from .visualization import all_visualizations
 from .goal_proposers import create_goal_proposer
@@ -123,25 +123,12 @@ class Baseline:
         
         # Create dummy transition for initial state.info (before first reset)
         # This ensures transitions_sample is always a valid Transition object, not None
-        # Shape must match: (num_envs, episode_length, obs_size) for observation
-        dummy_obs = jnp.zeros((config.num_envs, config.episode_length, obs_size))
-        dummy_action = jnp.zeros((config.num_envs, config.episode_length, action_size))
-        dummy_reward = jnp.zeros((config.num_envs, config.episode_length))
-        dummy_discount = jnp.zeros((config.num_envs, config.episode_length))
-        dummy_next_obs = jnp.zeros((config.num_envs, config.episode_length, obs_size)) if self.agent_type == "sac" else None
-        dummy_extras = {
-            "state_extras": {
-                "traj_id": jnp.zeros((config.num_envs, config.episode_length), dtype=jnp.float32),
-                "truncation": jnp.zeros((config.num_envs, config.episode_length), dtype=jnp.float32)
-            }
-        }
-        initial_dummy_transition = Transition(
-            observation=dummy_obs,
-            action=dummy_action,
-            reward=dummy_reward,
-            discount=dummy_discount,
-            next_observation=dummy_next_obs,
-            extras=dummy_extras
+        initial_dummy_transition = create_dummy_transition(
+            num_envs=config.num_envs,
+            episode_length=config.episode_length,
+            obs_size=obs_size,
+            action_size=action_size,
+            agent_type=self.agent_type,
         )
         
         # Create goal proposer (will be used to reset envs when they auto-reset)
@@ -150,9 +137,9 @@ class Baseline:
             self.goal_proposer_name,
             unwrapped_env,
             config.num_envs,
+            self.num_candidates,
             state_size=unwrapped_env.state_dim,
             goal_indices=unwrapped_env.goal_indices,
-            num_candidates=self.num_candidates,
         )
         
         # Wrap envs explicitly (mirrors brax.envs.training.wrap), but with TrajectoryIdWrapper innermost:
@@ -163,7 +150,6 @@ class Baseline:
         train_env = TrainAutoResetWrapper(
             train_env,
             goal_proposer=goal_proposer,
-            initial_dummy_transitions_sample=initial_dummy_transition,
         )
 
         eval_env = TrajectoryIdWrapper(eval_env)
@@ -209,11 +195,10 @@ class Baseline:
         key, buffer_key, eval_env_key, env_key, actor_key, critic_key = jax.random.split(key, 6)
 
         env_keys = jax.random.split(env_key, config.num_envs)
-        # Initialize transitions_sample in state.info (Brax pattern, JIT-compatible)
-        # This ensures it's always present, avoiding Python conditionals in reset()
-        # The wrapper will use initial_dummy_transition on first reset if not in state.info
+        # Initialize info dict with transitions_sample and rng (Brax pattern, JIT-compatible)
+        # This ensures the entire info dict is always present with required fields
         env_state = train_env.reset(env_keys)
-        # Initialize transitions_sample and rng with dummy transition and env_keys in state.info
+        # Initialize the entire info dict with transitions_sample and rng
         info = env_state.info.copy() if hasattr(env_state.info, 'copy') else dict(env_state.info)
         info['transitions_sample'] = initial_dummy_transition
         info['rng'] = env_keys

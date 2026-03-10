@@ -176,6 +176,49 @@ def sample_trajectories_from_buffer(
     return current_buffer_state, all_positions, final_positions, goal_positions_np
 
 
+def create_dummy_transition(
+    num_envs: int,
+    episode_length: int,
+    obs_size: int,
+    action_size: int,
+    agent_type: str = "crl",
+) -> Any:
+    """
+    Create a dummy transition object for initializing state.info.
+    
+    Args:
+        num_envs: Number of parallel environments
+        episode_length: Length of episodes
+        obs_size: Size of observation dimension
+        action_size: Size of action dimension
+        agent_type: Type of agent ("crl" or "sac") - SAC needs next_observation
+        
+    Returns:
+        A Transition object with zero-filled arrays of the correct shape.
+    """
+    from .types import Transition
+    
+    dummy_obs = jnp.zeros((num_envs, episode_length, obs_size))
+    dummy_action = jnp.zeros((num_envs, episode_length, action_size))
+    dummy_reward = jnp.zeros((num_envs, episode_length))
+    dummy_discount = jnp.zeros((num_envs, episode_length))
+    dummy_next_obs = jnp.zeros((num_envs, episode_length, obs_size)) if agent_type == "sac" else None
+    dummy_extras = {
+        "state_extras": {
+            "traj_id": jnp.zeros((num_envs, episode_length), dtype=jnp.float32),
+            "truncation": jnp.zeros((num_envs, episode_length), dtype=jnp.float32)
+        }
+    }
+    return Transition(
+        observation=dummy_obs,
+        action=dummy_action,
+        reward=dummy_reward,
+        discount=dummy_discount,
+        next_observation=dummy_next_obs,
+        extras=dummy_extras
+    )
+
+
 def sample_trajectory_sequences(
     replay_buffer,
     buffer_state,
