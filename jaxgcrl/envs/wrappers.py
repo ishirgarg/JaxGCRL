@@ -29,24 +29,49 @@ class GoalProposerWrapper(Wrapper):
         """Proposes goal and resets environment.
         
         Note: reset() is called by training.wrap, so we can't change its signature.
-        We get buffer_state from goal_proposer_state (Python dict read), but pass it as an
-        explicit JAX argument to the goal proposer. This ensures JAX sees the current value
-        on every call, not a trace-time constant from the closure.
+        We get transitions_sample from goal_proposer_state (Python dict read),
+        but pass it as an explicit JAX argument to the goal proposer. This ensures JAX sees
+        the current value on every call, not a trace-time constant from the closure.
         """
-        # Get current buffer_state from goal_proposer_state (Python dict read)
-        current_buffer_state = self._goal_proposer_state.get('buffer_state') if self._goal_proposer_state else None
+        # Get transitions_sample from goal_proposer_state (Python dict read)
+        transitions_sample = self._goal_proposer_state.get('transitions_sample') if self._goal_proposer_state else None
         
-        # Pass buffer_state as explicit JAX argument to goal proposer
-        # This is critical: buffer_state must be a JAX argument, not read from Python dict inside closure
-        # Otherwise JAX traces it as a constant and never sees updates
-        goal, updated_buffer_state = self._goal_proposer(rng, current_buffer_state)
+        # #region agent log
+        import json
+        log_data = {
+            "location": "wrappers.py:37",
+            "message": "GoalProposerWrapper.reset called",
+            "data": {
+                "transitions_sample_is_none": transitions_sample is None,
+                "goal_proposer_state_is_none": self._goal_proposer_state is None,
+            },
+            "timestamp": int(__import__('time').time() * 1000),
+            "runId": "debug",
+            "hypothesisId": "F"
+        }
+        if transitions_sample is not None:
+            try:
+                obs_shape = transitions_sample.observation.shape if hasattr(transitions_sample, 'observation') else None
+                log_data["data"]["obs_shape"] = str(obs_shape) if obs_shape else None
+                # Check if it's a dummy (all zeros)
+                if obs_shape:
+                    import jax.numpy as jnp
+                    obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
+                    is_all_zeros = bool(jnp.all(obs_flat == 0))
+                    log_data["data"]["is_dummy_transition"] = is_all_zeros
+            except: pass
+        try:
+            with open('/home/ishirgarg/JaxGCRL/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps(log_data) + '\n')
+        except: pass
+        # #endregion
+        
+        # Pass transitions_sample as explicit JAX argument to goal proposer
+        # This is critical: it must be a JAX argument, not read from Python dict inside closure
+        goal = self._goal_proposer(rng, transitions_sample)
         
         # Reset the environment with the proposed goal
         state = self.env.reset(rng, goal=goal)
-        
-        # Update goal_proposer_state with updated_buffer_state for next reset
-        if self._goal_proposer_state is not None:
-            self._goal_proposer_state.update(buffer_state=updated_buffer_state)
         
         return state
     

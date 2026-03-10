@@ -91,11 +91,11 @@ def create_goal_proposer(
     """
     if goal_proposer_name == "random_env_goals":
         proposer_fn = create_random_env_goals_proposer(env, num_envs, goal_proposer_state)
-        # Wrap to take buffer_state and return (goal, buffer_state) for consistency
-        def wrapped_proposer(rng, buffer_state):
+        # Wrap to take (rng, transitions_sample) and return goal for consistency
+        def wrapped_proposer(rng, transitions_sample):
             goal = proposer_fn(rng)
-            # For non-buffer proposers, return buffer_state unchanged (or None if not available)
-            return goal, buffer_state
+            # For non-buffer proposers, transitions_sample is ignored
+            return goal
         return wrapped_proposer
     elif goal_proposer_name == "random_final_states":
         return create_random_final_states_proposer(env, num_envs, goal_proposer_state)
@@ -124,6 +124,7 @@ def create_random_env_goals_proposer(
         This will be vmap'd by the training wrapper.
     """
     possible_goals = env.possible_goals  # Shape: (num_goals, goal_dim)
+    num_goals = possible_goals.shape[0]  # Use .shape[0] for JIT compatibility
     
     def propose_goal(rng: jax.Array) -> jnp.ndarray:
         """
@@ -135,7 +136,7 @@ def create_random_env_goals_proposer(
         Returns:
             Goal array, shape (goal_dim,)
         """
-        idx = jax.random.randint(rng, (), 0, len(possible_goals))
+        idx = jax.random.randint(rng, (), 0, num_goals)
         goal = possible_goals[idx]  # Shape: (goal_dim,)
         return goal
     
@@ -146,57 +147,243 @@ def create_random_final_states_proposer(
     env,
     num_envs: int,
     goal_proposer_state: Optional[GoalProposerState] = None,
-) -> Callable[[jax.Array, Any], tuple[jnp.ndarray, Any]]:
+) -> Callable[[jax.Array, Any], jnp.ndarray]:
     """
-    Creates a goal proposer that samples random goals from final states of trajectories
-    in the replay buffer. Falls back to random env goals if buffer is not available.
+    Creates a goal proposer that selects random goals from final states in a raw replay buffer sample.
+    The sample is provided as an argument (sampled outside this function).
+    Falls back to random env goals if sample is not available.
     
     Args:
         env: The environment instance
         num_envs: Number of parallel environments (not used, kept for API consistency)
         goal_proposer_state: State container that must contain:
-                           - 'replay_buffer': The replay buffer instance
                            - 'state_size': Size of state dimension
                            - 'goal_indices': Indices in state that represent the goal
         
     Returns:
-        A function that takes (rng, buffer_state) and returns (goal, updated_buffer_state).
+        A function that takes (rng, transitions_sample) and returns goal.
+        transitions_sample is a raw Transition object from replay_buffer.sample().
     """
-    # Extract static values at closure creation time (these don't change during training)
-    # These are captured in the closure, which is fine since they're static
-    replay_buffer = goal_proposer_state.get('replay_buffer') if goal_proposer_state else None
-    state_size = goal_proposer_state.get('state_size') if goal_proposer_state else None
-    goal_indices = goal_proposer_state.get('goal_indices') if goal_proposer_state else None
-    
     # Create fallback random env goals proposer
     random_env_goals_proposer = create_random_env_goals_proposer(env, num_envs, goal_proposer_state)
     
-    def propose_goal(rng: jax.Array, buffer_state: Any) -> tuple[jnp.ndarray, Any]:
-        """Returns (goal, updated_buffer_state).
+    def propose_goal(rng: jax.Array, transitions_sample: Any) -> jnp.ndarray:
+        """Returns goal.
         
-        Critical: buffer_state is passed as an explicit JAX argument, not read from Python dict.
-        This ensures JAX sees the current value on every call, not a trace-time constant.
-        Static values (replay_buffer, state_size, goal_indices) are captured in closure.
+        Args:
+            rng: Random key
+            transitions_sample: Raw Transition object from replay_buffer.sample()
+        
+        The transitions_sample is a raw replay buffer sample with no preprocessing.
+        We extract final states from it here.
         """
-        # If replay_buffer is not available yet (e.g., during initial reset), fallback to random env goals
-        if replay_buffer is None or buffer_state is None:
-            jax.debug.print("Goal proposer: fallback - replay_buffer={}, buffer_state={}", 
-                           replay_buffer is not None, buffer_state is not None)
-            goal = random_env_goals_proposer(rng)
-            return goal, buffer_state
+        # #region agent log
+        import json
+        import os
+        log_data = {
+            "location": "goal_proposers.py:170",
+            "message": "propose_goal called",
+            "data": {
+                "transitions_sample_is_none": transitions_sample is None,
+                "goal_proposer_state_is_none": goal_proposer_state is None,
+            },
+            "timestamp": int(__import__('time').time() * 1000),
+            "runId": "debug",
+            "hypothesisId": "A"
+        }
+        if goal_proposer_state:
+            log_data["data"]["state_size"] = goal_proposer_state.get('state_size')
+            log_data["data"]["goal_indices"] = str(goal_proposer_state.get('goal_indices'))
+        try:
+            with open('/home/ishirgarg/JaxGCRL/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps(log_data) + '\n')
+        except: pass
+        # #endregion
         
-        updated_buffer_state, _, final_positions, _ = sample_trajectories_from_buffer(
-            replay_buffer, buffer_state, state_size, tuple(goal_indices), rng
+        # Read static values on each call (may be None initially)
+        # These are Python objects, so we can read from dict (not in JIT context)
+        # Note: reset() is NOT JIT-compiled (see baseline.py comment), so Python conditionals are fine
+        state_size = goal_proposer_state.get('state_size') if goal_proposer_state else None
+        goal_indices = goal_proposer_state.get('goal_indices') if goal_proposer_state else None
+        
+        # If sample is not available or invalid, fallback to random env goals
+        # Python conditionals are fine here since reset() is not JIT-compiled
+        if transitions_sample is None or state_size is None or goal_indices is None:
+            # #region agent log
+            log_data = {
+                "location": "goal_proposers.py:188",
+                "message": "fallback to random_env_goals - early check",
+                "data": {
+                    "transitions_sample_is_none": transitions_sample is None,
+                    "state_size_is_none": state_size is None,
+                    "goal_indices_is_none": goal_indices is None,
+                },
+                "timestamp": int(__import__('time').time() * 1000),
+                "runId": "debug",
+                "hypothesisId": "B"
+            }
+            try:
+                with open('/home/ishirgarg/JaxGCRL/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps(log_data) + '\n')
+            except: pass
+            # #endregion
+            goal = random_env_goals_proposer(rng)
+            return goal
+        
+        # Extract final states from raw transitions sample
+        # transitions_sample.observation shape: (num_envs, episode_length, obs_size)
+        # transitions_sample.extras["state_extras"]["traj_id"] shape: (num_envs, episode_length)
+        # transitions_sample.extras["state_extras"]["truncation"] shape: (num_envs, episode_length)
+        
+        # Flatten to (num_envs * episode_length, obs_size)
+        obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
+        traj_id_flat = jnp.reshape(transitions_sample.extras["state_extras"]["traj_id"], (-1,))
+        truncation_flat = jnp.reshape(transitions_sample.extras["state_extras"]["truncation"], (-1,))
+        
+        # Extract positions from observations (first state_size elements contain state)
+        positions = obs_flat[:, :state_size][:, list(goal_indices)]  # (N, goal_dim)
+        
+        # Find final positions using JAX operations (JIT-compatible)
+        # Strategy: For each unique trajectory ID, find the first truncation point or last state
+        unique_traj_ids = jnp.unique(traj_id_flat)
+        num_trajs = unique_traj_ids.shape[0]
+        
+        # Use scan to process each trajectory (JIT-compatible)
+        # goal_indices is a Python tuple, so len() is fine (evaluated at Python level)
+        goal_dim = len(goal_indices)
+        
+        def process_traj(carry, traj_id):
+            # Find all indices for this trajectory
+            traj_mask = traj_id_flat == traj_id
+            num_elems = traj_id_flat.shape[0]  # Use .shape[0] instead of len() for JIT compatibility
+            indices = jnp.arange(num_elems)
+            traj_indices = jnp.where(traj_mask, indices, -1)
+            
+            # Get valid indices (where mask is True)
+            valid_mask = traj_indices >= 0
+            num_valid = jnp.sum(valid_mask.astype(jnp.int32))
+            has_data = num_valid > 0
+            
+            # Get valid indices (use first index as fallback)
+            first_valid_idx = jnp.argmax(valid_mask.astype(jnp.int32))
+            last_valid_idx = num_elems - 1 - jnp.argmax(valid_mask[::-1].astype(jnp.int32))
+            
+            # Get truncations for this trajectory
+            traj_truncations = jnp.where(traj_mask, truncation_flat, False)
+            
+            # Find first truncation index
+            truncation_idx = jnp.where(traj_truncations, indices, -1)
+            first_truncation = jnp.max(truncation_idx)
+            
+            # If truncation found, use it; otherwise use last valid index
+            final_idx = jnp.where(
+                first_truncation >= 0,
+                first_truncation,
+                jnp.where(has_data, last_valid_idx, 0)
+            )
+            final_idx = jnp.clip(final_idx, 0, positions.shape[0] - 1)
+            
+            # Get final position (zero if no data)
+            # goal_dim is a Python int constant, so it's fine in JIT
+            final_position = jnp.where(
+                has_data,
+                positions[final_idx],
+                jnp.zeros(goal_dim)
+            )
+            
+            return carry, final_position
+        
+        # Process all trajectories
+        _, final_positions = jax.lax.scan(process_traj, None, unique_traj_ids)
+        
+        # Filter out zero positions (empty trajectories) and sample
+        has_data_mask = jnp.any(final_positions != 0, axis=1)
+        num_valid = jnp.sum(has_data_mask.astype(jnp.int32))
+        
+        # #region agent log
+        # Log num_valid before conditional (convert to Python int for logging)
+        num_valid_py = int(jnp.array(num_valid))
+        log_data = {
+            "location": "goal_proposers.py:259",
+            "message": "computed num_valid final positions",
+            "data": {
+                "num_valid": num_valid_py,
+                "num_trajs": int(jnp.array(unique_traj_ids.shape[0])),
+            },
+            "timestamp": int(__import__('time').time() * 1000),
+            "runId": "debug",
+            "hypothesisId": "C"
+        }
+        try:
+            with open('/home/ishirgarg/JaxGCRL/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps(log_data) + '\n')
+        except: pass
+        # #endregion
+        
+        # Use JAX conditional for JIT compatibility
+        # If no valid positions, fallback to random env goals
+        # Otherwise, sample from valid final positions
+        def sample_from_finals(rng):
+            # Create cumulative sum to find idx-th valid position
+            # has_data_mask is (num_trajs,), we want to find the idx-th True value
+            cumsum = jnp.cumsum(has_data_mask.astype(jnp.int32))
+            # Sample random index (0 to num_valid-1)
+            idx = jax.random.randint(rng, (), 0, num_valid)
+            # Find the first position where cumsum == idx + 1 (the idx-th valid position)
+            # Use argmax to find first occurrence
+            target = idx + 1
+            matches = (cumsum == target).astype(jnp.int32)
+            valid_idx = jnp.argmax(matches)
+            return final_positions[valid_idx]
+        
+        def fallback_goal(rng):
+            # #region agent log
+            log_data = {
+                "location": "goal_proposers.py:278",
+                "message": "fallback to random_env_goals - no valid final positions",
+                "data": {
+                    "num_valid": num_valid_py,
+                },
+                "timestamp": int(__import__('time').time() * 1000),
+                "runId": "debug",
+                "hypothesisId": "D"
+            }
+            try:
+                with open('/home/ishirgarg/JaxGCRL/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps(log_data) + '\n')
+            except: pass
+            # #endregion
+            return random_env_goals_proposer(rng)
+        
+        # Use conditional to choose between sampling from finals or fallback
+        goal = jax.lax.cond(
+            num_valid > 0,
+            sample_from_finals,
+            fallback_goal,
+            rng
         )
-       
-        if len(final_positions) == 0:
-            jax.debug.print("Goal proposer: fallback - no final positions")
-            goal = random_env_goals_proposer(rng)
-        else:
-            jax.debug.print("Goal proposer: using final states - {} final positions", len(final_positions))
-            idx = jax.random.randint(rng, (), 0, len(final_positions))
-            goal = jnp.array(final_positions[idx])
         
-        return goal, updated_buffer_state
+        # #region agent log
+        # Log which path was taken and goal value
+        goal_py = jnp.array(goal)
+        log_data = {
+            "location": "goal_proposers.py:287",
+            "message": "goal proposed",
+            "data": {
+                "num_valid": num_valid_py,
+                "used_final_states": num_valid_py > 0,
+                "goal_value": [float(goal_py[i]) for i in range(len(goal_py))],
+            },
+            "timestamp": int(__import__('time').time() * 1000),
+            "runId": "debug",
+            "hypothesisId": "E"
+        }
+        try:
+            with open('/home/ishirgarg/JaxGCRL/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps(log_data) + '\n')
+        except: pass
+        # #endregion
+        
+        return goal
     
     return propose_goal
