@@ -386,29 +386,7 @@ class Baseline:
             # Actually, the goal proposer checks `if transitions_sample is None`, so
             # if we pass a dummy transition, it won't be None and will try to process it.
             # The goal proposer should handle empty/invalid data gracefully.
-            # #region agent log
-            import json
-            log_data = {
-                "location": "baseline.py:389",
-                "message": "updating goal_proposer_state with transitions_sample",
-                "data": {
-                    "transitions_sample_is_none": transitions_sample is None,
-                    "buffer_size": int(jnp.array(buffer_size)) if buffer_size is not None else None,
-                },
-                "timestamp": int(__import__('time').time() * 1000),
-                "runId": "debug",
-                "hypothesisId": "G"
-            }
-            if transitions_sample is not None:
-                try:
-                    obs_shape = transitions_sample.observation.shape if hasattr(transitions_sample, 'observation') else None
-                    log_data["data"]["obs_shape"] = str(obs_shape) if obs_shape else None
-                except: pass
-            try:
-                with open('/home/ishirgarg/JaxGCRL/.cursor/debug.log', 'a') as f:
-                    f.write(json.dumps(log_data) + '\n')
-            except: pass
-            # #endregion
+            
             goal_proposer_state.update(transitions_sample=transitions_sample)
             
             @jax.jit

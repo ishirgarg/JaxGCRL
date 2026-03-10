@@ -34,37 +34,9 @@ class GoalProposerWrapper(Wrapper):
         the current value on every call, not a trace-time constant from the closure.
         """
         # Get transitions_sample from goal_proposer_state (Python dict read)
-        transitions_sample = self._goal_proposer_state.get('transitions_sample') if self._goal_proposer_state else None
+        transitions_sample = self._goal_proposer_state.get('transitions_sample')
         
-        # #region agent log
-        import json
-        log_data = {
-            "location": "wrappers.py:37",
-            "message": "GoalProposerWrapper.reset called",
-            "data": {
-                "transitions_sample_is_none": transitions_sample is None,
-                "goal_proposer_state_is_none": self._goal_proposer_state is None,
-            },
-            "timestamp": int(__import__('time').time() * 1000),
-            "runId": "debug",
-            "hypothesisId": "F"
-        }
-        if transitions_sample is not None:
-            try:
-                obs_shape = transitions_sample.observation.shape if hasattr(transitions_sample, 'observation') else None
-                log_data["data"]["obs_shape"] = str(obs_shape) if obs_shape else None
-                # Check if it's a dummy (all zeros)
-                if obs_shape:
-                    import jax.numpy as jnp
-                    obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
-                    is_all_zeros = bool(jnp.all(obs_flat == 0))
-                    log_data["data"]["is_dummy_transition"] = is_all_zeros
-            except: pass
-        try:
-            with open('/home/ishirgarg/JaxGCRL/.cursor/debug.log', 'a') as f:
-                f.write(json.dumps(log_data) + '\n')
-        except: pass
-        # #endregion
+        
         
         # Pass transitions_sample as explicit JAX argument to goal proposer
         # This is critical: it must be a JAX argument, not read from Python dict inside closure

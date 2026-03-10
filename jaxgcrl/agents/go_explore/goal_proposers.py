@@ -177,28 +177,7 @@ def create_random_final_states_proposer(
         The transitions_sample is a raw replay buffer sample with no preprocessing.
         We extract final states from it here.
         """
-        # #region agent log
-        import json
-        import os
-        log_data = {
-            "location": "goal_proposers.py:170",
-            "message": "propose_goal called",
-            "data": {
-                "transitions_sample_is_none": transitions_sample is None,
-                "goal_proposer_state_is_none": goal_proposer_state is None,
-            },
-            "timestamp": int(__import__('time').time() * 1000),
-            "runId": "debug",
-            "hypothesisId": "A"
-        }
-        if goal_proposer_state:
-            log_data["data"]["state_size"] = goal_proposer_state.get('state_size')
-            log_data["data"]["goal_indices"] = str(goal_proposer_state.get('goal_indices'))
-        try:
-            with open('/home/ishirgarg/JaxGCRL/.cursor/debug.log', 'a') as f:
-                f.write(json.dumps(log_data) + '\n')
-        except: pass
-        # #endregion
+        
         
         # Read static values on each call (may be None initially)
         # These are Python objects, so we can read from dict (not in JIT context)
@@ -209,24 +188,7 @@ def create_random_final_states_proposer(
         # If sample is not available or invalid, fallback to random env goals
         # Python conditionals are fine here since reset() is not JIT-compiled
         if transitions_sample is None or state_size is None or goal_indices is None:
-            # #region agent log
-            log_data = {
-                "location": "goal_proposers.py:188",
-                "message": "fallback to random_env_goals - early check",
-                "data": {
-                    "transitions_sample_is_none": transitions_sample is None,
-                    "state_size_is_none": state_size is None,
-                    "goal_indices_is_none": goal_indices is None,
-                },
-                "timestamp": int(__import__('time').time() * 1000),
-                "runId": "debug",
-                "hypothesisId": "B"
-            }
-            try:
-                with open('/home/ishirgarg/JaxGCRL/.cursor/debug.log', 'a') as f:
-                    f.write(json.dumps(log_data) + '\n')
-            except: pass
-            # #endregion
+            
             goal = random_env_goals_proposer(rng)
             return goal
         
@@ -300,25 +262,7 @@ def create_random_final_states_proposer(
         has_data_mask = jnp.any(final_positions != 0, axis=1)
         num_valid = jnp.sum(has_data_mask.astype(jnp.int32))
         
-        # #region agent log
-        # Log num_valid before conditional (convert to Python int for logging)
-        num_valid_py = int(jnp.array(num_valid))
-        log_data = {
-            "location": "goal_proposers.py:259",
-            "message": "computed num_valid final positions",
-            "data": {
-                "num_valid": num_valid_py,
-                "num_trajs": int(jnp.array(unique_traj_ids.shape[0])),
-            },
-            "timestamp": int(__import__('time').time() * 1000),
-            "runId": "debug",
-            "hypothesisId": "C"
-        }
-        try:
-            with open('/home/ishirgarg/JaxGCRL/.cursor/debug.log', 'a') as f:
-                f.write(json.dumps(log_data) + '\n')
-        except: pass
-        # #endregion
+        
         
         # Use JAX conditional for JIT compatibility
         # If no valid positions, fallback to random env goals
@@ -337,22 +281,7 @@ def create_random_final_states_proposer(
             return final_positions[valid_idx]
         
         def fallback_goal(rng):
-            # #region agent log
-            log_data = {
-                "location": "goal_proposers.py:278",
-                "message": "fallback to random_env_goals - no valid final positions",
-                "data": {
-                    "num_valid": num_valid_py,
-                },
-                "timestamp": int(__import__('time').time() * 1000),
-                "runId": "debug",
-                "hypothesisId": "D"
-            }
-            try:
-                with open('/home/ishirgarg/JaxGCRL/.cursor/debug.log', 'a') as f:
-                    f.write(json.dumps(log_data) + '\n')
-            except: pass
-            # #endregion
+            
             return random_env_goals_proposer(rng)
         
         # Use conditional to choose between sampling from finals or fallback
@@ -363,26 +292,7 @@ def create_random_final_states_proposer(
             rng
         )
         
-        # #region agent log
-        # Log which path was taken and goal value
-        goal_py = jnp.array(goal)
-        log_data = {
-            "location": "goal_proposers.py:287",
-            "message": "goal proposed",
-            "data": {
-                "num_valid": num_valid_py,
-                "used_final_states": num_valid_py > 0,
-                "goal_value": [float(goal_py[i]) for i in range(len(goal_py))],
-            },
-            "timestamp": int(__import__('time').time() * 1000),
-            "runId": "debug",
-            "hypothesisId": "E"
-        }
-        try:
-            with open('/home/ishirgarg/JaxGCRL/.cursor/debug.log', 'a') as f:
-                f.write(json.dumps(log_data) + '\n')
-        except: pass
-        # #endregion
+        
         
         return goal
     
