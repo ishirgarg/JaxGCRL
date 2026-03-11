@@ -219,6 +219,45 @@ def create_dummy_transition(
     )
 
 
+def create_single_dummy_transition(
+    obs_size: int,
+    action_size: int,
+    agent_type: str = "crl",
+) -> Any:
+    """
+    Create a single dummy transition object (not batched) for replay buffer initialization.
+    
+    Args:
+        obs_size: Size of observation dimension
+        action_size: Size of action dimension
+        agent_type: Type of agent ("crl" or "sac") - SAC needs next_observation
+        
+    Returns:
+        A Transition object with zero-filled arrays of shape (obs_size,) and (action_size,).
+    """
+    from .types import Transition
+    
+    dummy_obs = jnp.zeros((obs_size,))
+    dummy_action = jnp.zeros((action_size,))
+    dummy_reward = 0.0
+    dummy_discount = 0.0
+    dummy_next_obs = jnp.zeros((obs_size,)) if agent_type == "sac" else None
+    dummy_extras = {
+        "state_extras": {
+            "truncation": 0.0,
+            "traj_id": 0.0,
+        }
+    }
+    return Transition(
+        observation=dummy_obs,
+        action=dummy_action,
+        reward=dummy_reward,
+        discount=dummy_discount,
+        next_observation=dummy_next_obs,
+        extras=dummy_extras
+    )
+
+
 def sample_trajectory_sequences(
     replay_buffer,
     buffer_state,

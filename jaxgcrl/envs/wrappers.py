@@ -1,6 +1,7 @@
 import jax
 from brax.envs import PipelineEnv, State, Wrapper, Env
 from jax import numpy as jnp
+from jax import tree_util
 from typing import Callable, Any, Optional
 
 class TrajectoryIdWrapper(Wrapper):
@@ -59,7 +60,7 @@ class TrainAutoResetWrapper(Wrapper):
     def __init__(
         self, 
         env: PipelineEnv, 
-        goal_proposer: Callable[[jax.Array, jnp.ndarray, Any], jnp.ndarray],
+        goal_proposer: Callable[[jax.Array, jnp.ndarray, Any], jnp.ndarray],  # Takes (rng, start_obs, info)
     ):
         super().__init__(env)
         self._goal_proposer = goal_proposer
@@ -88,18 +89,18 @@ class TrainAutoResetWrapper(Wrapper):
         
         def reset_done_envs(state, done, rng, info):
             # Create partialized goal_proposer_fn that captures the ENTIRE info dict
-            # The function will be called inside ant_maze.reset() with (rng, start_state)
+            # The function will be called inside ant_maze.reset() with (rng, start_obs)
             # The entire info dict is passed through (not vmapped over)
             def create_goal_proposer_fn(info):
-                def goal_proposer_fn(rng, start_state):
+                def goal_proposer_fn(rng, start_obs):
                     # Pass the entire info dict - it will be shared across all envs
-                    return self._goal_proposer(rng, start_state, info)
+                    return self._goal_proposer(rng, start_obs, info)
                 return goal_proposer_fn
             
             goal_proposer_fn = create_goal_proposer_fn(info)
             
             # Reset all envs (but we'll only use the reset states for done ones)
-            # The goal_proposer_fn will be called inside ant_maze.reset() after start_state is computed
+            # The goal_proposer_fn will be called inside ant_maze.reset() after start_obs is computed
             reset_state = self.env.reset(rng, goal_proposer_fn=goal_proposer_fn)
             
             # Update first_pipeline_state and first_obs for done envs
@@ -174,7 +175,20 @@ class VmapWrapper(Wrapper):
       
 
     def step(self, state: State, action: jax.Array) -> State:
-        return jax.vmap(self.env.step)(state, action)
+        # Extract shared info dict (contains things that shouldn't be vmapped)
+        shared_info = state.info
+        
+        def single_step(s, a):
+            # Add shared info back to state before stepping
+            s_with_info = s.replace(info=shared_info)
+            result = self.env.step(s_with_info, a)
+            # Return result without info (we'll add shared_info back after vmap)
+            return result.replace(info={})
+        
+        vmapped_state = jax.vmap(single_step)(state.replace(info={}), action)
+        
+        # Restore shared info to all vmapped states
+        return vmapped_state.replace(info=shared_info)
 
 
 class EpisodeWrapper(Wrapper):

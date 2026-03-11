@@ -29,7 +29,7 @@ from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
 from .types import Actor, Critic, TrainingState, Transition
 from .algorithms import get_algorithm
-from .utils import save_params, create_dummy_transition
+from .utils import save_params, create_dummy_transition, create_single_dummy_transition
 from .losses import update_alpha_sac, update_critic_sac, update_actor_sac
 from .visualization import all_visualizations
 from .goal_proposers import create_goal_proposer
@@ -86,7 +86,7 @@ class Baseline:
     use_her: bool = True  # Hindsight Experience Replay
 
     # goal proposer for training
-    goal_proposer_name: Literal["random_env_goals", "rb"] = "random_env_goals"
+    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic"] = "random_env_goals"
     num_candidates: int = 512  # Number of candidate goals to filter before final selection
 
     def check_config(self, config):
@@ -131,26 +131,12 @@ class Baseline:
             agent_type=self.agent_type,
         )
         
-        # Create goal proposer (will be used to reset envs when they auto-reset)
-        # Pass state_size and goal_indices directly (static config, no container needed)
-        goal_proposer = create_goal_proposer(
-            self.goal_proposer_name,
-            unwrapped_env,
-            config.num_envs,
-            self.num_candidates,
-            state_size=unwrapped_env.state_dim,
-            goal_indices=unwrapped_env.goal_indices,
-        )
-        
         # Wrap envs explicitly (mirrors brax.envs.training.wrap), but with TrajectoryIdWrapper innermost:
         # inner -> outer: TrajectoryIdWrapper -> VmapWrapper -> EpisodeWrapper -> (Train/Eval)AutoResetWrapper
+        # Note: TrainAutoResetWrapper will be added after actor and critic are created (they're needed for goal_proposer)
         train_env = TrajectoryIdWrapper(train_env)
         train_env = VmapWrapper(train_env)
         train_env = EpisodeWrapper(train_env, config.episode_length, config.action_repeat)
-        train_env = TrainAutoResetWrapper(
-            train_env,
-            goal_proposer=goal_proposer,
-        )
 
         eval_env = TrajectoryIdWrapper(eval_env)
         eval_env = VmapWrapper(eval_env)
@@ -193,20 +179,6 @@ class Baseline:
         np.random.seed(config.seed)
         key = jax.random.PRNGKey(config.seed)
         key, buffer_key, eval_env_key, env_key, actor_key, critic_key = jax.random.split(key, 6)
-
-        env_keys = jax.random.split(env_key, config.num_envs)
-        # Initialize info dict with transitions_sample and rng (Brax pattern, JIT-compatible)
-        # This ensures the entire info dict is always present with required fields
-        env_state = train_env.reset(env_keys)
-        # Initialize the entire info dict with transitions_sample and rng
-        info = env_state.info.copy() if hasattr(env_state.info, 'copy') else dict(env_state.info)
-        info['transitions_sample'] = initial_dummy_transition
-        info['rng'] = env_keys
-        env_state = env_state.replace(info=info)
-        train_env.step = jax.jit(train_env.step)
-        assert obs_size == train_env.observation_size, (
-            f"obs_size: {obs_size}, observation_size: {train_env.observation_size}"
-        )
 
         # Network setup
         actor, critic = get_algorithm(
@@ -262,23 +234,49 @@ class Baseline:
             alpha_state=alpha_state,
             target_critic_params=target_critic_params,
         )
+        
+        # Now create goal proposer with actor and critic objects (captured in closure)
+        goal_proposer = create_goal_proposer(
+            self.goal_proposer_name,
+            unwrapped_env,
+            config.num_envs,
+            self.num_candidates,
+            state_size=unwrapped_env.state_dim,
+            goal_indices=unwrapped_env.goal_indices,
+            actor=actor,  # Actor object captured in closure
+            critic=critic,  # Critic object captured in closure
+        )
+        
+        # Wrap train_env with TrainAutoResetWrapper now that goal_proposer is ready
+        train_env = TrainAutoResetWrapper(
+            train_env,
+            goal_proposer=goal_proposer,
+        )
+
+        # Now that TrainAutoResetWrapper is added, we can do the initial reset
+        env_keys = jax.random.split(env_key, config.num_envs)
+        # Initialize info dict with transitions_sample and rng (Brax pattern, JIT-compatible)
+        # This ensures the entire info dict is always present with required fields
+        env_state = train_env.reset(env_keys)
+        # Initialize the entire info dict with transitions_sample, rng, and network params
+        # Network params are needed for goal proposers and must be present from the start
+        # to maintain consistent pytree structure in scans
+        info = env_state.info.copy() if hasattr(env_state.info, 'copy') else dict(env_state.info)
+        info['transitions_sample'] = initial_dummy_transition
+        info['rng'] = env_keys
+        info['actor_params'] = actor_state.params
+        info['critic_params'] = {i: critic_i_state.params for i, critic_i_state in enumerate(critic_states)}
+        env_state = env_state.replace(info=info)
+        train_env.step = jax.jit(train_env.step)
+        assert obs_size == train_env.observation_size, (
+            f"obs_size: {obs_size}, observation_size: {train_env.observation_size}"
+        )
 
         # Replay Buffer
-        dummy_obs = jnp.zeros((obs_size,))
-        dummy_action = jnp.zeros((action_size,))
-
-        dummy_transition = Transition(
-            observation=dummy_obs,
-            action=dummy_action,
-            reward=0.0,
-            discount=0.0,
-            next_observation=dummy_obs if self.agent_type == "sac" else None,  # SAC needs next_observation
-            extras={
-                "state_extras": {
-                    "truncation": 0.0,
-                    "traj_id": 0.0,
-                }
-            },
+        dummy_transition = create_single_dummy_transition(
+            obs_size=obs_size,
+            action_size=action_size,
+            agent_type=self.agent_type,
         )
 
         def jit_wrap(buffer):
@@ -315,7 +313,7 @@ class Baseline:
                 extras={"state_extras": state_extras}
             )
 
-        def get_experience(actor_state, env_state, buffer_state, key, is_deterministic: bool):
+        def get_experience(actor_state, critic_states, env_state, buffer_state, key, is_deterministic: bool):
             # Sample raw transitions from replay buffer BEFORE the scan
             # This provides a fresh sample for all resets during this experience
             # Check buffer size first - use JAX conditional for JIT compatibility
@@ -333,25 +331,12 @@ class Baseline:
             def no_sample(buffer_state, key):
                 # Create dummy Transition with same structure but empty/zero data
                 # Shape must match: (num_envs, episode_length, obs_size) for observation
-                dummy_obs = jnp.zeros((num_envs, episode_length, obs_size))
-                dummy_action = jnp.zeros((num_envs, episode_length, action_size))
-                dummy_reward = jnp.zeros((num_envs, episode_length))
-                dummy_discount = jnp.zeros((num_envs, episode_length))
-                dummy_next_obs = jnp.zeros((num_envs, episode_length, obs_size)) if self.agent_type == "sac" else None
-                dummy_extras = {
-                    "state_extras": {
-                        # Match the dtype from real transitions: float32 for both
-                        "traj_id": jnp.zeros((num_envs, episode_length), dtype=jnp.float32),
-                        "truncation": jnp.zeros((num_envs, episode_length), dtype=jnp.float32)
-                    }
-                }
-                dummy_transition = Transition(
-                    observation=dummy_obs,
-                    action=dummy_action,
-                    reward=dummy_reward,
-                    discount=dummy_discount,
-                    next_observation=dummy_next_obs,
-                    extras=dummy_extras
+                dummy_transition = create_dummy_transition(
+                    num_envs=num_envs,
+                    episode_length=episode_length,
+                    obs_size=obs_size,
+                    action_size=action_size,
+                    agent_type=self.agent_type,
                 )
                 return buffer_state, dummy_transition
             
@@ -364,12 +349,17 @@ class Baseline:
                 key,
             )
             
-            # Store transitions_sample in env_state.info using Brax pattern
-            # This makes it part of the JAX PyTree and JIT-compatible
-            # transitions_sample will flow through state.info in step() and be available in reset()
+            # Store transitions_sample, actor_params, and critic_params in env_state.info using Brax pattern
+            # This makes them part of the JAX PyTree and JIT-compatible
+            # These will flow through state.info in step() and be available in reset() for goal proposers
             # Update rng keys once per experience (fresh keys for each experience, reused within experience)
             info = env_state.info.copy() if hasattr(env_state.info, 'copy') else dict(env_state.info)
             info['transitions_sample'] = transitions_sample
+            # Store current actor and critic params so goal proposers can use them
+            info['actor_params'] = actor_state.params
+            # Store critic params as a dict mapping critic index to params dict
+            # Goal proposer will handle the structure as needed
+            info['critic_params'] = {i: critic_i_state.params for i, critic_i_state in enumerate(critic_states)}
             key, subkeys = jax.random.split(key, 2)
             env_keys = jax.random.split(subkeys, config.num_envs)
             info['rng'] = env_keys
@@ -412,6 +402,7 @@ class Baseline:
                 key, new_key = jax.random.split(key)
                 env_state, buffer_state, _ = get_experience(
                     training_state.actor_state,
+                    training_state.critic_states,
                     env_state,
                     buffer_state,
                     key,
@@ -500,6 +491,7 @@ class Baseline:
             # get_experience will update goal_proposer_state before the scan
             env_state, buffer_state, _ = get_experience(
                 training_state.actor_state,
+                training_state.critic_states,
                 env_state,
                 buffer_state,
                 experience_key1,
@@ -527,6 +519,11 @@ class Baseline:
                 ),
                 metrics,
             ) = jax.lax.scan(update_networks, (training_state, training_key), transitions)
+            
+            info = env_state.info.copy() if hasattr(env_state.info, 'copy') else dict(env_state.info)
+            info['actor_params'] = training_state.actor_state.params
+            info['critic_params'] = {i: critic_i_state.params for i, critic_i_state in enumerate(training_state.critic_states)}
+            env_state = env_state.replace(info=info)
 
             return (
                 training_state,

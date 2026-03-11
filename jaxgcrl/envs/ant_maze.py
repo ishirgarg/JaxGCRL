@@ -184,8 +184,14 @@ class AntMaze(PipelineEnv):
         # Calculate x and y bounds based on maze layout dimensions
         num_rows = len(maze_layout)
         num_cols = len(maze_layout[0])
-        self.x_bounds = jnp.array([0.0, num_rows * maze_size_scaling])
-        self.y_bounds = jnp.array([0.0, num_cols * maze_size_scaling])
+        self.x_bounds = jnp.array([
+            0.5 * maze_size_scaling,
+            (num_rows - 0.5) * maze_size_scaling
+        ])
+        self.y_bounds = jnp.array([
+            0.5 * maze_size_scaling,
+            (num_cols - 0.5) * maze_size_scaling
+        ])
 
         sys = mjcf.loads(xml_string)
         self.possible_starts = possible_starts
@@ -237,8 +243,8 @@ class AntMaze(PipelineEnv):
         
         Args:
             rng: Random key
-            goal_proposer_fn: Optional goal proposer function that takes (rng, start_state) and returns goal.
-                             If provided, uses this to propose goal based on start state.
+            goal_proposer_fn: Optional goal proposer function that takes (rng, start_obs) and returns goal.
+                             If provided, uses this to propose goal based on start observation.
                              If None, samples goal randomly from possible goals.
         """
 
@@ -248,22 +254,31 @@ class AntMaze(PipelineEnv):
         q = self.sys.init_q + jax.random.uniform(rng, (self.sys.q_size(),), minval=low, maxval=hi)
         qd = hi * jax.random.normal(rng1, (self.sys.qd_size(),))
 
-        # set the start and target q, qd
+        # set the start q, qd
         start = self._random_start(rng2)
         q = q.at[:2].set(start)
 
         # Use goal_proposer_fn if provided, otherwise sample randomly
-        if goal_proposer_fn is not None:
-            target = goal_proposer_fn(rng3, start)
-        else:
-            target = self._random_target(rng3)
+        target = self._random_target(rng3)
+        
+        # Dummy for getting obs
         q = q.at[-2:].set(target)
-
         qd = qd.at[-2:].set(0)
 
         pipeline_state = self.pipeline_init(q, qd)
         obs = self._get_obs(pipeline_state)
 
+        if goal_proposer_fn is not None:
+            target = goal_proposer_fn(rng3, obs)
+
+        # Overwrite with target
+        q = q.at[-2:].set(target)
+        qd = qd.at[-2:].set(0)
+
+        pipeline_state = self.pipeline_init(q, qd)
+        obs = self._get_obs(pipeline_state)
+
+        # Return metrics
         reward, done, zero = jnp.zeros(3)
         metrics = {
             "reward_forward": zero,
