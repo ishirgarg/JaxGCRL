@@ -176,7 +176,52 @@ def sample_trajectories_from_buffer(
     return current_buffer_state, all_positions, final_positions, goal_positions_np
 
 
-def create_dummy_transition(
+
+def create_dummy_transition_for_buffer(
+    unroll_length: int,
+    num_envs: int,
+    obs_size: int,
+    action_size: int,
+    agent_type: str = "crl",
+) -> Any:
+    """
+    Create a dummy transition object for replay buffer insertion.
+    Shape is (unroll_length, num_envs, ...) to match what's normally inserted.
+    
+    Args:
+        unroll_length: Length of unroll (first dimension)
+        num_envs: Number of parallel environments (second dimension)
+        obs_size: Size of observation dimension
+        action_size: Size of action dimension
+        agent_type: Type of agent ("crl" or "sac") - SAC needs next_observation
+        
+    Returns:
+        A Transition object with zero-filled arrays of shape (unroll_length, num_envs, ...).
+    """
+    from .types import Transition
+    
+    dummy_obs = jnp.zeros((unroll_length, num_envs, obs_size))
+    dummy_action = jnp.zeros((unroll_length, num_envs, action_size))
+    dummy_reward = jnp.zeros((unroll_length, num_envs))
+    dummy_discount = jnp.zeros((unroll_length, num_envs))
+    dummy_next_obs = jnp.zeros((unroll_length, num_envs, obs_size)) if agent_type == "sac" else None
+    dummy_extras = {
+        "state_extras": {
+            "traj_id": jnp.zeros((unroll_length, num_envs), dtype=jnp.float32),
+            "truncation": jnp.zeros((unroll_length, num_envs), dtype=jnp.float32),
+        }
+    }
+    return Transition(
+        observation=dummy_obs,
+        action=dummy_action,
+        reward=dummy_reward,
+        discount=dummy_discount,
+        next_observation=dummy_next_obs,
+        extras=dummy_extras
+    )
+
+
+def create_dummy_transition_for_goal_proposer(
     num_envs: int,
     episode_length: int,
     obs_size: int,
@@ -184,17 +229,18 @@ def create_dummy_transition(
     agent_type: str = "crl",
 ) -> Any:
     """
-    Create a dummy transition object for initializing state.info.
+    Create a dummy transition object with shape (num_envs, episode_length, ...) for goal proposer state.
+    This matches the shape returned by the replay buffer's sample method.
     
     Args:
         num_envs: Number of parallel environments
-        episode_length: Length of episodes
+        episode_length: Length of episode
         obs_size: Size of observation dimension
         action_size: Size of action dimension
         agent_type: Type of agent ("crl" or "sac") - SAC needs next_observation
         
     Returns:
-        A Transition object with zero-filled arrays of the correct shape.
+        A Transition object with zero-filled arrays of shape (num_envs, episode_length, ...).
     """
     from .types import Transition
     
@@ -206,7 +252,7 @@ def create_dummy_transition(
     dummy_extras = {
         "state_extras": {
             "traj_id": jnp.zeros((num_envs, episode_length), dtype=jnp.float32),
-            "truncation": jnp.zeros((num_envs, episode_length), dtype=jnp.float32)
+            "truncation": jnp.zeros((num_envs, episode_length), dtype=jnp.float32),
         }
     }
     return Transition(

@@ -52,6 +52,7 @@ class TrainingState:
 
     env_steps: jnp.ndarray
     gradient_steps: jnp.ndarray
+    experience_count: jnp.ndarray  # Counter for number of experiences collected
     actor_state: TrainState
     critic_states: Tuple[TrainState, ...]  # Separate TrainState for each critic
     alpha_state: Optional[TrainState] = None
@@ -72,3 +73,12 @@ class Transition(NamedTuple):
     discount: jnp.ndarray
     next_observation: Optional[jnp.ndarray] = None  # Required for SAC
     extras: jnp.ndarray = ()
+
+
+@dataclass
+class GoalProposerState:
+    """State for goal proposers that can be read from and written to."""
+    
+    transitions_sample: Any  # Transition sample from replay buffer
+    actor_params: Optional[Any] = None  # Actor network parameters (for q_epistemic)
+    critic_params: Optional[Any] = None  # Critic network parameters (for q_epistemic)

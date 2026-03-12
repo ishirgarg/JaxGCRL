@@ -27,12 +27,12 @@ from jaxgcrl.envs.wrappers import (
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
-from .types import Actor, Critic, TrainingState, Transition
+from .types import Actor, Critic, TrainingState, Transition, GoalProposerState
 from .algorithms import get_algorithm
-from .utils import save_params, create_dummy_transition, create_single_dummy_transition
+from .utils import save_params, create_single_dummy_transition, create_dummy_transition_for_buffer, create_dummy_transition_for_goal_proposer
 from .losses import update_alpha_sac, update_critic_sac, update_actor_sac
 from .visualization import all_visualizations
-from .goal_proposers import create_goal_proposer
+from .goal_proposers import create_goal_proposer, create_random_env_goals_proposer
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -82,7 +82,7 @@ class Baseline:
 
     # SAC specific
     tau: float = 0.005
-    n_critics: int = 2
+    n_critics: int = 2 # Also for q epistemic
     use_her: bool = True  # Hindsight Experience Replay
 
     # goal proposer for training
@@ -121,16 +121,7 @@ class Baseline:
         goal_size = len(train_env.goal_indices)
         obs_size = state_size + goal_size
         
-        # Create dummy transition for initial state.info (before first reset)
-        # This ensures transitions_sample is always a valid Transition object, not None
-        initial_dummy_transition = create_dummy_transition(
-            num_envs=config.num_envs,
-            episode_length=config.episode_length,
-            obs_size=obs_size,
-            action_size=action_size,
-            agent_type=self.agent_type,
-        )
-        
+       
         # Wrap envs explicitly (mirrors brax.envs.training.wrap), but with TrajectoryIdWrapper innermost:
         # inner -> outer: TrajectoryIdWrapper -> VmapWrapper -> EpisodeWrapper -> (Train/Eval)AutoResetWrapper
         # Note: TrainAutoResetWrapper will be added after actor and critic are created (they're needed for goal_proposer)
@@ -229,6 +220,7 @@ class Baseline:
         training_state = TrainingState(
             env_steps=jnp.zeros(()),
             gradient_steps=jnp.zeros(()),
+            experience_count=jnp.array(0, dtype=jnp.int32),
             actor_state=actor_state,
             critic_states=critic_states,
             alpha_state=alpha_state,
@@ -247,25 +239,21 @@ class Baseline:
             critic=critic,  # Critic object captured in closure
         )
         
-        # Wrap train_env with TrainAutoResetWrapper now that goal_proposer is ready
-        train_env = TrainAutoResetWrapper(
-            train_env,
-            goal_proposer=goal_proposer,
-        )
+        # Wrap train_env with TrainAutoResetWrapper (no goal_proposer needed - goals stored in info)
+        train_env = TrainAutoResetWrapper(train_env)
 
-        # Now that TrainAutoResetWrapper is added, we can do the initial reset
+        # Propose random environment goals for the first reset
+        random_goals_proposer = create_random_env_goals_proposer(unwrapped_env, config.num_envs)
         env_keys = jax.random.split(env_key, config.num_envs)
-        # Initialize info dict with transitions_sample and rng (Brax pattern, JIT-compatible)
-        # This ensures the entire info dict is always present with required fields
-        env_state = train_env.reset(env_keys)
-        # Initialize the entire info dict with transitions_sample, rng, and network params
-        # Network params are needed for goal proposers and must be present from the start
+
+        initial_goals = jax.vmap(random_goals_proposer)(env_keys)
+        
+        env_state = train_env.reset(env_keys, goal=initial_goals)
+        # Initialize the entire info dict with proposed_goals and traj_id
         # to maintain consistent pytree structure in scans
         info = env_state.info.copy() if hasattr(env_state.info, 'copy') else dict(env_state.info)
-        info['transitions_sample'] = initial_dummy_transition
-        info['rng'] = env_keys
-        info['actor_params'] = actor_state.params
-        info['critic_params'] = {i: critic_i_state.params for i, critic_i_state in enumerate(critic_states)}
+        info['proposed_goals'] = initial_goals
+
         env_state = env_state.replace(info=info)
         train_env.step = jax.jit(train_env.step)
         assert obs_size == train_env.observation_size, (
@@ -294,15 +282,42 @@ class Baseline:
             )
         )
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
+        
+        # Add dummy transition to buffer at initialization so we can always sample
+        dummy_batch_transition = create_dummy_transition_for_buffer(
+            unroll_length=self.unroll_length,
+            num_envs=config.num_envs,
+            obs_size=obs_size,
+            action_size=action_size,
+            agent_type=self.agent_type,
+        )
+        buffer_state = replay_buffer.insert(buffer_state, dummy_batch_transition)
+        
+        # Initialize goal proposer state with dummy transition matching replay buffer sample shape
+        # Replay buffer sample returns (num_envs, episode_length, ...), not (unroll_length, num_envs, ...)
+        dummy_goal_proposer_transition = create_dummy_transition_for_goal_proposer(
+            num_envs=config.num_envs,
+            episode_length=config.episode_length,
+            obs_size=obs_size,
+            action_size=action_size,
+            agent_type=self.agent_type,
+        )
+        goal_proposer_state = GoalProposerState(
+            transitions_sample=dummy_goal_proposer_transition,
+            actor_params=actor_state.params,
+            critic_params={i: critic_i_state.params for i, critic_i_state in enumerate(critic_states)},
+        )
 
         def actor_step(actor_state, env, env_state, key, extra_fields, is_deterministic: bool):
+            # Split key: one for action sampling, one for environment step (for resets)
+            action_key, env_rng = jax.random.split(key)
             actions = actor.sample_actions(
                 actor_state.params,
                 env_state.obs,
-                key,
+                action_key,
                 is_deterministic=is_deterministic
             )
-            nstate = env.step(env_state, actions)
+            nstate = env.step(env_state, actions, env_rng)
             state_extras = {x: nstate.info[x] for x in extra_fields}
             return nstate, Transition(
                 observation=env_state.obs, 
@@ -313,56 +328,55 @@ class Baseline:
                 extras={"state_extras": state_extras}
             )
 
-        def get_experience(actor_state, critic_states, env_state, buffer_state, key, is_deterministic: bool):
-            # Sample raw transitions from replay buffer BEFORE the scan
-            # This provides a fresh sample for all resets during this experience
-            # Check buffer size first - use JAX conditional for JIT compatibility
-            buffer_size = replay_buffer.size(buffer_state)
+        def get_experience(actor_state, critic_states, env_state, buffer_state, key, experience_count, goal_proposer_state, is_deterministic: bool):
+            # Always sample from buffer (dummy data was added at initialization)
+            buffer_state, transitions_sample = replay_buffer.sample(buffer_state)
             
-            # Use obs_size and action_size (already computed) for creating dummy transition
-            # obs_size and action_size are scalars, so shapes are (obs_size,) and (action_size,)
+            # Update goal proposer state with new replay buffer sample and current network params
+            goal_proposer_state = goal_proposer_state.replace(
+                transitions_sample=transitions_sample,
+                actor_params=actor_state.params,
+                critic_params={i: critic_i_state.params for i, critic_i_state in enumerate(critic_states)},
+            )
+            
             num_envs = config.num_envs
             episode_length = config.episode_length
             
-            def sample_from_buffer(buffer_state, key):
-                buffer_state, transitions_sample = replay_buffer.sample(buffer_state)
-                return buffer_state, transitions_sample
+            info = dict(env_state.info)
             
-            def no_sample(buffer_state, key):
-                # Create dummy Transition with same structure but empty/zero data
-                # Shape must match: (num_envs, episode_length, obs_size) for observation
-                dummy_transition = create_dummy_transition(
-                    num_envs=num_envs,
-                    episode_length=episode_length,
-                    obs_size=obs_size,
-                    action_size=action_size,
-                    agent_type=self.agent_type,
-                )
-                return buffer_state, dummy_transition
+            reset_threshold = jnp.array(episode_length // self.unroll_length, dtype=jnp.int32)
+            new_experience_count = experience_count + 1
             
-            # Use JAX conditional instead of Python if for JIT compatibility
-            buffer_state, transitions_sample = jax.lax.cond(
-                buffer_size > 0,
-                sample_from_buffer,
-                no_sample,
-                buffer_state,
-                key,
+            # Propose new goals if we've reached the threshold
+            def propose_new_goals(env_state, key, info, experience_count, goal_proposer_state):
+                # Generate rng keys for goal proposer
+                goal_keys = jax.random.split(key, num_envs)
+                first_obs = info['first_obs']
+                # Call goal proposer to get new goals (vmapped over envs)
+                # Only extract goals from the result, keep state unchanged since it's shared
+                def propose_single_goal(rng_key, obs, state):
+                    goal, _ = goal_proposer(rng_key, obs, state)
+                    return goal
+                new_goals = jax.vmap(propose_single_goal, in_axes=(0, 0, None))(goal_keys, first_obs, goal_proposer_state)
+                info['proposed_goals'] = new_goals
+                # Reset counter to 0 after proposing new goals
+                updated_experience_count = jnp.array(0, dtype=jnp.int32)
+                # Return the same goal_proposer_state (it's updated elsewhere with new transitions_sample)
+                return env_state, info, updated_experience_count, goal_proposer_state
+            
+            def keep_existing_goals(env_state, key, info, experience_count, goal_proposer_state):
+                # Increment counter
+                updated_experience_count = experience_count + 1
+                return env_state, info, updated_experience_count, goal_proposer_state
+            
+            # Conditionally propose new goals
+            env_state, info, updated_experience_count, updated_goal_proposer_state = jax.lax.cond(
+                new_experience_count >= reset_threshold,
+                propose_new_goals,
+                keep_existing_goals,
+                env_state, key, info, experience_count, goal_proposer_state
             )
             
-            # Store transitions_sample, actor_params, and critic_params in env_state.info using Brax pattern
-            # This makes them part of the JAX PyTree and JIT-compatible
-            # These will flow through state.info in step() and be available in reset() for goal proposers
-            # Update rng keys once per experience (fresh keys for each experience, reused within experience)
-            info = env_state.info.copy() if hasattr(env_state.info, 'copy') else dict(env_state.info)
-            info['transitions_sample'] = transitions_sample
-            # Store current actor and critic params so goal proposers can use them
-            info['actor_params'] = actor_state.params
-            # Store critic params as a dict mapping critic index to params dict
-            # Goal proposer will handle the structure as needed
-            info['critic_params'] = {i: critic_i_state.params for i, critic_i_state in enumerate(critic_states)}
-            key, subkeys = jax.random.split(key, 2)
-            env_keys = jax.random.split(subkeys, config.num_envs)
-            info['rng'] = env_keys
             env_state = env_state.replace(info=info)
             
             @jax.jit
@@ -378,45 +392,47 @@ class Baseline:
                     is_deterministic=is_deterministic,
                 )
                 # transitions_sample flows through state.info (JAX PyTree, JIT-compatible)
-                # When reset() is called during step() (auto-reset), it reads transitions_sample
-                # from state.info and passes it to goal proposer
+                # When reset() is called during step() (auto-reset), it reads proposed_goals
+                # from state.info and uses them for reset
                 return (env_state, buffer_state, next_key), transition
 
             (env_state, buffer_state, _), data = jax.lax.scan(f, (env_state, buffer_state, key), (), length=self.unroll_length)
 
-            # GoalProposerWrapper intercepts all reset calls (including mid-unroll resets from training.wrap)
-            # so we don't need to manually reset here - the wrapper handles it automatically
+            # Goal proposing happens before the scan, so new goals are available during the scan
+            # Auto reset wrapper will use proposed_goals from info when resets occur
             
             buffer_state = replay_buffer.insert(buffer_state, data)
             
-            # Return transitions_sample so caller can update goal_proposer_state
-            # (Python side effect must happen outside JIT)
-            return env_state, buffer_state, transitions_sample
+            return env_state, buffer_state, updated_experience_count, updated_goal_proposer_state
+            
 
-        def prefill_replay_buffer(training_state, env_state, buffer_state, key):
+        def prefill_replay_buffer(training_state, env_state, buffer_state, key, goal_proposer_state):
             # get_experience will update goal_proposer_state before each scan
             @jax.jit
             def f(carry, unused):
                 del unused
-                training_state, env_state, buffer_state, key = carry
+                training_state, env_state, buffer_state, key, goal_proposer_state = carry
                 key, new_key = jax.random.split(key)
-                env_state, buffer_state, _ = get_experience(
+                env_state, buffer_state, updated_experience_count, updated_goal_proposer_state = get_experience(
                     training_state.actor_state,
                     training_state.critic_states,
                     env_state,
                     buffer_state,
                     key,
+                    training_state.experience_count,
+                    goal_proposer_state,
                     is_deterministic=False,
                 )
                 # Prefill uses unroll_length steps per call
                 training_state = training_state.replace(
                     env_steps=training_state.env_steps + config.num_envs * self.unroll_length,
+                    experience_count=updated_experience_count,
                 )
-                return (training_state, env_state, buffer_state, new_key), ()
+                return (training_state, env_state, buffer_state, new_key, updated_goal_proposer_state), ()
 
             return jax.lax.scan(
                 f,
-                (training_state, env_state, buffer_state, key),
+                (training_state, env_state, buffer_state, key, goal_proposer_state),
                 (),
                 length=num_prefill_actor_steps,
             )[0]
@@ -484,22 +500,25 @@ class Baseline:
             ), metrics
 
         @jax.jit
-        def training_step(training_state, env_state, buffer_state, key):
+        def training_step(training_state, env_state, buffer_state, key, goal_proposer_state):
             experience_key1, process_key, training_key = jax.random.split(key, 3)
 
             # Collect unroll_length steps (with auto-resets)
             # get_experience will update goal_proposer_state before the scan
-            env_state, buffer_state, _ = get_experience(
+            env_state, buffer_state, updated_experience_count, updated_goal_proposer_state = get_experience(
                 training_state.actor_state,
                 training_state.critic_states,
                 env_state,
                 buffer_state,
                 experience_key1,
+                training_state.experience_count,
+                goal_proposer_state,
                 is_deterministic=False,
             )
 
             training_state = training_state.replace(
                 env_steps=training_state.env_steps + env_steps_per_actor_step,
+                experience_count=updated_experience_count,
             )
 
             # sample actor-step worth of transitions
@@ -520,16 +539,13 @@ class Baseline:
                 metrics,
             ) = jax.lax.scan(update_networks, (training_state, training_key), transitions)
             
-            info = env_state.info.copy() if hasattr(env_state.info, 'copy') else dict(env_state.info)
-            info['actor_params'] = training_state.actor_state.params
-            info['critic_params'] = {i: critic_i_state.params for i, critic_i_state in enumerate(training_state.critic_states)}
-            env_state = env_state.replace(info=info)
-
             return (
                 training_state,
                 env_state,
                 buffer_state,
+                updated_goal_proposer_state,
             ), metrics
+
 
         @jax.jit
         def training_epoch(
@@ -537,35 +553,32 @@ class Baseline:
             env_state,
             buffer_state,
             key,
+            goal_proposer_state,
         ):
             @jax.jit
             def f(carry, unused_t):
-                ts, es, bs, k = carry
+                ts, es, bs, k, gps = carry
                 k, train_key = jax.random.split(k, 2)
                 (
-                    (
-                        ts,
-                        es,
-                        bs,
-                    ),
+                    (ts, es, bs, updated_gps),
                     metrics,
-                ) = training_step(ts, es, bs, train_key)
-                return (ts, es, bs, k), metrics
+                ) = training_step(ts, es, bs, train_key, gps)
+                return (ts, es, bs, k, updated_gps), metrics
 
-            (training_state, env_state, buffer_state, key), metrics = jax.lax.scan(
+            (training_state, env_state, buffer_state, key, goal_proposer_state), metrics = jax.lax.scan(
                 f,
-                (training_state, env_state, buffer_state, key),
+                (training_state, env_state, buffer_state, key, goal_proposer_state),
                 (),
                 length=num_training_steps_per_epoch,
             )
 
             metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
-            return training_state, env_state, buffer_state, metrics
+            return training_state, env_state, buffer_state, goal_proposer_state, metrics
 
         key, prefill_key = jax.random.split(key, 2)
 
-        training_state, env_state, buffer_state, _ = prefill_replay_buffer(
-            training_state, env_state, buffer_state, prefill_key
+        training_state, env_state, buffer_state, _, goal_proposer_state = prefill_replay_buffer(
+            training_state, env_state, buffer_state, prefill_key, goal_proposer_state
         )
 
         """Setting up evaluator"""
@@ -585,8 +598,8 @@ class Baseline:
 
             key, epoch_key = jax.random.split(key)
 
-            training_state, env_state, buffer_state, metrics = training_epoch(
-                training_state, env_state, buffer_state, epoch_key
+            training_state, env_state, buffer_state, goal_proposer_state, metrics = training_epoch(
+                training_state, env_state, buffer_state, epoch_key, goal_proposer_state
             )
 
             metrics = jax.tree_util.tree_map(jnp.mean, metrics)

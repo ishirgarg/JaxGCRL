@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 from jaxgcrl.agents.go_explore.utils import sample_trajectories_from_buffer
 from jaxgcrl.agents.go_explore.algorithms_utils import reconstruct_full_critic_params
+from jaxgcrl.agents.go_explore.types import GoalProposerState
 
 
 
@@ -31,18 +32,15 @@ def create_goal_proposer(
         critic: Optional critic network object (for goal proposers that need to compute values)
         
     Returns:
-        A goal proposer function that takes (rng, start_obs, info) and returns goal.
-        This will be partialized by the wrapper to only need (rng, start_obs).
-        The entire info dict is passed through (not vmapped over).
-        The info dict contains 'actor_params' and 'critic_params' that can be used with
-        the actor and critic objects (captured in closure) to sample actions, compute values, etc.
+        A goal proposer function that takes (rng, start_obs, goal_proposer_state) and returns (goal, updated_state).
+        The goal proposer state can be read from and written to.
     """
     if goal_proposer_name == "random_env_goals":
         proposer_fn = create_random_env_goals_proposer(env, num_envs)
-        # Wrap to take (rng, start_obs, info) - start_obs and info ignored
-        def wrapped_proposer(rng: jax.Array, start_obs: jnp.ndarray, info: Dict[str, Any]) -> jnp.ndarray:
+        # Wrap to take (rng, start_obs, goal_proposer_state) - start_obs and state ignored
+        def wrapped_proposer(rng: jax.Array, start_obs: jnp.ndarray, goal_proposer_state: GoalProposerState):
             goal = proposer_fn(rng)
-            return goal
+            return goal, goal_proposer_state
         return wrapped_proposer
     elif goal_proposer_name == "rb":
         return create_rb_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic)
@@ -75,12 +73,10 @@ def create_rb_goal_proposer(
     goal_indices: Optional[tuple] = None,
     actor: Optional[Any] = None,
     critic: Optional[Any] = None,
-) -> Callable[[jax.Array, jnp.ndarray, Dict[str, Any]], jnp.ndarray]:
-    def propose_goal(rng: jax.Array, start_obs: jnp.ndarray, info: Dict[str, Any]) -> jnp.ndarray:
-        # actor and critic are captured in closure - can be used to sample actions, compute values, etc.
-        # actor_params and critic_params are in info dict
-        # Extract transitions_sample from info dict
-        transitions_sample = info.get('transitions_sample')
+) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
+    def propose_goal(rng: jax.Array, start_obs: jnp.ndarray, goal_proposer_state: GoalProposerState):
+        # Extract transitions_sample from goal proposer state
+        transitions_sample = goal_proposer_state.transitions_sample
         
         # transitions_sample.observation shape: (num_envs, episode_length, obs_size)
         # Flatten to (num_envs * episode_length, obs_size)
@@ -97,7 +93,7 @@ def create_rb_goal_proposer(
         idx = jax.random.randint(rng2, (), 0, num_candidates)
         goal = candidate_positions[idx]
         
-        return goal
+        return goal, goal_proposer_state
     
     return propose_goal
 
@@ -110,15 +106,15 @@ def create_variance_goal_proposer(
     goal_indices: Optional[tuple] = None,
     actor: Optional[Any] = None,
     critic: Optional[Any] = None,
-) -> Callable[[jax.Array, jnp.ndarray, Dict[str, Any]], jnp.ndarray]:
+) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
     """
     Create a goal proposer that selects goals with highest Q-value variance across the ensemble.
     """
-    def propose_goal(rng: jax.Array, start_obs: jnp.ndarray, info: Dict[str, Any]) -> jnp.ndarray:
-        # Extract required data from info dict
-        transitions_sample = info.get('transitions_sample')
-        actor_params = info.get('actor_params')
-        critic_params = info.get('critic_params')
+    def propose_goal(rng: jax.Array, start_obs: jnp.ndarray, goal_proposer_state: GoalProposerState):
+        # Extract required data from goal proposer state
+        transitions_sample = goal_proposer_state.transitions_sample
+        actor_params = goal_proposer_state.actor_params
+        critic_params = goal_proposer_state.critic_params
         
         obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
         positions = obs_flat[:, :state_size][:, list(goal_indices)]  # (N, goal_dim)
@@ -174,6 +170,6 @@ def create_variance_goal_proposer(
         best_idx = jnp.argmax(variances)
         selected_goal = candidate_goals[best_idx]  # Shape: (goal_dim,)
         
-        return selected_goal
+        return selected_goal, goal_proposer_state
     
     return propose_goal

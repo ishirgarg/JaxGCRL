@@ -238,7 +238,7 @@ class AntMaze(PipelineEnv):
         if self._use_contact_forces:
             raise NotImplementedError("use_contact_forces not implemented.")
 
-    def reset(self, rng: jax.Array, goal_proposer_fn=None) -> State:
+    def reset(self, rng: jax.Array, goal=None) -> State:
         """Resets the environment to an initial state.
         
         Args:
@@ -258,20 +258,11 @@ class AntMaze(PipelineEnv):
         start = self._random_start(rng2)
         q = q.at[:2].set(start)
 
-        # Use goal_proposer_fn if provided, otherwise sample randomly
-        target = self._random_target(rng3)
+        if goal is None:
+            target = self._random_target(rng3)
+        else:
+            target = goal
         
-        # Dummy for getting obs
-        q = q.at[-2:].set(target)
-        qd = qd.at[-2:].set(0)
-
-        pipeline_state = self.pipeline_init(q, qd)
-        obs = self._get_obs(pipeline_state)
-
-        if goal_proposer_fn is not None:
-            target = goal_proposer_fn(rng3, obs)
-
-        # Overwrite with target
         q = q.at[-2:].set(target)
         qd = qd.at[-2:].set(0)
 
