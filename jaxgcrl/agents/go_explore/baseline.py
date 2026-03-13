@@ -64,7 +64,7 @@ class Baseline:
 
     disable_entropy_actor: bool = False
 
-    max_replay_size: int = 10000
+    max_replay_size: int = 20000
     min_replay_size: int = 1000
     unroll_length: int = 50
     h_dim: int = 256
@@ -345,7 +345,7 @@ class Baseline:
             
             info = dict(env_state.info)
             
-            reset_threshold = jnp.array(episode_length // self.unroll_length, dtype=jnp.int32)
+            reset_threshold = jnp.array(episode_length // (self.unroll_length * 2), dtype=jnp.int32)
             new_experience_count = experience_count + 1
             
             # Propose new goals if we've reached the threshold
