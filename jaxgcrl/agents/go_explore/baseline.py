@@ -87,7 +87,7 @@ class Baseline:
     use_her: bool = True  # Hindsight Experience Replay
 
     # goal proposer for training
-    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic"] = "random_env_goals"
+    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr"] = "random_env_goals"
     num_candidates: int = 512  # Number of candidate goals to filter before final selection
 
     def check_config(self, config):
@@ -236,8 +236,9 @@ class Baseline:
             self.num_candidates,
             state_size=unwrapped_env.state_dim,
             goal_indices=unwrapped_env.goal_indices,
-            actor=actor,  # Actor object captured in closure
-            critic=critic,  # Critic object captured in closure
+            actor=actor,
+            critic=critic,
+            discounting=self.discounting,
         )
         
         # Wrap train_env with TrainAutoResetWrapper (no goal_proposer needed - goals stored in info)

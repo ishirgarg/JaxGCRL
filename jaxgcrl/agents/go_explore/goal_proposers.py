@@ -3,9 +3,10 @@ from typing import Callable, Dict, Any, Optional
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxgcrl.agents.go_explore.utils import sample_trajectories_from_buffer
+from jaxgcrl.agents.go_explore.utils import sample_trajectories_from_buffer, flatten_batch
 from jaxgcrl.agents.go_explore.algorithms_utils import reconstruct_full_critic_params
 from jaxgcrl.agents.go_explore.types import GoalProposerState
+from jaxgcrl.agents.go_explore.utils import geometric_sample_one_triple
 
 
 
@@ -18,6 +19,7 @@ def create_goal_proposer(
     goal_indices: Optional[tuple] = None,
     actor: Optional[Any] = None,
     critic: Optional[Any] = None,
+    discounting: float=0.99,
 ) -> Callable:
     """
     Factory function to create a goal proposer function.
@@ -28,9 +30,10 @@ def create_goal_proposer(
         num_envs: Number of parallel environments
         state_size: Size of state dimension (required for rb)
         goal_indices: Indices in state that represent the goal (required for rb)
-        num_candidates: Number of candidate goals to filter before final selection
+        num_candidates: Number of candidate goals to evaluate before final selection.
         actor: Optional actor network object (for goal proposers that need to sample actions)
         critic: Optional critic network object (for goal proposers that need to compute values)
+        discounting: Discount factor for geometric future-state sampling (ucgr only)
         
     Returns:
         A goal proposer function that takes (rng, start_obs, goal_proposer_state) and returns (goal, updated_state).
@@ -47,6 +50,8 @@ def create_goal_proposer(
         return wrapped_proposer
     elif goal_proposer_name == "rb":
         return create_rb_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic)
+    elif goal_proposer_name == "ucgr":
+        return create_ucgr_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic, discounting)
     elif goal_proposer_name == "q_epistemic":
         return create_q_epistemic_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic)
     else:
@@ -100,6 +105,226 @@ def create_rb_goal_proposer(
         log_data = {}
         return goal, goal_proposer_state, log_data
     
+    return propose_goal
+
+
+from typing import Callable, Dict, Any, Optional
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jaxgcrl.agents.go_explore.utils import sample_trajectories_from_buffer
+from jaxgcrl.agents.go_explore.algorithms_utils import reconstruct_full_critic_params
+from jaxgcrl.agents.go_explore.types import GoalProposerState
+
+
+def create_goal_proposer(
+    goal_proposer_name: str,
+    env,
+    num_envs: int,
+    num_candidates: int,
+    state_size: Optional[int] = None,
+    goal_indices: Optional[tuple] = None,
+    actor: Optional[Any] = None,
+    critic: Optional[Any] = None,
+    discounting: float = 0.99,
+) -> Callable:
+    """
+    Factory function to create a goal proposer function.
+    
+    Args:
+        goal_proposer_name: Name of the goal proposer to create
+        env: The environment instance
+        num_envs: Number of parallel environments
+        state_size: Size of state dimension (required for rb)
+        goal_indices: Indices in state that represent the goal (required for rb)
+        num_candidates: Number of candidate goals to evaluate before final selection.
+        actor: Optional actor network object (for goal proposers that need to sample actions)
+        critic: Optional critic network object (for goal proposers that need to compute values)
+        discounting: Discount factor for geometric future-state sampling (ucgr only)
+        
+    Returns:
+        A goal proposer function that takes (rng, start_obs, goal_proposer_state) and returns (goal, updated_state).
+        The goal proposer state can be read from and written to.
+    """
+    if goal_proposer_name == "random_env_goals":
+        proposer_fn = create_random_env_goals_proposer(env, num_envs)
+        # Wrap to take (rng, start_obs, goal_proposer_state) - start_obs and state ignored
+        def wrapped_proposer(rng: jax.Array, start_obs: jnp.ndarray, goal_proposer_state: GoalProposerState):
+            goal = proposer_fn(rng)
+            # Return empty log_data dict (no visualization for random goals)
+            log_data = {}
+            return goal, goal_proposer_state, log_data
+        return wrapped_proposer
+    elif goal_proposer_name == "rb":
+        return create_rb_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic)
+    elif goal_proposer_name == "ucgr":
+        return create_ucgr_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic, discounting)
+    elif goal_proposer_name == "q_epistemic":
+        return create_q_epistemic_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic)
+    else:
+        raise ValueError(f"Unknown goal proposer: {goal_proposer_name}")
+
+
+def create_random_env_goals_proposer(
+    env,
+    num_envs: int,
+) -> Callable[[jax.Array], jnp.ndarray]:
+    possible_goals = env.possible_goals  # Shape: (num_goals, goal_dim)
+    num_goals = possible_goals.shape[0]  # Use .shape[0] for JIT compatibility
+    
+    def propose_goal(rng: jax.Array) -> jnp.ndarray:
+        idx = jax.random.randint(rng, (), 0, num_goals)
+        goal = possible_goals[idx]  # Shape: (goal_dim,)
+        return goal
+    
+    return propose_goal
+
+
+def create_rb_goal_proposer(
+    env,
+    num_envs: int,
+    num_candidates: int,
+    state_size: Optional[int] = None,
+    goal_indices: Optional[tuple] = None,
+    actor: Optional[Any] = None,
+    critic: Optional[Any] = None,
+) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
+    def propose_goal(rng: jax.Array, start_obs: jnp.ndarray, goal_proposer_state: GoalProposerState):
+        # Extract transitions_sample from goal proposer state
+        transitions_sample = goal_proposer_state.transitions_sample
+        
+        # transitions_sample.observation shape: (num_envs, episode_length, obs_size)
+        # Flatten to (num_envs * episode_length, obs_size)
+        obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
+        positions = obs_flat[:, :state_size][:, jnp.array(goal_indices)]  # (N, goal_dim)
+        
+        # First select num_candidates random states, then randomly select from those
+        num_states = positions.shape[0]
+        rng1, rng2 = jax.random.split(rng, 2)
+        candidate_indices = jax.random.randint(rng1, (num_candidates,), 0, num_states)
+        candidate_positions = positions[candidate_indices]  # (num_candidates, goal_dim)
+        
+        # Randomly select one from candidates
+        idx = jax.random.randint(rng2, (), 0, num_candidates)
+        goal = candidate_positions[idx]
+        
+        # Return empty log_data dict (no visualization for rb proposer)
+        log_data = {}
+        return goal, goal_proposer_state, log_data
+    
+    return propose_goal
+
+
+def create_ucgr_goal_proposer(
+    env,
+    num_envs: int,
+    num_candidates: int,
+    state_size: Optional[int] = None,
+    goal_indices: Optional[tuple] = None,
+    actor: Optional[Any] = None,
+    critic: Optional[Any] = None,
+    discounting: float = 0.99,
+) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
+    """
+    Create a goal proposer implementing Unsupervised Contrastive Goal-Reaching (UCGR).
+ 
+    Strategy (MinLSE): score each candidate goal by how reachable it is, using the
+    CRL critic as an implicit dynamics-aware reachability model:
+ 
+        S(g_i) = f(s_i, a_i, g_i)
+ 
+    where (s_i, a_i, g_i) are matched triples — g_i is geometrically sampled from
+    the future state occupancy of (s_i, a_i). argmin_i S(g_i) returns the goal
+    that is hardest to reach from its anchor, i.e. at the frontier of the agent's
+    current capability.
+ 
+    Memory-efficient: exactly num_candidates (env_idx, t) pairs are sampled first,
+    then geometric future-state sampling is applied only to those num_candidates
+    anchors via vmap — never materializing the full buffer.
+ 
+    Args:
+        env: The environment instance.
+        num_envs: Number of parallel environments.
+        num_candidates: Number of (s, a, g) triples to sample and score.
+        state_size: Number of elements in the state portion of an observation.
+        goal_indices: Indices within the state that encode the goal position.
+        actor: CRL actor (unused, kept for API consistency).
+        critic: CRLCritic instance — used via critic.apply(params, obs, actions).
+        discounting: Discount factor γ for geometric future-state sampling.
+    """
+    goal_idx_array = jnp.array(goal_indices)
+ 
+    def propose_goal(
+        rng: jax.Array,
+        start_obs: jnp.ndarray,
+        goal_proposer_state: GoalProposerState,
+    ):
+        transitions_sample = goal_proposer_state.transitions_sample
+        critic_params = goal_proposer_state.critic_params
+        full_params = reconstruct_full_critic_params(critic_params)
+ 
+        # transitions_sample shapes:
+        #   observation: (num_envs_buf, episode_length, obs_size)
+        #   action:      (num_envs_buf, episode_length, action_size)
+        #   traj_id:     (num_envs_buf, episode_length)
+        num_envs_buf = transitions_sample.observation.shape[0]
+        episode_length = transitions_sample.observation.shape[1]
+        all_traj_ids = transitions_sample.extras["state_extras"]["traj_id"]
+ 
+        # ── 1. Sample num_candidates (env_idx, t) anchor pairs ───────────────
+        # Only these num_candidates locations will ever be touched — no full
+        # buffer materialisation.
+        rng, env_rng, t_rng, fb_rng = jax.random.split(rng, 4)
+        env_indices = jax.random.randint(env_rng, (num_candidates,), 0, num_envs_buf)
+        t_indices   = jax.random.randint(t_rng,   (num_candidates,), 0, episode_length - 1)
+        triple_keys = jax.random.split(fb_rng, num_candidates)
+ 
+        # ── 2. Geometric future-state sampling — only num_candidates calls ────
+        # vmap over the num_candidates anchor pairs; each call accesses one row
+        # of the buffer (one env trajectory) and samples one future timestep.
+        anchor_obs, anchor_acts = jax.vmap(
+            lambda env_idx, t, key: geometric_sample_one_triple(
+                discounting, state_size, goal_idx_array,
+                transitions_sample.observation,
+                transitions_sample.action,
+                all_traj_ids,
+                env_idx, t, key,
+            )
+        )(env_indices, t_indices, triple_keys)
+        # anchor_obs:  (K, obs_size)   where obs = [state_t, geom-sampled goal]
+        # anchor_acts: (K, action_size)
+ 
+        candidate_goals = anchor_obs[:, state_size:]   # (K, goal_dim)
+ 
+        # ── 3. MinLSE score for each candidate goal ───────────────────────────
+        # Each triple (s_i, a_i, g_i) is already matched by geometric sampling:
+        # g_i ~ p^π(sf | s_i, a_i). So f(s_i, a_i, g_i) is the critic's
+        # reachability estimate for that specific pair.
+        #
+        # Score = critic value on the matched triple. argmin finds the goal g_i
+        # that is hardest to reach from its anchor (s_i, a_i) — the frontier.
+        #
+        # This is a single forward pass of size K (vs the O(K²) cost of scoring
+        # every g against every anchor).
+        q_vals = critic.apply(full_params, anchor_obs, anchor_acts)  # (K, n_critics)
+        scores = jnp.mean(q_vals, axis=-1)                           # (K,)
+ 
+        # ── 4. Select the hardest (lowest MinLSE score) goal ─────────────────
+        best_idx = jnp.argmin(scores)
+        selected_goal = candidate_goals[best_idx]  # (goal_dim,)
+ 
+        # ── 5. Build log_data for visualization ──────────────────────────────
+        first_obs_position = start_obs[:state_size][goal_idx_array]
+        log_data = {
+            "candidate_goals":    candidate_goals,    # (K, goal_dim)
+            "first_obs_position": first_obs_position, # (goal_dim,)
+            "minlse_scores":      scores,             # (K,)
+            "selected_goal":      selected_goal,      # (goal_dim,)
+        }
+ 
+        return selected_goal, goal_proposer_state, log_data
+ 
     return propose_goal
 
 

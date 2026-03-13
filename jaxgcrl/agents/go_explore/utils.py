@@ -400,3 +400,52 @@ def sample_trajectory_sequences(
         return current_buffer_state, np.array([]).reshape(0, 8, 2), np.array([]).reshape(0, 2)
     
     return current_buffer_state, np.array(trajectory_states), np.array(trajectory_goals)
+
+
+def geometric_sample_one_triple(
+    gamma, state_size, goal_idx_array, all_obs, all_acts, all_traj_ids, env_idx, t, key
+):
+    """
+    Sample a single (s_t, a_t, g_{t+k}) triple from a pre-sampled buffer.
+ 
+    Given a specific (env_idx, t), samples a future timestep t' > t with
+    probability proportional to γ^(t'-t) within the same trajectory, then
+    returns obs = [state_t, goal_{t'}] and action_t.
+ 
+    Args:
+        gamma:           Discount factor.
+        state_size:      Elements in the state portion of obs.
+        goal_idx_array:  JAX array of indices selecting goal dims from state.
+        all_obs:         (num_envs, episode_length, obs_size) full buffer obs.
+        all_acts:        (num_envs, episode_length, action_size) full buffer acts.
+        all_traj_ids:    (num_envs, episode_length) trajectory IDs.
+        env_idx:         Scalar int — which env to draw from.
+        t:               Scalar int — which anchor timestep.
+        key:             JAX random key.
+ 
+    Returns:
+        obs:    (obs_size,)    [state_t, geom-sampled goal]
+        action: (action_size,)
+    """
+    ep_len = all_obs.shape[1]
+    arrangement = jnp.arange(ep_len)
+ 
+    traj_obs  = all_obs[env_idx]       # (ep_len, obs_size)
+    traj_acts = all_acts[env_idx]      # (ep_len, action_size)
+    traj_ids  = all_traj_ids[env_idx]  # (ep_len,)
+ 
+    # Geometric weights: only future steps in the same trajectory
+    is_future  = (arrangement > t).astype(jnp.float32)
+    discount   = gamma ** (arrangement - t).astype(jnp.float32)
+    same_traj  = jnp.equal(traj_ids, traj_ids[t]).astype(jnp.float32)
+    probs      = is_future * discount * same_traj
+    # Fallback: if no valid future (e.g. last step), self-sample
+    probs      = probs + (arrangement == t).astype(jnp.float32) * 1e-5
+ 
+    future_t  = jax.random.categorical(key, jnp.log(probs))  # scalar
+    state     = traj_obs[t, :state_size]                      # (state_size,)
+    goal      = traj_obs[future_t, :state_size][goal_idx_array]  # (goal_dim,)
+    obs       = jnp.concatenate([state, goal])                # (obs_size,)
+    action    = traj_acts[t]                                  # (action_size,)
+ 
+    return obs, action

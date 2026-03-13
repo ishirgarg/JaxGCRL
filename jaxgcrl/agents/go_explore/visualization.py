@@ -473,6 +473,15 @@ def handle_goal_proposer_visualization(
             y_bounds,
             selected_goal,
         )
+    elif goal_proposer_name == "ucgr":
+        visualize_ucgr_candidates(
+            candidate_goals=log_data["candidate_goals"],
+            first_obs_position=log_data["first_obs_position"],
+            minlse_scores=log_data["minlse_scores"],
+            selected_goal=log_data["selected_goal"],
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+        )
     # Add more goal proposer visualizations here as needed
 
 
@@ -616,4 +625,136 @@ def visualize_q_epistemic_candidates(
     
     # Log to wandb
     wandb.log({"q_epistemic_candidates": wandb.Image(fig)})
+    plt.close(fig)
+
+def visualize_ucgr_candidates(
+    candidate_goals: np.ndarray,
+    first_obs_position: np.ndarray,
+    minlse_scores: np.ndarray,
+    selected_goal: np.ndarray,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+) -> None:
+    """
+    Visualize UCGR goal-proposer candidates coloured by their MinLSE score.
+
+    Two side-by-side panels:
+    - Left:  candidates coloured by raw MinLSE score (lower = harder = frontier).
+             Cool colours → hard; warm colours → easy.  Selected goal marked in lime.
+    - Right: candidates coloured by normalised *difficulty* (1 − normalised score),
+             so the selected (hardest) goal is the brightest point.  Useful for
+             seeing at a glance where the frontier of the agent's capability lies.
+
+    Both panels also show the agent's start position as a red star.
+
+    Args:
+        candidate_goals:    (num_candidates, 2) [x, y] positions of candidate goals.
+        first_obs_position: (2,) [x, y] of the agent's start position this step.
+        minlse_scores:      (num_candidates,) MinLSE reachability score per candidate.
+                            Lower score → harder to reach → more useful for training.
+        selected_goal:      (2,) [x, y] of the chosen (lowest-score) goal.
+        x_bounds:           [x_min, x_max] for the environment.
+        y_bounds:           [y_min, y_max] for the environment.
+    """
+    # ── Ensure plain numpy ───────────────────────────────────────────────────
+    candidate_goals    = np.asarray(candidate_goals)
+    first_obs_position = np.asarray(first_obs_position)
+    minlse_scores      = np.asarray(minlse_scores)
+    selected_goal      = np.asarray(selected_goal)
+    x_bounds           = np.asarray(x_bounds)
+    y_bounds           = np.asarray(y_bounds)
+
+    x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
+    y_min, y_max = float(y_bounds[0]), float(y_bounds[1])
+
+    # ── Normalised difficulty (inverted score, 0-1) ──────────────────────────
+    score_min, score_max = minlse_scores.min(), minlse_scores.max()
+    score_range = score_max - score_min
+    if score_range > 0:
+        # difficulty ∈ [0, 1]; 1 = hardest (lowest MinLSE score)
+        difficulty = 1.0 - (minlse_scores - score_min) / score_range
+    else:
+        difficulty = np.ones_like(minlse_scores) * 0.5
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+
+    # ── Shared helper ────────────────────────────────────────────────────────
+    def _setup_ax(ax, title):
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_xlabel("X Position", fontsize=12)
+        ax.set_ylabel("Y Position", fontsize=12)
+        ax.set_title(title, fontsize=14, fontweight="bold")
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect("equal", adjustable="box")
+
+    # ── Left panel: raw MinLSE score (cool = hard, warm = easy) ─────────────
+    if len(candidate_goals) > 0:
+        sc1 = ax1.scatter(
+            candidate_goals[:, 0],
+            candidate_goals[:, 1],
+            c=minlse_scores,
+            cmap="coolwarm_r",   # reversed: blue (cool) = low score = hard
+            s=50,
+            alpha=0.75,
+            edgecolors="black",
+            linewidths=0.4,
+            zorder=5,
+        )
+        cb1 = plt.colorbar(sc1, ax=ax1)
+        cb1.set_label("MinLSE Score  (↓ harder to reach)", fontsize=10)
+
+    # Start position
+    ax1.scatter(
+        first_obs_position[0], first_obs_position[1],
+        c="red", s=120, marker="*",
+        edgecolors="black", linewidths=1.5,
+        label="Start obs", zorder=10,
+    )
+    # Selected goal
+    ax1.scatter(
+        selected_goal[0], selected_goal[1],
+        c="lime", s=180, marker="X",
+        edgecolors="black", linewidths=1.5,
+        label="Selected goal (hardest)", zorder=11,
+    )
+    _setup_ax(ax1, "UCGR Candidates — MinLSE Score")
+    ax1.legend(fontsize=10, loc="best")
+
+    # ── Right panel: normalised difficulty (bright = hardest) ────────────────
+    if len(candidate_goals) > 0:
+        sc2 = ax2.scatter(
+            candidate_goals[:, 0],
+            candidate_goals[:, 1],
+            c=difficulty,
+            cmap="plasma",
+            vmin=0.0, vmax=1.0,
+            s=50,
+            alpha=0.75,
+            edgecolors="black",
+            linewidths=0.4,
+            zorder=5,
+        )
+        cb2 = plt.colorbar(sc2, ax=ax2)
+        cb2.set_label("Normalised Difficulty  (↑ harder)", fontsize=10)
+
+    # Start position
+    ax2.scatter(
+        first_obs_position[0], first_obs_position[1],
+        c="red", s=120, marker="*",
+        edgecolors="black", linewidths=1.5,
+        label="Start obs", zorder=10,
+    )
+    # Selected goal
+    ax2.scatter(
+        selected_goal[0], selected_goal[1],
+        c="lime", s=180, marker="X",
+        edgecolors="black", linewidths=1.5,
+        label="Selected goal (hardest)", zorder=11,
+    )
+    _setup_ax(ax2, "UCGR Candidates — Normalised Difficulty")
+    ax2.legend(fontsize=10, loc="best")
+
+    plt.tight_layout()
+    wandb.log({"ucgr_candidates": wandb.Image(fig)})
     plt.close(fig)
