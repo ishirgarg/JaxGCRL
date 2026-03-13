@@ -114,10 +114,14 @@ def find_goals(structure, size_scaling):
 def make_maze(maze_layout_name, maze_size_scaling):
     if maze_layout_name == "u_maze":
         maze_layout = U_MAZE
+    elif maze_layout_name == "u_maze_hard":
+        maze_layout = U_MAZE_HARD
     elif maze_layout_name == "u_maze_eval":
         maze_layout = U_MAZE_EVAL
     elif maze_layout_name == "big_maze":
         maze_layout = BIG_MAZE
+    elif maze_layout_name == "big_maze_hard":
+        maze_layout = BIG_MAZE_HARD
     elif maze_layout_name == "big_maze_eval":
         maze_layout = BIG_MAZE_EVAL
     elif maze_layout_name == "hardest_maze":
