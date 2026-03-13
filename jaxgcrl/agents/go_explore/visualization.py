@@ -462,7 +462,7 @@ def handle_goal_proposer_visualization(
         first_obs_position = log_data["first_obs_position"]
         q_means = log_data["q_means"]
         q_stds = log_data["q_stds"]
-        selected_goal = log_data.get("selected_goal", None)
+        selected_goal = log_data.get("selected_goal")
 
         visualize_q_epistemic_candidates(
             candidate_goals,
@@ -471,7 +471,7 @@ def handle_goal_proposer_visualization(
             q_stds,
             x_bounds,
             y_bounds,
-            selected_goal=selected_goal,
+            selected_goal,
         )
     # Add more goal proposer visualizations here as needed
 
@@ -483,7 +483,7 @@ def visualize_q_epistemic_candidates(
     q_stds: np.ndarray,
     x_bounds: np.ndarray,
     y_bounds: np.ndarray,
-    selected_goal: Optional[np.ndarray] = None,
+    selected_goal: np.ndarray,
 ) -> None:
     """
     Visualize Q-epistemic goal proposer candidates with mean and std Q-values.
