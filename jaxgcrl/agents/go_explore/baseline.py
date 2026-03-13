@@ -26,6 +26,7 @@ from jaxgcrl.envs.wrappers import (
 )
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
+from jaxgcrl.agents.go_explore.visualization import handle_goal_proposer_visualization
 
 from .types import Actor, Critic, TrainingState, Transition, GoalProposerState
 from .algorithms import get_algorithm
@@ -75,7 +76,7 @@ class Baseline:
     repr_dim: int = 64
 
     # layer norm
-    use_ln: bool = True
+    use_ln: bool = True # NOTE: for CRL we don't apply layer norm to the actor regardless
 
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
@@ -349,16 +350,39 @@ class Baseline:
             
             # Propose new goals if we've reached the threshold
             def propose_new_goals(env_state, key, info, experience_count, goal_proposer_state):
-                # Generate rng keys for goal proposer
-                goal_keys = jax.random.split(key, num_envs)
+                # Split key: one for selecting viz env, one for goal proposer keys
+                viz_key, goal_key = jax.random.split(key)
+                # Randomly select one environment for visualization
+                viz_env_idx = jax.random.randint(viz_key, (), 0, num_envs)
+                goal_keys = jax.random.split(goal_key, num_envs)
                 first_obs = info['first_obs']
                 # Call goal proposer to get new goals (vmapped over envs)
-                # Only extract goals from the result, keep state unchanged since it's shared
                 def propose_single_goal(rng_key, obs, state):
-                    goal, _ = goal_proposer(rng_key, obs, state)
-                    return goal
-                new_goals = jax.vmap(propose_single_goal, in_axes=(0, 0, None))(goal_keys, first_obs, goal_proposer_state)
+                    goal, updated_state, log_data = goal_proposer(rng_key, obs, state)
+                    return goal, log_data
+                
+                new_goals, log_data_tree = jax.vmap(
+                    propose_single_goal, in_axes=(0, 0, None)
+                )(goal_keys, first_obs, goal_proposer_state)
                 info['proposed_goals'] = new_goals
+                
+                # Log visualization using io_callback (select one environment's log_data)
+                # Capture goal_proposer_name from closure (static value, not traced)
+                def log_visualization(log_data_tree_np, viz_idx):
+                    selected_log_data = {}
+                    for key, value in log_data_tree_np.items():
+                        selected_log_data[key] = value[viz_idx]
+                    handle_goal_proposer_visualization(selected_log_data, self.goal_proposer_name, unwrapped_env.x_bounds, unwrapped_env.y_bounds)
+                    return jnp.array(0, dtype=jnp.int32)
+                
+                # Use io_callback to log visualization
+                jax.experimental.io_callback(
+                    log_visualization,
+                    jnp.array(0, dtype=jnp.int32),
+                    log_data_tree,
+                    viz_env_idx
+                )
+                
                 # Reset counter to 0 after proposing new goals
                 updated_experience_count = jnp.array(0, dtype=jnp.int32)
                 # Return the same goal_proposer_state (it's updated elsewhere with new transitions_sample)

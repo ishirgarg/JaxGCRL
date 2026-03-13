@@ -57,7 +57,7 @@ class RunConfig:
     action_repeat: int = 1
 
     # total number of evals during training
-    num_evals: int = 200
+    num_evals: int = 100
 
     seed: int = 0
     backend: Optional[Literal["mjx", "spring", "positional", "generalized"]] = None

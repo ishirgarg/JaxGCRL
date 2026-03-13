@@ -429,7 +429,7 @@ def get_algorithm(agent_type: str, **kwargs):
             network_depth=kwargs.get("n_hidden", 4),
             skip_connections=kwargs.get("skip_connections", 0),
             use_relu=kwargs.get("use_relu", False),
-            use_ln=kwargs.get("use_ln", True),
+            use_ln=False,
             discounting=kwargs.get("discounting", 0.99),
             state_size=kwargs.get("state_size"),
             goal_indices=kwargs.get("goal_indices"),

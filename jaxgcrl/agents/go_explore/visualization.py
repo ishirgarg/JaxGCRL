@@ -435,3 +435,185 @@ def all_visualizations(
     plt.close(fig)
     
     return buffer_state
+
+
+def handle_goal_proposer_visualization(
+    log_data: dict,
+    goal_proposer_name: str,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+) -> None:
+    """
+    Generic handler for goal proposer visualization.
+    Dispatches to appropriate visualization function based on goal_proposer_name.
+    
+    Args:
+        log_data: Dictionary with visualization data from goal proposer
+        goal_proposer_name: Name of the goal proposer (e.g., "q_epistemic", "rb")
+        x_bounds: Environment x bounds [x_min, x_max]
+        y_bounds: Environment y bounds [y_min, y_max]
+    """
+    if not log_data:  # Empty dict means no visualization
+        return
+    
+    if goal_proposer_name == "q_epistemic":
+        # Extract data for q_epistemic visualization
+        candidate_goals = log_data["candidate_goals"]
+        first_obs_position = log_data["first_obs_position"]
+        q_means = log_data["q_means"]
+        q_stds = log_data["q_stds"]
+        selected_goal = log_data.get("selected_goal", None)
+
+        visualize_q_epistemic_candidates(
+            candidate_goals,
+            first_obs_position,
+            q_means,
+            q_stds,
+            x_bounds,
+            y_bounds,
+            selected_goal=selected_goal,
+        )
+    # Add more goal proposer visualizations here as needed
+
+
+def visualize_q_epistemic_candidates(
+    candidate_goals: np.ndarray,
+    first_obs_position: np.ndarray,
+    q_means: np.ndarray,
+    q_stds: np.ndarray,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+    selected_goal: Optional[np.ndarray] = None,
+) -> None:
+    """
+    Visualize Q-epistemic goal proposer candidates with mean and std Q-values.
+    
+    Creates two plots side by side:
+    - Left: candidate states and first observation colored by mean Q-value
+    - Right: candidate states and first observation colored by std Q-value
+    
+    Args:
+        candidate_goals: (num_candidates, 2) array of [x, y] candidate goal positions
+        first_obs_position: (2,) array of [x, y] position from first observation
+        q_means: (num_candidates,) array of mean Q-values for each candidate
+        q_stds: (num_candidates,) array of std Q-values for each candidate
+        x_bounds: [x_min, x_max] bounds for x-axis
+        y_bounds: [y_min, y_max] bounds for y-axis
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+
+    # Ensure numpy arrays
+    candidate_goals = np.asarray(candidate_goals)
+    first_obs_position = np.asarray(first_obs_position)
+    q_means = np.asarray(q_means)
+    q_stds = np.asarray(q_stds)
+    x_bounds = np.asarray(x_bounds)
+    y_bounds = np.asarray(y_bounds)
+    selected_goal = np.asarray(selected_goal)
+
+    x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
+    y_min, y_max = float(y_bounds[0]), float(y_bounds[1])
+    
+    # Left plot: colored by mean Q-value
+    if len(candidate_goals) > 0:
+        scatter1 = ax1.scatter(
+            candidate_goals[:, 0],
+            candidate_goals[:, 1],
+            c=q_means,
+            cmap='viridis',
+            s=50,
+            alpha=0.7,
+            edgecolors='black',
+            linewidths=0.5,
+        )
+        plt.colorbar(scatter1, ax=ax1, label='Mean Q-value')
+    
+    # Plot first observation position
+    ax1.scatter(
+        first_obs_position[0],
+        first_obs_position[1],
+        c='red',
+        s=100,
+        marker='*',
+        edgecolors='black',
+        linewidths=1.5,
+        label='First Observation',
+        zorder=10,
+    )
+    
+    ax1.set_xlim(x_min, x_max)
+    ax1.set_ylim(y_min, y_max)
+    ax1.set_xlabel('X Position', fontsize=12)
+    ax1.set_ylabel('Y Position', fontsize=12)
+    ax1.set_title('Q-Epistemic Candidates (Mean Q-value)', fontsize=14, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_aspect('equal', adjustable='box')
+    ax1.legend()
+    
+    ax1.scatter(
+        selected_goal[0],
+        selected_goal[1],
+        c="lime",
+        s=150,
+        marker="X",
+        edgecolors="black",
+        linewidths=1.5,
+        label="Selected Goal",
+        zorder=11,
+    )
+
+    # Right plot: colored by std Q-value
+    if len(candidate_goals) > 0:
+        scatter2 = ax2.scatter(
+            candidate_goals[:, 0],
+            candidate_goals[:, 1],
+            c=q_stds,
+            cmap='plasma',
+            s=50,
+            alpha=0.7,
+            edgecolors='black',
+            linewidths=0.5,
+        )
+        plt.colorbar(scatter2, ax=ax2, label='Std Q-value')
+    
+    # Plot first observation position
+    ax2.scatter(
+        first_obs_position[0],
+        first_obs_position[1],
+        c='red',
+        s=100,
+        marker='*',
+        edgecolors='black',
+        linewidths=1.5,
+        label='First Observation',
+        zorder=10,
+    )
+    
+    # Optionally plot selected goal on right subplot
+    if selected_goal is not None and selected_goal.size > 0:
+        ax2.scatter(
+            selected_goal[0],
+            selected_goal[1],
+            c="lime",
+            s=150,
+            marker="X",
+            edgecolors="black",
+            linewidths=1.5,
+            label="Selected Goal",
+            zorder=11,
+        )
+
+    ax2.set_xlim(x_min, x_max)
+    ax2.set_ylim(y_min, y_max)
+    ax2.set_xlabel('X Position', fontsize=12)
+    ax2.set_ylabel('Y Position', fontsize=12)
+    ax2.set_title('Q-Epistemic Candidates (Std Q-value)', fontsize=14, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_aspect('equal', adjustable='box')
+    ax2.legend()
+    
+    plt.tight_layout()
+    
+    # Log to wandb
+    wandb.log({"q_epistemic_candidates": wandb.Image(fig)})
+    plt.close(fig)
