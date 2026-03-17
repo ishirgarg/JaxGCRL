@@ -273,6 +273,7 @@ class GoExploreWrapper(Wrapper):
         state.info['first_pipeline_state'] = state.pipeline_state
         state.info['first_obs']           = state.obs
         state.info['explore_first_obs']   = state.obs
+        state.info['pre_reset_obs']       = state.obs  # pre-GoExploreWrapper-reset next obs
         state.info['traj_id']             = jnp.zeros(num_envs, dtype=jnp.float32)
         state.info['proposed_goals']      = go_goal
         return state
@@ -399,5 +400,6 @@ class GoExploreWrapper(Wrapper):
         info['first_obs']           = new_first_obs
         info['first_pipeline_state'] = first_ps
         info['proposed_goals']      = proposed_goals
+        info['pre_reset_obs']       = nstate.obs
 
         return nstate.replace(pipeline_state=reset_pipeline_state, obs=reset_obs, info=info)

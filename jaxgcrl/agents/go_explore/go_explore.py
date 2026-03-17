@@ -48,7 +48,7 @@ from .utils import (
     create_dummy_transition_for_goal_proposer,
 )
 from .losses import update_alpha_sac, update_critic_sac, update_actor_sac
-from .visualization import all_visualizations
+from .visualization import all_visualizations, visualize_go_explore_phases
 from .goal_proposers import (
     create_goal_proposer,
     create_random_env_goals_proposer,
@@ -380,6 +380,7 @@ class GoExplore:
 
             nstate = env.step(env_state, actions, env_rng)
             state_extras = {x: nstate.info[x] for x in extra_fields}
+            state_extras['phase'] = phase
 
             # ── Compute explore reward (every step; zeroed for go phase) ──────
             full_gcp_critic_params = reconstruct_full_critic_params(
@@ -387,12 +388,13 @@ class GoExplore:
             )
             explore_first_obs = env_state.info['explore_first_obs']  # (num_envs, obs_size)
 
+            pre_reset_next_obs = nstate.info['pre_reset_obs']  # (num_envs, obs_size)
             reward_keys = jax.random.split(reward_key, config.num_envs)
             explore_rewards = jax.vmap(
                 lambda fo, co, rk: explore_reward_fn(
                     fo, co, training_state.actor_state.params, full_gcp_critic_params, rk
                 )
-            )(explore_first_obs, nstate.obs, reward_keys)  # (num_envs,)
+            )(explore_first_obs, pre_reset_next_obs, reward_keys)  # (num_envs,)
 
             # Use explore reward only in explore phase
             in_explore  = (phase == 1)
@@ -575,15 +577,10 @@ class GoExplore:
             # next_observation is always stored (actor_step always fills it).
             state_obs      = transitions.observation[:, :state_size]
             next_state_obs = transitions.next_observation[:, :state_size]
-            # Zero out go-phase rewards/discounts so they don't confuse the critic
-            masked_reward   = transitions.reward   * explore_mask
-            masked_discount = transitions.discount * explore_mask
-
+           
             explore_transitions = transitions._replace(
                 observation=state_obs,
                 next_observation=next_state_obs,
-                reward=masked_reward,
-                discount=masked_discount,
             )
 
             # Build a temporary TrainingState that has explore states in the
@@ -604,6 +601,7 @@ class GoExplore:
                 target_entropy=target_entropy,
                 state_size=state_size,
                 action_size=action_size,
+                sample_weights=explore_mask,
             )
             explore_networks = dict(actor=explore_actor, critic=explore_critic)
 
@@ -808,6 +806,15 @@ class GoExplore:
                     state_size=state_size,
                     goal_indices=tuple(train_env.goal_indices),
                     rng_key=viz_key,
+                )
+                # Separate Go Explore phase breakdown plot
+                _, phase_transitions = replay_buffer.sample(buffer_state)
+                visualize_go_explore_phases(
+                    phase_transitions,
+                    unwrapped_env.x_bounds,
+                    unwrapped_env.y_bounds,
+                    state_size=state_size,
+                    goal_indices=tuple(train_env.goal_indices),
                 )
                 last_visualization_step = current_step
 

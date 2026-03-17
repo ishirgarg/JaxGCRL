@@ -433,8 +433,162 @@ def all_visualizations(
     
     wandb.log({"trajectory_visualization": wandb.Image(fig)})
     plt.close(fig)
-    
+
     return buffer_state
+
+
+def visualize_go_explore_phases(
+    transitions: Any,
+    x_bounds: jnp.ndarray,
+    y_bounds: jnp.ndarray,
+    state_size: int,
+    goal_indices: Tuple[int, ...],
+    num_pairs: int = 4,
+) -> None:
+    # ── 1. Flatten buffer sample ──────────────────────────────────────────────
+    obs_flat      = np.array(jnp.reshape(transitions.observation,
+                                         (-1, transitions.observation.shape[-1])))
+    phase_flat    = np.array(jnp.reshape(transitions.extras["state_extras"]["phase"], (-1,)))
+    traj_id_flat  = np.array(jnp.reshape(transitions.extras["state_extras"]["traj_id"], (-1,)))
+    trunc_flat    = np.array(jnp.reshape(transitions.extras["state_extras"]["truncation"], (-1,)))
+
+    goal_idx_list = list(goal_indices)
+    positions     = obs_flat[:, :state_size][:, goal_idx_list]        # (N, 2)
+    goals         = obs_flat[:, state_size:][:, :len(goal_idx_list)]  # (N, 2)
+
+    go_mask      = phase_flat == 0
+    explore_mask = phase_flat == 1
+
+    go_pos      = positions[go_mask]
+    explore_pos = positions[explore_mask]
+    go_goals    = goals[go_mask]
+
+    x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
+    y_min, y_max = float(y_bounds[0]), float(y_bounds[1])
+
+    # ── 2. Find paired (go traj N, explore traj N+1) ─────────────────────────
+    # GoExploreWrapper increments traj_id by +1 on go→explore, so the explore
+    # sub-trajectory immediately following go traj N has traj_id = N+1.
+    def _traj_positions(traj_id):
+        mask = traj_id_flat == traj_id
+        return positions[mask], trunc_flat[mask]
+
+    go_traj_ids = np.unique(traj_id_flat[go_mask])
+    pairs = []          # list of (go_positions, explore_positions, go_goal)
+    for go_tid in go_traj_ids:
+        exp_tid = go_tid + 1.0
+        if not np.any(traj_id_flat == exp_tid):
+            continue
+        gp, gtrunc = _traj_positions(go_tid)
+        ep, _      = _traj_positions(exp_tid)
+        if len(gp) == 0 or len(ep) == 0:
+            continue
+        # Goal is constant within go traj; take the first
+        gg = goals[go_mask][traj_id_flat[go_mask] == go_tid][0]
+        pairs.append((gp, ep, gg))
+        if len(pairs) >= num_pairs:
+            break
+
+    # ── 3. Build figure ───────────────────────────────────────────────────────
+    n_detail = max(1, len(pairs))
+    fig = plt.figure(figsize=(18, 6 + 5 * ((n_detail + 1) // 2)))
+    top_gs   = fig.add_gridspec(2, 1, hspace=0.45)
+    top_row  = top_gs[0].subgridspec(1, 3, wspace=0.3)
+    bot_row  = top_gs[1].subgridspec((n_detail + 1) // 2, 2, hspace=0.4, wspace=0.3)
+
+    def _setup(ax, title):
+        ax.set_xlim(x_min, x_max); ax.set_ylim(y_min, y_max)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.3)
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        ax.set_xlabel("X"); ax.set_ylabel("Y")
+
+    # ── Row 0, col 0: go-phase positions with goal markers ───────────────────
+    ax0 = fig.add_subplot(top_row[0, 0])
+    if len(go_pos) > 0:
+        ax0.scatter(go_pos[:, 0], go_pos[:, 1],
+                    s=1, alpha=0.3, c="steelblue", label="Go states")
+        # Sub-sample goals to avoid overplotting
+        step = max(1, len(go_goals) // 200)
+        ax0.scatter(go_goals[::step, 0], go_goals[::step, 1],
+                    s=15, alpha=0.5, c="gold", marker="*",
+                    edgecolors="darkorange", linewidths=0.4, label="Goals", zorder=5)
+    _setup(ax0, f"Go phase — states (n={len(go_pos)})")
+    ax0.legend(fontsize=7, loc="upper right")
+
+    # ── Row 0, col 1: explore-phase KDE heatmap ──────────────────────────────
+    ax1 = fig.add_subplot(top_row[0, 1])
+    plot_positions_with_heatmap(
+        explore_pos, x_bounds, y_bounds,
+        title=f"Explore phase — states (n={len(explore_pos)})",
+        ax=ax1, alpha_points=0.2, alpha_heatmap=0.55, point_size=0.5,
+    )
+
+    # ── Row 0, col 2: explore reach vs go goal (final explore pos per pair) ──
+    ax2 = fig.add_subplot(top_row[0, 2])
+    if pairs:
+        final_exp  = np.array([p[1][-1] for p in pairs])
+        pair_goals = np.array([p[2] for p in pairs])
+        ax2.scatter(pair_goals[:, 0], pair_goals[:, 1],
+                    s=60, c="gold", marker="*",
+                    edgecolors="darkorange", linewidths=0.8,
+                    label="Go goal", zorder=6)
+        ax2.scatter(final_exp[:, 0], final_exp[:, 1],
+                    s=40, c="tomato", marker="D",
+                    edgecolors="darkred", linewidths=0.8,
+                    label="Explore end", zorder=6)
+        for gp_pt, ep_pt in zip(pair_goals, final_exp):
+            ax2.annotate("", xy=ep_pt, xytext=gp_pt,
+                         arrowprops=dict(arrowstyle="->", color="gray",
+                                         lw=0.8, alpha=0.6))
+    _setup(ax2, "Explore reach vs. go goal")
+    ax2.legend(fontsize=7, loc="upper right")
+
+    # ── Row 1: paired trajectory detail ──────────────────────────────────────
+    colors_go      = plt.cm.Blues(np.linspace(0.55, 0.9, max(len(pairs), 1)))
+    colors_explore = plt.cm.Oranges(np.linspace(0.55, 0.9, max(len(pairs), 1)))
+
+    for k, (gp, ep, gg) in enumerate(pairs):
+        row_k, col_k = k // 2, k % 2
+        ax = fig.add_subplot(bot_row[row_k, col_k])
+
+        # Go-phase path
+        ax.plot(gp[:, 0], gp[:, 1], "-o", color=colors_go[k],
+                linewidth=1.5, markersize=3, alpha=0.8, label="Go")
+        ax.plot(*gp[0],  "o", color=colors_go[k],
+                markersize=8, markeredgecolor="black", markeredgewidth=1.2)
+
+        # Explore-phase path
+        ax.plot(ep[:, 0], ep[:, 1], "-o", color=colors_explore[k],
+                linewidth=1.5, markersize=3, alpha=0.8, label="Explore")
+        ax.plot(*ep[-1], "s", color=colors_explore[k],
+                markersize=8, markeredgecolor="black", markeredgewidth=1.2)
+
+        # Goal
+        ax.plot(*gg, "*", color="gold", markersize=12,
+                markeredgecolor="darkorange", markeredgewidth=1, label="Goal", zorder=7)
+
+        # Dashed connector: final go state → proposed goal (shows residual gap)
+        ax.plot([gp[-1, 0], gg[0]], [gp[-1, 1], gg[1]],
+                "--", color="gray", linewidth=1, alpha=0.6)
+
+        # Title: show which go traj_id this pair belongs to
+        go_tid_label = int(go_traj_ids[k]) if k < len(go_traj_ids) else k
+        _setup(ax, f"Pair {k + 1}  (go traj_id={go_tid_label})")
+        ax.legend(fontsize=7, loc="upper right")
+
+    # Hide any unused bot-row slots
+    total_slots = ((n_detail + 1) // 2) * 2
+    for k in range(len(pairs), total_slots):
+        try:
+            fig.add_subplot(bot_row[k // 2, k % 2]).axis("off")
+        except Exception:
+            pass
+
+    plt.suptitle("Go Explore — Phase Breakdown", fontsize=13, fontweight="bold", y=1.01)
+    wandb.log({"go_explore_phase_viz": wandb.Image(fig)})
+    plt.close(fig)
+
 
 # Module-level variable to track last visualized env_steps (for go_explore only)
 _last_viz_env_steps = -1

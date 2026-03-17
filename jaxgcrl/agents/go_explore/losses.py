@@ -214,9 +214,13 @@ def update_alpha_sac(config: Dict[str, Any], networks: Dict[str, Any],
         # Original SAC: alpha_loss = -alpha * mean(log_prob + target_entropy)
         # CRITICAL: stop_gradient prevents alpha update from affecting actor params
         alpha = jnp.exp(alpha_params["log_alpha"])
-        alpha_loss = -alpha * jnp.mean(
-            jax.lax.stop_gradient(log_prob + config["target_entropy"])
-        )
+        per_sample = jax.lax.stop_gradient(log_prob + config["target_entropy"])  # (batch, 1)
+        sample_weights = config.get("sample_weights", None)
+        if sample_weights is None:
+            alpha_loss = -alpha * jnp.mean(per_sample)
+        else:
+            w = sample_weights[:, None]
+            alpha_loss = -alpha * jnp.sum(w * per_sample) / (jnp.sum(w) + 1e-8)
         return alpha_loss
     
     alpha_loss_val, alpha_grad = jax.value_and_grad(alpha_loss)(
@@ -257,7 +261,12 @@ def update_actor_sac(config: Dict[str, Any], networks: Dict[str, Any],
         q_values = critic.apply(q_params, obs, actions)
         q_value = jnp.min(q_values, axis=-1, keepdims=True)  # Min over critics
 
-        actor_loss = jnp.mean(alpha * log_prob - q_value)
+        sample_weights = config.get("sample_weights", None)
+        if sample_weights is None:
+            actor_loss = jnp.mean(alpha * log_prob - q_value)
+        else:
+            w = sample_weights[:, None]
+            actor_loss = jnp.sum(w * (alpha * log_prob - q_value)) / (jnp.sum(w) + 1e-8)
         return actor_loss, log_prob
 
     # Use OLD alpha value (before alpha update) - matching original SAC
@@ -368,7 +377,12 @@ def update_critic_sac(config: Dict[str, Any], networks: Dict[str, Any],
             q_value = q_values[:, critic_idx:critic_idx+1]  # Shape: (batch_size, 1) - only this critic's Q-value
             
             # Bellman error for this critic
-            critic_loss = jnp.mean((q_value - target_val) ** 2)
+            sample_weights = config.get("sample_weights", None)
+            if sample_weights is None:
+                critic_loss = jnp.mean((q_value - target_val) ** 2)
+            else:
+                w = sample_weights[:, None]
+                critic_loss = jnp.sum(w * (q_value - target_val) ** 2) / (jnp.sum(w) + 1e-8)
             return critic_loss
 
         # Compute loss and gradient for this critic
