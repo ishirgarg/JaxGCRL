@@ -436,12 +436,15 @@ def all_visualizations(
     
     return buffer_state
 
+# Module-level variable to track last visualized env_steps (for go_explore only)
+_last_viz_env_steps = -1
 
 def handle_goal_proposer_visualization(
     log_data: dict,
     goal_proposer_name: str,
     x_bounds: np.ndarray,
     y_bounds: np.ndarray,
+    env_steps: int = -1,
 ) -> None:
     """
     Generic handler for goal proposer visualization.
@@ -452,9 +455,18 @@ def handle_goal_proposer_visualization(
         goal_proposer_name: Name of the goal proposer (e.g., "q_epistemic", "rb")
         x_bounds: Environment x bounds [x_min, x_max]
         y_bounds: Environment y bounds [y_min, y_max]
+        env_steps: Current environment steps (for go_explore: only visualize if >= 1M steps since last)
     """
+    global _last_viz_env_steps
+    
     if not log_data:  # Empty dict means no visualization
         return
+    
+    # For go_explore: only visualize if env_steps is provided and it's been >= 1M steps since last viz
+    if env_steps >= 0:
+        if _last_viz_env_steps >= 0 and (env_steps - _last_viz_env_steps) < 1_000_000:
+            return
+        _last_viz_env_steps = env_steps
     
     if goal_proposer_name == "q_epistemic":
         # Extract data for q_epistemic visualization
@@ -479,6 +491,16 @@ def handle_goal_proposer_visualization(
             first_obs_position=log_data["first_obs_position"],
             minlse_scores=log_data["minlse_scores"],
             selected_goal=log_data["selected_goal"],
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+        )
+    elif goal_proposer_name == "max_critic_to_env":
+        visualize_max_critic_to_env_candidates(
+            candidate_goals=log_data["candidate_goals"],
+            first_obs_position=log_data["first_obs_position"],
+            q_means=log_data["q_means"],
+            env_goal=log_data["selected_goal"],
+            selected_state_goal=log_data["selected_state_goal"],
             x_bounds=x_bounds,
             y_bounds=y_bounds,
         )
@@ -626,6 +648,117 @@ def visualize_q_epistemic_candidates(
     # Log to wandb
     wandb.log({"q_epistemic_candidates": wandb.Image(fig)})
     plt.close(fig)
+
+
+def visualize_max_critic_to_env_candidates(
+    candidate_goals: np.ndarray,
+    first_obs_position: np.ndarray,
+    q_means: np.ndarray,
+    env_goal: np.ndarray,
+    selected_state_goal: np.ndarray,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+) -> None:
+    """
+    Visualize max_critic_to_env goal proposer candidates colored by mean Q-value.
+    
+    Shows:
+    - Candidate states colored by their mean Q-value (with the random env goal g)
+    - The random environment goal g (selected goal)
+    - The state that maximizes Q(w, g) (selected_state_goal)
+    - The first observation position
+    
+    Args:
+        candidate_goals: (num_candidates, 2) array of [x, y] candidate goal positions
+        first_obs_position: (2,) array of [x, y] position from first observation
+        q_means: (num_candidates,) array of mean Q-values for each candidate
+        env_goal: (2,) array of [x, y] position of the random environment goal g
+        selected_state_goal: (2,) array of [x, y] position of the state that maximizes Q
+        x_bounds: [x_min, x_max] bounds for x-axis
+        y_bounds: [y_min, y_max] bounds for y-axis
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+
+    # Ensure numpy arrays
+    candidate_goals = np.asarray(candidate_goals)
+    first_obs_position = np.asarray(first_obs_position)
+    q_means = np.asarray(q_means)
+    env_goal = np.asarray(env_goal)
+    selected_state_goal = np.asarray(selected_state_goal)
+    x_bounds = np.asarray(x_bounds)
+    y_bounds = np.asarray(y_bounds)
+
+    x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
+    y_min, y_max = float(y_bounds[0]), float(y_bounds[1])
+    
+    # Plot candidate states colored by mean Q-value
+    if len(candidate_goals) > 0:
+        scatter = ax.scatter(
+            candidate_goals[:, 0],
+            candidate_goals[:, 1],
+            c=q_means,
+            cmap='viridis',
+            s=50,
+            alpha=0.7,
+            edgecolors='black',
+            linewidths=0.5,
+        )
+        plt.colorbar(scatter, ax=ax, label='Mean Q-value')
+    
+    # Plot first observation position
+    ax.scatter(
+        first_obs_position[0],
+        first_obs_position[1],
+        c='red',
+        s=100,
+        marker='*',
+        edgecolors='black',
+        linewidths=1.5,
+        label='First Observation',
+        zorder=10,
+    )
+    
+    # Plot the random environment goal g (selected goal)
+    ax.scatter(
+        env_goal[0],
+        env_goal[1],
+        c="lime",
+        s=150,
+        marker="X",
+        edgecolors="black",
+        linewidths=1.5,
+        label="Selected Goal (Env Goal g)",
+        zorder=11,
+    )
+    
+    # Plot the state that maximizes Q(w, g)
+    ax.scatter(
+        selected_state_goal[0],
+        selected_state_goal[1],
+        c="orange",
+        s=150,
+        marker="D",
+        edgecolors="black",
+        linewidths=1.5,
+        label="Max Q State w",
+        zorder=11,
+    )
+    
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_xlabel('X Position', fontsize=12)
+    ax.set_ylabel('Y Position', fontsize=12)
+    ax.set_title('Max Critic to Env: Candidates Colored by Q(w, g)', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal', adjustable='box')
+    ax.legend()
+    
+    plt.tight_layout()
+    
+    # Log to wandb
+    wandb.log({"max_critic_to_env_candidates": wandb.Image(fig)})
+    plt.close(fig)
+
 
 def visualize_ucgr_candidates(
     candidate_goals: np.ndarray,

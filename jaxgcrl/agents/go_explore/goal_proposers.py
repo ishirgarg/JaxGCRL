@@ -54,6 +54,8 @@ def create_goal_proposer(
         return create_ucgr_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic, discounting)
     elif goal_proposer_name == "q_epistemic":
         return create_q_epistemic_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic)
+    elif goal_proposer_name == "max_critic_to_env":
+        return create_max_critic_to_env_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic)
     else:
         raise ValueError(f"Unknown goal proposer: {goal_proposer_name}")
 
@@ -162,6 +164,8 @@ def create_goal_proposer(
         return create_ucgr_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic, discounting)
     elif goal_proposer_name == "q_epistemic":
         return create_q_epistemic_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic)
+    elif goal_proposer_name == "max_critic_to_env":
+        return create_max_critic_to_env_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic)
     else:
         raise ValueError(f"Unknown goal proposer: {goal_proposer_name}")
 
@@ -417,3 +421,196 @@ def create_q_epistemic_goal_proposer(
         return selected_goal, goal_proposer_state, log_data
     
     return propose_goal
+
+
+def create_max_critic_to_env_goal_proposer(
+    env,
+    num_envs: int,
+    num_candidates: int,
+    state_size: Optional[int] = None,
+    goal_indices: Optional[tuple] = None,
+    actor: Optional[Any] = None,
+    critic: Optional[Any] = None,
+) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
+    """
+    Create a goal proposer that:
+    1. Chooses a random environment goal g
+    2. Samples num_candidates states w from the replay buffer
+    3. For each candidate state w, computes mean Q(w, g) across the critic ensemble
+    4. Selects the state w that maximizes mean Q(w, g)
+    5. Returns the random environment goal g
+    """
+    possible_goals = env.possible_goals  # Shape: (num_goals, goal_dim)
+    num_goals = possible_goals.shape[0]  # Use .shape[0] for JIT compatibility
+    
+    def propose_goal(rng: jax.Array, start_obs: jnp.ndarray, goal_proposer_state: GoalProposerState):
+        # Extract required data from goal proposer state
+        transitions_sample = goal_proposer_state.transitions_sample
+        actor_params = goal_proposer_state.actor_params
+        critic_params = goal_proposer_state.critic_params
+        
+        # Sample a random environment goal g
+        rng, goal_rng = jax.random.split(rng)
+        goal_idx = jax.random.randint(goal_rng, (), 0, num_goals)
+        env_goal = possible_goals[goal_idx]  # Shape: (goal_dim,)
+        
+        # Sample num_candidates states w from the replay buffer
+        obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
+        states = obs_flat[:, :state_size]  # (N, state_size)
+        
+        num_states = states.shape[0]
+        rng, sample_rng = jax.random.split(rng)
+        candidate_indices = jax.random.randint(sample_rng, (num_candidates,), 0, num_states)
+        candidate_states = states[candidate_indices]  # (num_candidates, state_size)
+        
+        # Reconstruct full critic params using utility function
+        full_critic_params = reconstruct_full_critic_params(critic_params)
+        
+        # For each candidate state w, compute mean Q(w, g)
+        def compute_mean_q_for_state(candidate_state, rng_key):
+            """Compute mean Q-value for a single candidate state w with goal g."""
+            # Construct observation: obs = [w, g] where w is candidate_state and g is env_goal
+            obs = jnp.concatenate([candidate_state, env_goal], axis=-1)  # Shape: (obs_size,)
+            
+            # Sample action deterministically from policy
+            rng_key, action_key = jax.random.split(rng_key)
+            action = actor.sample_actions(
+                actor_params,
+                obs[None, :],  # Add batch dimension: (1, obs_size)
+                action_key,
+                is_deterministic=True
+            )  # Shape: (1, action_size)
+            action = action[0]  # Remove batch dimension: (action_size,)
+            
+            # Compute Q-values using critic
+            q_values = critic.apply(
+                full_critic_params,
+                obs[None, :],  # Add batch dimension: (1, obs_size)
+                action[None, :]  # Add batch dimension: (1, action_size)
+            )  # Shape: (1, n_critics)
+            q_values = q_values[0]  # Remove batch dimension: (n_critics,)
+            
+            # Compute mean across the ensemble
+            q_mean = jnp.mean(q_values)
+            
+            return q_mean
+        
+        # Compute mean Q for all candidate states
+        rng, var_rng = jax.random.split(rng)
+        var_keys = jax.random.split(var_rng, num_candidates)
+        q_means = jax.vmap(compute_mean_q_for_state)(candidate_states, var_keys)  # Shape: (num_candidates,)
+        
+        # Select state w that maximizes mean Q(w, g)
+        best_idx = jnp.argmax(q_means)
+        selected_state = candidate_states[best_idx]  # Shape: (state_size,)
+        selected_state_goal = selected_state[jnp.array(goal_indices)]  # Shape: (goal_dim,)
+        
+        # Prepare log_data dict with visualization data
+        first_obs_state = start_obs[:state_size]  # Shape: (state_size,)
+        first_obs_position = first_obs_state[jnp.array(goal_indices)]  # Shape: (goal_dim,)
+        candidate_goals = candidate_states[:, jnp.array(goal_indices)]  # (num_candidates, goal_dim)
+        
+        log_data = {
+            'candidate_goals': candidate_goals,        # (num_candidates, goal_dim)
+            'first_obs_position': first_obs_position,  # (goal_dim,)
+            'q_means': q_means,                        # (num_candidates,)
+            'selected_goal': env_goal,                 # (goal_dim,) - the random environment goal
+            'selected_state_goal': selected_state_goal, # (goal_dim,) - goal coordinates of maximizing state
+        }
+        
+        # Return the random environment goal g
+        return env_goal, goal_proposer_state, log_data
+    
+    return propose_goal
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Explore Reward Functions (for Go Explore algorithm)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def q_epistemic_reward(
+    first_obs: jnp.ndarray,
+    current_obs: jnp.ndarray,
+    gcp_actor,
+    gcp_actor_params,
+    critic,
+    full_critic_params,
+    state_size: int,
+    goal_indices,
+    rng: jax.Array,
+) -> jnp.ndarray:
+    """Compute epistemic uncertainty reward for the explore phase.
+
+    For current state ``w``, measures Q-value variance across the critic ensemble
+    when asking: "from first_obs (go-phase start state), how reachable is w?"
+
+    Args:
+        first_obs:          (obs_size,)  - Observation at start of go phase.
+        current_obs:        (obs_size,)  - Observation at current explore step.
+        gcp_actor:          Goal-conditioned policy object.
+        gcp_actor_params:   Params for the GCP actor.
+        critic:             Critic object with ``apply(params, obs, action) -> (n_critics,)``.
+        full_critic_params: Reconstructed full critic params dict.
+        state_size:         Number of elements in the state portion of obs.
+        goal_indices:       Array of indices selecting goal dims from state.
+        rng:                JAX random key.
+
+    Returns:
+        Scalar reward = std of Q-values across the critic ensemble.
+    """
+    goal_idx_array = jnp.array(goal_indices)
+    first_state = first_obs[:state_size]                             # (state_size,)
+    current_goal = current_obs[:state_size][goal_idx_array]          # (goal_dim,)
+
+    obs = jnp.concatenate([first_state, current_goal], axis=-1)      # (obs_size,)
+
+    action = gcp_actor.sample_actions(
+        gcp_actor_params, obs[None, :], rng, is_deterministic=True
+    )  # (1, action_size)
+    action = action[0]                                               # (action_size,)
+
+    q_values = critic.apply(
+        full_critic_params, obs[None, :], action[None, :]
+    )  # (1, n_critics)
+    q_values = q_values[0]                                           # (n_critics,)
+
+    return jnp.std(q_values)
+
+
+def create_explore_reward_fn(
+    reward_type: str,
+    critic,
+    gcp_actor,
+    state_size: int,
+    goal_indices,
+):
+    """Factory function to create explore reward functions.
+
+    Args:
+        reward_type:   One of ``"q_epistemic"``.
+        critic:        Critic object used for Q-value computation.
+        gcp_actor:     Goal-conditioned actor object.
+        state_size:    Size of the state portion in observations.
+        goal_indices:  Indices selecting goal dims from state.
+
+    Returns:
+        A callable ``explore_reward_fn(first_obs, current_obs,
+            gcp_actor_params, full_critic_params, rng) -> scalar``.
+    """
+    if reward_type == "q_epistemic":
+        def explore_reward_fn(
+            first_obs: jnp.ndarray,
+            current_obs: jnp.ndarray,
+            gcp_actor_params,
+            full_critic_params,
+            rng: jax.Array,
+        ) -> jnp.ndarray:
+            return q_epistemic_reward(
+                first_obs, current_obs,
+                gcp_actor, gcp_actor_params,
+                critic, full_critic_params,
+                state_size, goal_indices, rng,
+            )
+        return explore_reward_fn
+    else:
+        raise ValueError(f"Unknown explore reward_type: {reward_type}")

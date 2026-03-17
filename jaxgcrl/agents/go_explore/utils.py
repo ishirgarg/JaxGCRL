@@ -183,6 +183,7 @@ def create_dummy_transition_for_buffer(
     obs_size: int,
     action_size: int,
     agent_type: str = "crl",
+    include_phase: bool = False,
 ) -> Any:
     """
     Create a dummy transition object for replay buffer insertion.
@@ -194,6 +195,7 @@ def create_dummy_transition_for_buffer(
         obs_size: Size of observation dimension
         action_size: Size of action dimension
         agent_type: Type of agent ("crl" or "sac") - SAC needs next_observation
+        include_phase: If True, include "phase" in state_extras (for Go Explore)
         
     Returns:
         A Transition object with zero-filled arrays of shape (unroll_length, num_envs, ...).
@@ -205,12 +207,13 @@ def create_dummy_transition_for_buffer(
     dummy_reward = jnp.zeros((unroll_length, num_envs))
     dummy_discount = jnp.zeros((unroll_length, num_envs))
     dummy_next_obs = jnp.zeros((unroll_length, num_envs, obs_size)) if agent_type == "sac" else None
-    dummy_extras = {
-        "state_extras": {
+    state_extras = {
             "traj_id": jnp.zeros((unroll_length, num_envs), dtype=jnp.float32),
             "truncation": jnp.zeros((unroll_length, num_envs), dtype=jnp.float32),
         }
-    }
+    if include_phase:
+        state_extras["phase"] = jnp.zeros((unroll_length, num_envs), dtype=jnp.int32)
+    dummy_extras = {"state_extras": state_extras}
     return Transition(
         observation=dummy_obs,
         action=dummy_action,
@@ -227,6 +230,7 @@ def create_dummy_transition_for_goal_proposer(
     obs_size: int,
     action_size: int,
     agent_type: str = "crl",
+    include_phase: bool = False,
 ) -> Any:
     """
     Create a dummy transition object with shape (num_envs, episode_length, ...) for goal proposer state.
@@ -238,6 +242,7 @@ def create_dummy_transition_for_goal_proposer(
         obs_size: Size of observation dimension
         action_size: Size of action dimension
         agent_type: Type of agent ("crl" or "sac") - SAC needs next_observation
+        include_phase: If True, include "phase" in state_extras (for Go Explore)
         
     Returns:
         A Transition object with zero-filled arrays of shape (num_envs, episode_length, ...).
@@ -249,12 +254,13 @@ def create_dummy_transition_for_goal_proposer(
     dummy_reward = jnp.zeros((num_envs, episode_length))
     dummy_discount = jnp.zeros((num_envs, episode_length))
     dummy_next_obs = jnp.zeros((num_envs, episode_length, obs_size)) if agent_type == "sac" else None
-    dummy_extras = {
-        "state_extras": {
+    state_extras = {
             "traj_id": jnp.zeros((num_envs, episode_length), dtype=jnp.float32),
             "truncation": jnp.zeros((num_envs, episode_length), dtype=jnp.float32),
         }
-    }
+    if include_phase:
+        state_extras["phase"] = jnp.zeros((num_envs, episode_length), dtype=jnp.int32)
+    dummy_extras = {"state_extras": state_extras}
     return Transition(
         observation=dummy_obs,
         action=dummy_action,
@@ -269,6 +275,7 @@ def create_single_dummy_transition(
     obs_size: int,
     action_size: int,
     agent_type: str = "crl",
+    include_phase: bool = False,
 ) -> Any:
     """
     Create a single dummy transition object (not batched) for replay buffer initialization.
@@ -277,6 +284,7 @@ def create_single_dummy_transition(
         obs_size: Size of observation dimension
         action_size: Size of action dimension
         agent_type: Type of agent ("crl" or "sac") - SAC needs next_observation
+        include_phase: If True, include "phase" in state_extras (for Go Explore)
         
     Returns:
         A Transition object with zero-filled arrays of shape (obs_size,) and (action_size,).
@@ -288,12 +296,13 @@ def create_single_dummy_transition(
     dummy_reward = 0.0
     dummy_discount = 0.0
     dummy_next_obs = jnp.zeros((obs_size,)) if agent_type == "sac" else None
-    dummy_extras = {
-        "state_extras": {
+    state_extras = {
             "truncation": 0.0,
             "traj_id": 0.0,
         }
-    }
+    if include_phase:
+        state_extras["phase"] = jnp.zeros((), dtype=jnp.int32)
+    dummy_extras = {"state_extras": state_extras}
     return Transition(
         observation=dummy_obs,
         action=dummy_action,
