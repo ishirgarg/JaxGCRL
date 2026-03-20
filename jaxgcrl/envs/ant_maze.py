@@ -265,14 +265,15 @@ class AntMaze(PipelineEnv):
         if self._use_contact_forces:
             raise NotImplementedError("use_contact_forces not implemented.")
 
-    def reset(self, rng: jax.Array, goal=None) -> State:
+    def reset(self, rng: jax.Array, goal=None, start=None) -> State:
         """Resets the environment to an initial state.
-        
+
         Args:
-            rng: Random key
-            goal_proposer_fn: Optional goal proposer function that takes (rng, start_obs) and returns goal.
-                             If provided, uses this to propose goal based on start observation.
-                             If None, samples goal randomly from possible goals.
+            rng:   Random key.
+            goal:  Optional (2,) goal position.  If None, sampled randomly.
+            start: Optional (2,) start xy position.  If None, sampled randomly.
+                   Pass a fixed value from GoExploreWrapper so the ant always
+                   returns to the same starting cell across go phases.
         """
 
         rng, rng1, rng2, rng3 = jax.random.split(rng, 4)
@@ -281,9 +282,12 @@ class AntMaze(PipelineEnv):
         q = self.sys.init_q + jax.random.uniform(rng, (self.sys.q_size(),), minval=low, maxval=hi)
         qd = hi * jax.random.normal(rng1, (self.sys.qd_size(),))
 
-        # set the start q, qd
-        start = self._random_start(rng2)
-        q = q.at[:2].set(start)
+        # Use provided start position or sample a random one
+        if start is None:
+            start_pos = self._random_start(rng2)
+        else:
+            start_pos = start
+        q = q.at[:2].set(start_pos)
 
         if goal is None:
             target = self._random_target(rng3)

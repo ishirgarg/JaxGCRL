@@ -152,6 +152,7 @@ class GoExplore:
             num_ep_steps=self.num_ep_steps,
             state_size=state_size,
             goal_size=goal_size,
+            goal_indices=unwrapped_env.goal_indices,
         )
 
         # ── Step count bookkeeping ───────────────────────────────────────────
@@ -692,18 +693,19 @@ class GoExplore:
                 length=num_training_steps_per_epoch,
             )
 
-            # Go Explore phase metrics (aggregated from all envs during epoch)
-            # Compute from final env_state (these are cumulative per-environment values)
-            go_success_rate = jnp.mean(env_state.info['go_phase_success'])
-            # For avg_go_steps, only average over successful go phases
-            successful_go_steps = jnp.where(
-                env_state.info['go_phase_success'] > 0,
-                env_state.info['go_phase_steps'],
-                jnp.nan,  # Use NaN so we can ignore failed phases
-            )
-            avg_go_steps = jnp.nanmean(successful_go_steps)
-            # If no successful phases, set to 0
-            avg_go_steps = jnp.where(jnp.isnan(avg_go_steps), 0.0, avg_go_steps)
+            # Go Explore phase metrics — computed from cumulative counters so the
+            # value is independent of which phase each env happens to be in at
+            # epoch end (Bug 2 fix: point-in-time snapshot was biased by ~50% of
+            # envs being mid-go-phase with success=0).
+            total_completions   = jnp.sum(env_state.info['go_completions_total'])
+            total_successes     = jnp.sum(env_state.info['go_successes_total'])
+            go_success_rate     = jnp.where(total_completions > 0,
+                                            total_successes / total_completions,
+                                            0.0)
+            total_success_steps = jnp.sum(env_state.info['go_success_steps_total'])
+            avg_go_steps        = jnp.where(total_successes > 0,
+                                            total_success_steps / total_successes,
+                                            0.0)
             
             # Broadcast to match scan output shape for consistent aggregation
             scan_shape = jax.tree_util.tree_leaves(metrics)[0].shape if metrics else (1,)

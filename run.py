@@ -86,6 +86,8 @@ def main(config: Config):
         "training/critic_loss",
         "training/entropy",
         "training/sps",
+        "training/go_phase_success_rate",
+        "training/avg_go_phase_steps",
     ]
 
     metrics_recorder = MetricsRecorder(

@@ -65,18 +65,18 @@ class VmapWrapper(Wrapper):
         super().__init__(env)
         self.batch_size = batch_size
 
-    def reset(self, rng: jax.Array, goal: Optional[jnp.ndarray] = None) -> State:
+    def reset(self, rng: jax.Array, goal: Optional[jnp.ndarray] = None,
+              start: Optional[jnp.ndarray] = None) -> State:
         if self.batch_size is not None:
             rng = jax.random.split(rng, self.batch_size)
-        # If goal is None, pass None to each environment (they'll generate random goals)
-        if goal is None:
-            def reset_fn_no_goal(r):
-                return self.env.reset(r, goal=None)
-            return jax.vmap(reset_fn_no_goal)(rng)
+        if goal is None and start is None:
+            return jax.vmap(lambda r: self.env.reset(r))(rng)
+        elif goal is not None and start is None:
+            return jax.vmap(lambda r, g: self.env.reset(r, goal=g))(rng, goal)
+        elif goal is None and start is not None:
+            return jax.vmap(lambda r, s: self.env.reset(r, start=s))(rng, start)
         else:
-            def reset_fn(r, g):
-                return self.env.reset(r, goal=g)
-            return jax.vmap(reset_fn)(rng, goal)
+            return jax.vmap(lambda r, g, s: self.env.reset(r, goal=g, start=s))(rng, goal, start)
 
     def step(self, state: State, action: jax.Array) -> State:
         return jax.vmap(self.env.step)(state, action)
@@ -90,8 +90,9 @@ class EpisodeWrapper(Wrapper):
         self.episode_length = episode_length
         self.action_repeat = action_repeat
 
-    def reset(self, rng: jax.Array, goal: Optional[jnp.ndarray] = None) -> State:
-        state = self.env.reset(rng, goal=goal)
+    def reset(self, rng: jax.Array, goal: Optional[jnp.ndarray] = None,
+              start: Optional[jnp.ndarray] = None) -> State:
+        state = self.env.reset(rng, goal=goal, start=start)
         state.info['steps'] = jnp.zeros(rng.shape[:-1])
         state.info['truncation'] = jnp.zeros(rng.shape[:-1])
         # Keep separate record of episode done as state.info['done'] can be erased
@@ -246,12 +247,15 @@ class GoExploreWrapper(Wrapper):
     """
 
     def __init__(self, env: Env, num_gcp_steps: int, num_ep_steps: int,
-                 state_size: int, goal_size: int):
+                 state_size: int, goal_size: int, goal_indices=None):
         super().__init__(env)
         self.num_gcp_steps = num_gcp_steps
         self.num_ep_steps = num_ep_steps
         self.state_size = state_size
         self.goal_size = goal_size
+        # Indices into the state portion of obs that select the (x, y) position
+        # used as the ant's start position (passed to env.reset(start=...)).
+        self.goal_indices = goal_indices
 
     # ------------------------------------------------------------------
     # reset
@@ -270,12 +274,18 @@ class GoExploreWrapper(Wrapper):
         state.info['go_goal']             = go_goal
         state.info['go_phase_success']    = jnp.zeros(num_envs, dtype=jnp.float32)
         state.info['go_phase_steps']      = jnp.zeros(num_envs, dtype=jnp.float32)
-        state.info['first_pipeline_state'] = state.pipeline_state
+        # Cache the start position (at goal_indices) so env.reset(start=first_start)
+        # can restore it across go phases without manual pipeline-state surgery.
+        state.info['first_start'] = state.obs[:, self.goal_indices]
         state.info['first_obs']           = state.obs
         state.info['explore_first_obs']   = state.obs
-        state.info['pre_reset_obs']       = state.obs  # pre-GoExploreWrapper-reset next obs
+        state.info['pre_reset_obs']       = state.obs
         state.info['traj_id']             = jnp.zeros(num_envs, dtype=jnp.float32)
         state.info['proposed_goals']      = go_goal
+        # Cumulative counters for Bug 2 (never reset within step, only in reset)
+        state.info['go_completions_total']   = jnp.zeros(num_envs, dtype=jnp.float32)
+        state.info['go_successes_total']     = jnp.zeros(num_envs, dtype=jnp.float32)
+        state.info['go_success_steps_total'] = jnp.zeros(num_envs, dtype=jnp.float32)
         return state
 
     # ------------------------------------------------------------------
@@ -305,34 +315,46 @@ class GoExploreWrapper(Wrapper):
 
         # ── 4. Phase-transition predicates ────────────────────────────────────────
         # (phase_step + 1) because we are about to increment phase_step.
-        should_go_to_explore = in_go & (goal_reached | ((phase_step + 1) >= self.num_gcp_steps))
-        should_explore_to_go = in_explore & ((phase_step + 1) >= self.num_ep_steps)
         ep_done              = nstate.done.astype(bool)
+        # Bug 3 fix: ep_done takes priority — mask it out of go→explore so a
+        # simultaneous episode termination always routes through should_reset (go phase).
+        should_go_to_explore = in_go & (goal_reached | ((phase_step + 1) >= self.num_gcp_steps)) & ~ep_done
+        should_explore_to_go = in_explore & ((phase_step + 1) >= self.num_ep_steps)
 
         # Any condition that resets to the go-phase start state
         should_reset = should_explore_to_go | ep_done
 
         # ── 5. Go-phase success metrics ───────────────────────────────────────────
         go_success = in_go & goal_reached
-        # Update success/steps when transitioning to explore, reset when starting new go phase
+        # Point-in-time snapshot fields (kept for backward compat / debugging)
         new_go_phase_success = jnp.where(
             should_go_to_explore,
-            go_success.astype(jnp.float32),  # Record success when transitioning to explore
+            go_success.astype(jnp.float32),
             jnp.where(
                 should_reset,
-                jnp.zeros_like(state.info['go_phase_success']),  # Reset when starting new go phase
-                state.info['go_phase_success'],  # Keep current value otherwise
+                jnp.zeros_like(state.info['go_phase_success']),
+                state.info['go_phase_success'],
             ),
         )
         new_go_phase_steps = jnp.where(
             should_go_to_explore & go_success,
-            (phase_step + 1).astype(jnp.float32),  # Record steps when successfully transitioning
+            (phase_step + 1).astype(jnp.float32),
             jnp.where(
                 should_reset,
-                jnp.zeros_like(state.info['go_phase_steps']),  # Reset when starting new go phase
-                state.info['go_phase_steps'],  # Keep current value otherwise
+                jnp.zeros_like(state.info['go_phase_steps']),
+                state.info['go_phase_steps'],
             ),
         )
+        # Bug 2 fix: cumulative counters — incremented only when a go phase
+        # completes (should_go_to_explore), never reset within step().
+        new_go_completions_total   = (state.info['go_completions_total']
+                                      + should_go_to_explore.astype(jnp.float32))
+        new_go_successes_total     = (state.info['go_successes_total']
+                                      + go_success.astype(jnp.float32))
+        new_go_success_steps_total = (state.info['go_success_steps_total']
+                                      + jnp.where(go_success,
+                                                   (phase_step + 1).astype(jnp.float32),
+                                                   0.0))
 
         # ── 6. New phase and phase_step ───────────────────────────────────────────
         new_phase = jnp.where(
@@ -362,11 +384,18 @@ class GoExploreWrapper(Wrapper):
             state.info['explore_first_obs'],
         )
 
-        # ── 10. Restore pipeline_state and obs to start state on reset ────────────
-        first_ps  = state.info['first_pipeline_state']
-        first_obs = state.info['first_obs']
-        first_state      = first_obs[:, :self.state_size]
-        new_obs_on_reset = jnp.concatenate([first_state, new_go_goal], axis=-1)
+        # ── 10. Restore physics to start state on reset via proper env.reset() ──────
+        # Bug 1 fix: instead of restoring cached pipeline state (which has the
+        # original goal baked into q), call env.reset(start=first_start, goal=new_goal)
+        # so pipeline_init regenerates correct q/qd with the new goal embedded.
+        # This matches how TrainAutoResetWrapper resets via the env API.
+        first_start = state.info['first_start']   # (num_envs, 2) — ant xy at episode start
+        num_envs_local = state.obs.shape[0]
+        # Split rng for per-env resets (rng may be a single key from actor_step)
+        reset_rng = jax.random.split(rng, num_envs_local)  # (num_envs, 2)
+        # Reset ALL envs unconditionally (JAX traces the branch regardless);
+        # _where_masked selects results only for envs where should_reset is True.
+        reset_state = self.env.reset(reset_rng, goal=new_go_goal, start=first_start)
 
         def _where_masked(x_reset, x_current):
             if not hasattr(x_reset, 'shape'):
@@ -378,11 +407,11 @@ class GoExploreWrapper(Wrapper):
             mask = jnp.reshape(should_reset, [should_reset.shape[0]] + [1] * (x_reset.ndim - 1))
             return jnp.where(mask, x_reset, x_current)
 
-        reset_pipeline_state = jax.tree.map(_where_masked, first_ps, nstate.pipeline_state)
-        reset_obs = jnp.where(should_reset[:, None], new_obs_on_reset, nstate.obs)
+        reset_pipeline_state = jax.tree.map(_where_masked, reset_state.pipeline_state, nstate.pipeline_state)
+        reset_obs = jnp.where(should_reset[:, None], reset_state.obs, nstate.obs)
 
-        # first_obs updated to reflect new goal for the incoming go phase
-        new_first_obs = jnp.where(should_reset[:, None], new_obs_on_reset, first_obs)
+        # first_obs for the new go phase now has the correct goal baked in
+        new_first_obs = jnp.where(should_reset[:, None], reset_state.obs, state.info['first_obs'])
 
         # ── 11. Mark phase boundaries as truncations ─────────────────────────────
         phase_boundary = (should_go_to_explore | should_reset).astype(jnp.float32)
@@ -390,16 +419,19 @@ class GoExploreWrapper(Wrapper):
         info['truncation'] = jnp.maximum(existing_trunc, phase_boundary)
 
         # ── 12. Write updated fields back to info ────────────────────────────────
-        info['phase']               = new_phase
-        info['phase_step']          = new_phase_step
-        info['traj_id']             = traj_id
-        info['go_goal']             = new_go_goal
-        info['go_phase_success']    = new_go_phase_success
-        info['go_phase_steps']      = new_go_phase_steps
-        info['explore_first_obs']   = new_explore_first_obs
-        info['first_obs']           = new_first_obs
-        info['first_pipeline_state'] = first_ps
-        info['proposed_goals']      = proposed_goals
-        info['pre_reset_obs']       = nstate.obs
+        info['phase']                   = new_phase
+        info['phase_step']              = new_phase_step
+        info['traj_id']                 = traj_id
+        info['go_goal']                 = new_go_goal
+        info['go_phase_success']        = new_go_phase_success
+        info['go_phase_steps']          = new_go_phase_steps
+        info['go_completions_total']    = new_go_completions_total
+        info['go_successes_total']      = new_go_successes_total
+        info['go_success_steps_total']  = new_go_success_steps_total
+        info['explore_first_obs']       = new_explore_first_obs
+        info['first_obs']               = new_first_obs
+        info['first_start']             = first_start   # unchanged, carry forward
+        info['proposed_goals']          = proposed_goals
+        info['pre_reset_obs']           = nstate.obs
 
         return nstate.replace(pipeline_state=reset_pipeline_state, obs=reset_obs, info=info)
