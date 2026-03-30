@@ -101,7 +101,7 @@ class GoExplore:
     n_critics: int = 2
     use_her: bool = True
 
-    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env"] = "random_env_goals"
+    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega"] = "random_env_goals"
     ep_goal_proposer_name: Literal["nearest_env_goal_to_gcp_goal"] = "nearest_env_goal_to_gcp_goal"
     num_candidates: int = 512
 

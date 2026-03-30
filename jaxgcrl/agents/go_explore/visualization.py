@@ -658,6 +658,29 @@ def handle_goal_proposer_visualization(
             x_bounds=x_bounds,
             y_bounds=y_bounds,
         )
+    elif goal_proposer_name == "mega":
+        visualize_mega_candidates(
+            candidate_goals=log_data["candidate_goals"],
+            first_obs_position=log_data["first_obs_position"],
+            densities=log_data["densities"],
+            selected_goal=log_data["selected_goal"],
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+            title_prefix="MEGA",
+        )
+    elif goal_proposer_name == "omega":
+        visualize_omega_candidates(
+            candidate_goals=log_data["candidate_goals"],
+            first_obs_position=log_data["first_obs_position"],
+            densities=log_data["densities"],
+            selected_goal=log_data["selected_goal"],
+            mega_goal=log_data["mega_goal"],
+            env_goal=log_data["env_goal"],
+            alpha=log_data["alpha"],
+            kl_div=log_data["kl_div"],
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+        )
     # Add more goal proposer visualizations here as needed
 
 
@@ -1044,4 +1067,283 @@ def visualize_ucgr_candidates(
 
     plt.tight_layout()
     wandb.log({"ucgr_candidates": wandb.Image(fig)})
+    plt.close(fig)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MEGA / OMEGA visualisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def visualize_mega_candidates(
+    candidate_goals: np.ndarray,
+    first_obs_position: np.ndarray,
+    densities: np.ndarray,
+    selected_goal: np.ndarray,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+    title_prefix: str = "MEGA",
+) -> None:
+    """Visualise MEGA goal-proposer candidates coloured by KDE density.
+
+    Two side-by-side panels:
+    - Left:  candidates coloured by raw KDE density estimate.
+             Cool (low) = sparse = frontier; warm (high) = well-visited.
+             The selected (minimum-density) goal is highlighted in lime.
+    - Right: candidates coloured by normalised *sparsity* (1 − normalised density),
+             so the selected goal is the brightest point.  Useful for seeing
+             the frontier of the achievable goal set at a glance.
+
+    Both panels also show the agent's start position as a red star.
+
+    Args:
+        candidate_goals:    (num_candidates, 2) candidate goal positions [x, y].
+        first_obs_position: (2,) agent's start position this step [x, y].
+        densities:          (num_candidates,) KDE density per candidate.
+                            Lower → sparser → chosen by MEGA.
+        selected_goal:      (2,) the chosen minimum-density goal [x, y].
+        x_bounds:           [x_min, x_max] for the environment.
+        y_bounds:           [y_min, y_max] for the environment.
+        title_prefix:       "MEGA" or "OMEGA" (used in panel titles / wandb key).
+    """
+    candidate_goals    = np.asarray(candidate_goals)
+    first_obs_position = np.asarray(first_obs_position)
+    densities          = np.asarray(densities)
+    selected_goal      = np.asarray(selected_goal)
+    x_bounds           = np.asarray(x_bounds)
+    y_bounds           = np.asarray(y_bounds)
+
+    x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
+    y_min, y_max = float(y_bounds[0]), float(y_bounds[1])
+
+    # Normalised sparsity: 1 − normalised density  →  1 = most sparse = frontier
+    d_min, d_max = densities.min(), densities.max()
+    d_range = d_max - d_min
+    if d_range > 0:
+        sparsity = 1.0 - (densities - d_min) / d_range
+    else:
+        sparsity = np.ones_like(densities) * 0.5
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+
+    def _setup_ax(ax, title):
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_xlabel("X Position", fontsize=12)
+        ax.set_ylabel("Y Position", fontsize=12)
+        ax.set_title(title, fontsize=14, fontweight="bold")
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect("equal", adjustable="box")
+
+    # ── Left panel: raw KDE density (cool = sparse = frontier) ──────────────
+    if len(candidate_goals) > 0:
+        sc1 = ax1.scatter(
+            candidate_goals[:, 0],
+            candidate_goals[:, 1],
+            c=densities,
+            cmap="coolwarm",   # blue (cool) = low density = frontier
+            s=55,
+            alpha=0.75,
+            edgecolors="black",
+            linewidths=0.4,
+            zorder=5,
+        )
+        cb1 = plt.colorbar(sc1, ax=ax1)
+        cb1.set_label("KDE Density  (↓ = frontier)", fontsize=10)
+
+    ax1.scatter(
+        first_obs_position[0], first_obs_position[1],
+        c="red", s=120, marker="*",
+        edgecolors="black", linewidths=1.5,
+        label="Start obs", zorder=10,
+    )
+    ax1.scatter(
+        selected_goal[0], selected_goal[1],
+        c="lime", s=200, marker="X",
+        edgecolors="black", linewidths=1.5,
+        label="Selected goal (min density)", zorder=11,
+    )
+    _setup_ax(ax1, f"{title_prefix} Candidates — KDE Density")
+    ax1.legend(fontsize=10, loc="best")
+
+    # ── Right panel: normalised sparsity (bright = hardest / most sparse) ───
+    if len(candidate_goals) > 0:
+        sc2 = ax2.scatter(
+            candidate_goals[:, 0],
+            candidate_goals[:, 1],
+            c=sparsity,
+            cmap="plasma",
+            vmin=0.0, vmax=1.0,
+            s=55,
+            alpha=0.75,
+            edgecolors="black",
+            linewidths=0.4,
+            zorder=5,
+        )
+        cb2 = plt.colorbar(sc2, ax=ax2)
+        cb2.set_label("Normalised Sparsity  (↑ = frontier)", fontsize=10)
+
+    ax2.scatter(
+        first_obs_position[0], first_obs_position[1],
+        c="red", s=120, marker="*",
+        edgecolors="black", linewidths=1.5,
+        label="Start obs", zorder=10,
+    )
+    ax2.scatter(
+        selected_goal[0], selected_goal[1],
+        c="lime", s=200, marker="X",
+        edgecolors="black", linewidths=1.5,
+        label="Selected goal (min density)", zorder=11,
+    )
+    _setup_ax(ax2, f"{title_prefix} Candidates — Normalised Sparsity")
+    ax2.legend(fontsize=10, loc="best")
+
+    plt.tight_layout()
+    wandb_key = f"{title_prefix.lower()}_candidates"
+    wandb.log({wandb_key: wandb.Image(fig)})
+    plt.close(fig)
+
+
+def visualize_omega_candidates(
+    candidate_goals: np.ndarray,
+    first_obs_position: np.ndarray,
+    densities: np.ndarray,
+    selected_goal: np.ndarray,
+    mega_goal: np.ndarray,
+    env_goal: np.ndarray,
+    alpha: float,
+    kl_div: float,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+) -> None:
+    """Visualise OMEGA goal-proposer candidates.
+
+    Extends the MEGA visualisation with OMEGA-specific overlays:
+    - The MEGA (min-density) goal is marked with a blue diamond.
+    - The randomly sampled environment (desired) goal is marked with an
+      orange triangle.  If OMEGA chose the env goal this step, the selected
+      goal (lime ✕) will coincide with the env goal; otherwise with the MEGA goal.
+    - The mixing weight α and estimated KL divergence are annotated on the plot.
+
+    Logs two images to wandb:
+    - ``omega_candidates``  — the main candidate scatter (two panels, as in MEGA).
+    - ``omega_alpha``       — a simple scalar-over-time log (just ``alpha`` this step).
+
+    Args:
+        candidate_goals:    (num_candidates, 2) candidate goal positions.
+        first_obs_position: (2,) agent's start position.
+        densities:          (num_candidates,) KDE density per candidate.
+        selected_goal:      (2,) goal that was actually proposed this step.
+        mega_goal:          (2,) minimum-density goal (MEGA choice).
+        env_goal:           (2,) randomly drawn desired goal (env choice).
+        alpha:              Mixing weight in [0, 1]; 1 → always use env goal.
+        kl_div:             Estimated KL(p_dg ‖ p_ag) used to compute alpha.
+        x_bounds:           [x_min, x_max] for the environment.
+        y_bounds:           [y_min, y_max] for the environment.
+    """
+    candidate_goals    = np.asarray(candidate_goals)
+    first_obs_position = np.asarray(first_obs_position)
+    densities          = np.asarray(densities)
+    selected_goal      = np.asarray(selected_goal)
+    mega_goal          = np.asarray(mega_goal)
+    env_goal           = np.asarray(env_goal)
+    alpha              = float(alpha)
+    kl_div             = float(kl_div)
+    x_bounds           = np.asarray(x_bounds)
+    y_bounds           = np.asarray(y_bounds)
+
+    x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
+    y_min, y_max = float(y_bounds[0]), float(y_bounds[1])
+
+    d_min, d_max = densities.min(), densities.max()
+    d_range = d_max - d_min
+    sparsity = (
+        1.0 - (densities - d_min) / d_range if d_range > 0
+        else np.ones_like(densities) * 0.5
+    )
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+
+    def _setup_ax(ax, title):
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_xlabel("X Position", fontsize=12)
+        ax.set_ylabel("Y Position", fontsize=12)
+        ax.set_title(title, fontsize=13, fontweight="bold")
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect("equal", adjustable="box")
+
+    def _add_omega_overlays(ax):
+        """Add start, mega, env, and selected goal markers."""
+        # Agent start
+        ax.scatter(
+            first_obs_position[0], first_obs_position[1],
+            c="red", s=120, marker="*", edgecolors="black", linewidths=1.5,
+            label="Start obs", zorder=10,
+        )
+        # MEGA candidate (min-density)
+        ax.scatter(
+            mega_goal[0], mega_goal[1],
+            c="deepskyblue", s=180, marker="D",
+            edgecolors="black", linewidths=1.5,
+            label=f"MEGA goal (min ρ)", zorder=11,
+        )
+        # Env (desired) goal
+        ax.scatter(
+            env_goal[0], env_goal[1],
+            c="orange", s=180, marker="^",
+            edgecolors="black", linewidths=1.5,
+            label="Env goal (desired)", zorder=11,
+        )
+        # Actually selected goal (lime ✕)
+        ax.scatter(
+            selected_goal[0], selected_goal[1],
+            c="lime", s=220, marker="X",
+            edgecolors="black", linewidths=1.5,
+            label="Selected goal", zorder=12,
+        )
+
+    # ── Left panel: raw KDE density ──────────────────────────────────────────
+    if len(candidate_goals) > 0:
+        sc1 = ax1.scatter(
+            candidate_goals[:, 0], candidate_goals[:, 1],
+            c=densities, cmap="coolwarm",
+            s=55, alpha=0.75, edgecolors="black", linewidths=0.4, zorder=5,
+        )
+        cb1 = plt.colorbar(sc1, ax=ax1)
+        cb1.set_label("KDE Density  (↓ = frontier)", fontsize=10)
+
+    _add_omega_overlays(ax1)
+    info_text = f"α = {alpha:.3f}   KL = {kl_div:.2f}"
+    ax1.text(
+        0.02, 0.98, info_text,
+        transform=ax1.transAxes, fontsize=11, verticalalignment="top",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+    )
+    _setup_ax(ax1, "OMEGA Candidates — KDE Density")
+    ax1.legend(fontsize=9, loc="lower right")
+
+    # ── Right panel: normalised sparsity ─────────────────────────────────────
+    if len(candidate_goals) > 0:
+        sc2 = ax2.scatter(
+            candidate_goals[:, 0], candidate_goals[:, 1],
+            c=sparsity, cmap="plasma", vmin=0.0, vmax=1.0,
+            s=55, alpha=0.75, edgecolors="black", linewidths=0.4, zorder=5,
+        )
+        cb2 = plt.colorbar(sc2, ax=ax2)
+        cb2.set_label("Normalised Sparsity  (↑ = frontier)", fontsize=10)
+
+    _add_omega_overlays(ax2)
+    ax2.text(
+        0.02, 0.98, info_text,
+        transform=ax2.transAxes, fontsize=11, verticalalignment="top",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+    )
+    _setup_ax(ax2, "OMEGA Candidates — Normalised Sparsity")
+    ax2.legend(fontsize=9, loc="lower right")
+
+    plt.tight_layout()
+    wandb.log({
+        "omega_candidates": wandb.Image(fig),
+        "omega_alpha":      alpha,
+        "omega_kl_div":     kl_div,
+    })
     plt.close(fig)
