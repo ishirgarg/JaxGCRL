@@ -15,6 +15,16 @@ RESET = R = "r"
 GOAL = G = "g"
 BALL = B = "b"
 
+SQUARE_MAZE = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, G, R, R, R, R, G, 1],
+    [1, R, B, B, B, B, R, 1],
+    [1, R, B, B, B, B, R, 1],
+    [1, R, B, B, B, B, R, 1],
+    [1, R, B, B, B, B, R, 1],
+    [1, G, R, R, R, R, G, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
 
 U_MAZE = [
     [1, 1, 1, 1, 1],
@@ -52,7 +62,10 @@ def find(structure, size_scaling, obj):
 
 # Create a xml with maze and a list of possible goal positions
 def make_maze(maze_layout_name, maze_size_scaling):
-    if maze_layout_name == "u_maze":
+    print(f"maze_layout_name: {maze_layout_name}")
+    if maze_layout_name == "square_maze":
+        maze_layout = SQUARE_MAZE
+    elif maze_layout_name == "u_maze":
         maze_layout = U_MAZE
     elif maze_layout_name == "big_maze":
         maze_layout = BIG_MAZE
@@ -64,6 +77,18 @@ def make_maze(maze_layout_name, maze_size_scaling):
     possible_starts = find(maze_layout, maze_size_scaling, RESET)
     possible_goals = find(maze_layout, maze_size_scaling, GOAL)
     possible_balls = find(maze_layout, maze_size_scaling, BALL)
+
+    # Calculate axis-aligned bounds used for visualization
+    num_rows = len(maze_layout)
+    num_cols = len(maze_layout[0])
+    x_bounds = jnp.array([
+        -0.5 * maze_size_scaling,
+        (num_rows - 0.5) * maze_size_scaling,
+    ])
+    y_bounds = jnp.array([
+        -0.5 * maze_size_scaling,
+        (num_cols - 0.5) * maze_size_scaling,
+    ])
 
     tree = ET.parse(xml_path)
     worldbody = tree.find(".//worldbody")
@@ -98,7 +123,7 @@ def make_maze(maze_layout_name, maze_size_scaling):
     tree = tree.getroot()
     xml_string = ET.tostring(tree)
 
-    return xml_string, possible_starts, possible_goals, possible_balls
+    return xml_string, possible_starts, possible_goals, possible_balls, x_bounds, y_bounds
 
 
 class AntBallMaze(PipelineEnv):
@@ -119,7 +144,7 @@ class AntBallMaze(PipelineEnv):
         dense_reward: bool = False,
         **kwargs,
     ):
-        xml_string, possible_starts, possible_goals, possible_balls = make_maze(
+        xml_string, possible_starts, possible_goals, possible_balls, x_bounds, y_bounds = make_maze(
             maze_layout_name, maze_size_scaling
         )
 
@@ -127,6 +152,8 @@ class AntBallMaze(PipelineEnv):
         self.possible_starts = possible_starts
         self.possible_goals = possible_goals
         self.possible_balls = possible_balls
+        self.x_bounds = x_bounds
+        self.y_bounds = y_bounds
 
         n_frames = 5
 
@@ -165,14 +192,15 @@ class AntBallMaze(PipelineEnv):
         self.dense_reward = dense_reward
 
         self.state_dim = 31
-        self.goal_indices = jnp.array([28, 29])
+        self.goal_indices = jnp.array([29, 30])
         self.goal_reach_thresh = 0.5
+
 
         if self._use_contact_forces:
             raise NotImplementedError("use_contact_forces not implemented.")
 
-    def reset(self, rng: jax.Array) -> State:
-        """Resets the environment to an initial state."""
+    def reset(self, rng: jax.Array, goal=None, start=None) -> State:
+        """Resets the environment to an initial state. goal/start are accepted but ignored (no goal conditioning)."""
 
         rng, rng1, rng2, rng3 = jax.random.split(rng, 4)
 
@@ -242,7 +270,7 @@ class AntBallMaze(PipelineEnv):
         if self.dense_reward:
             reward = 10 * vel_to_target + healthy_reward - ctrl_cost - contact_cost
         else:
-            reward = success
+            reward = healthy_reward - ctrl_cost - contact_cost # + success (AUGMENT FOR NOW)
 
         done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
 
@@ -263,19 +291,23 @@ class AntBallMaze(PipelineEnv):
         return state.replace(pipeline_state=pipeline_state, obs=obs, reward=reward, done=done)
 
     def _get_obs(self, pipeline_state: base.State) -> jax.Array:
-        """Observe ant body position and velocities."""
-        # remove target and object q, qd
-        qpos = pipeline_state.q[:-4]
-        qvel = pipeline_state.qd[:-4]
+        """Observation with absolute ant xy at head, then OGBench-style relatives.
+        Vector:
+          [ant_xy(2), qpos[2:-7], qpos[-5:], qvel, (ball_xy - agent_xy), (goal_xy - ball_xy)]
+        """
+        qpos = pipeline_state.q
+        qvel = pipeline_state.qd
+        agent_xy = pipeline_state.x.pos[0][:2]
+        ball_xy = pipeline_state.x.pos[self._object_idx][:2]
+        goal_xy = pipeline_state.x.pos[-1][:2]
 
-        target_pos = pipeline_state.x.pos[-1][:2]
+        # Build relative terms
+        ball_rel = ball_xy - agent_xy
+        goal_rel = goal_xy - ball_xy
 
-        if self._exclude_current_positions_from_observation:
-            qpos = qpos[2:]
-
-        object_position = pipeline_state.x.pos[self._object_idx][:2]
-
-        return jnp.concatenate([qpos] + [qvel] + [object_position] + [target_pos])
+        print("SHAPE", qpos.shape, qvel.shape)
+        # Concatenate per requested structure (no absolute ant/ball xy in the tail)
+        return jnp.concatenate([agent_xy, qpos[2:-7], qpos[-5:], qvel, ball_rel, goal_rel])
 
     def _random_target(self, rng: jax.Array) -> jax.Array:
         """Returns a random target location chosen from possibilities specified in the maze layout."""
