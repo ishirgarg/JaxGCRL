@@ -190,6 +190,7 @@ class EmpowermentSAC:
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
     empowerment_reward_scaling: float = 1.0
+    use_empowerment_diff: bool = False
     deterministic_eval: bool = True
 
     # Empowerment checkpoint args
@@ -366,6 +367,7 @@ class EmpowermentSAC:
                     "truncation": jnp.zeros(()),
                     "traj_id": jnp.zeros(()),
                     "emp_abs": jnp.zeros(()),
+                    "emp_delta": jnp.zeros(()),
                 }
             },
         )
@@ -424,10 +426,20 @@ class EmpowermentSAC:
             )
             nstate = env.step(env_state, actions)
             next_state_obs = nstate.obs[:, :state_size]
-            next_emp = empowerment_reward_online_with_key(next_state_obs, emp_key)
-            combined_reward = self.empowerment_reward_scaling * next_emp # + nstate.reward
+            if self.use_empowerment_diff:
+                emp_key_cur, emp_key_next = jax.random.split(emp_key)
+                cur_emp = empowerment_reward_online_with_key(state_obs, emp_key_cur)
+                next_emp = empowerment_reward_online_with_key(next_state_obs, emp_key_next)
+                emp_delta = next_emp - cur_emp
+                shaped_reward = emp_delta
+            else:
+                next_emp = empowerment_reward_online_with_key(next_state_obs, emp_key)
+                emp_delta = jnp.zeros_like(next_emp)
+                shaped_reward = next_emp
+            combined_reward = self.empowerment_reward_scaling * shaped_reward
             state_extras = {x: nstate.info[x] for x in extra_fields}
             state_extras["emp_abs"] = next_emp
+            state_extras["emp_delta"] = emp_delta
             return nstate, Transition(
                 observation=state_obs,
                 action=actions,
@@ -514,6 +526,11 @@ class EmpowermentSAC:
             metrics["emp_abs_min"] = jnp.min(emp_abs)
             metrics["emp_abs_max"] = jnp.max(emp_abs)
             metrics["emp_abs_scaled_mean"] = self.empowerment_reward_scaling * jnp.mean(emp_abs)
+            emp_delta = transitions.extras["state_extras"]["emp_delta"]
+            metrics["emp_delta_mean"] = jnp.mean(emp_delta)
+            metrics["emp_delta_min"] = jnp.min(emp_delta)
+            metrics["emp_delta_max"] = jnp.max(emp_delta)
+            metrics["emp_delta_scaled_mean"] = self.empowerment_reward_scaling * jnp.mean(emp_delta)
             return (training_state, env_state, buffer_state), metrics
 
         # Steps-per-epoch scheduling (same as SAC)

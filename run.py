@@ -88,6 +88,14 @@ def main(config: Config):
         "training/sps",
         "training/go_phase_success_rate",
         "training/avg_go_phase_steps",
+        "training/emp_abs_mean",
+        "training/emp_abs_min",
+        "training/emp_abs_max",
+        "training/emp_abs_scaled_mean",
+        "training/emp_delta_mean",
+        "training/emp_delta_min",
+        "training/emp_delta_max",
+        "training/emp_delta_scaled_mean",
     ]
 
     metrics_recorder = MetricsRecorder(
