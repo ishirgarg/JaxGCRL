@@ -53,6 +53,8 @@ legal_envs = (
     "arm_binpick_hard",
     "ant_ball_maze",
     "ant_ball_square_maze",
+    "ant_ball_easy_square_maze",
+    "ant_ball_small_square_maze",
     "ant_u_maze",
     "ant_u_maze_hard",
     "ant_big_maze",

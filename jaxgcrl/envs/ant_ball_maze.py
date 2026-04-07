@@ -17,12 +17,34 @@ BALL = B = "b"
 
 SQUARE_MAZE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, G, R, R, R, R, G, 1],
-    [1, R, B, B, B, B, R, 1],
-    [1, R, B, B, B, B, R, 1],
-    [1, R, B, B, B, B, R, 1],
-    [1, R, B, B, B, B, R, 1],
-    [1, G, R, R, R, R, G, 1],
+    [1, R, B, R, B, R, B, 1],
+    [1, B, B, B, B, B, B, 1],
+    [1, R, B, G, G, B, R, 1],
+    [1, B, B, G, G, B, B, 1],
+    [1, R, B, G, G, B, R, 1],
+    [1, B, R, B, R, B, R, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+EASY_SQUARE_MAZE = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, 0, 0, 0, 0, G, 1],
+    [1, 0, 0, 0, 0, 0, G, 1],
+    [1, 0, 0, B, 0, 0, G, 1],
+    [1, 0, 0, 0, 0, 0, G, 1],
+    [1, 0, 0, 0, 0, 0, G, 1],
+    [1, G, G, G, G, G, G, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+SMALL_SQUARE_MAZE = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, 0, 0, G, 0, 0, 1],
+    [1, 0, B, 0, G, 0, 0, 1],
+    [1, 0, 0, 0, G, 0, 0, 1],
+    [1, G, G, G, G, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
@@ -48,22 +70,29 @@ BIG_MAZE = [
 
 
 MAZE_HEIGHT = 0.5
+XY_OFFSET = 4.0
 
 
 def find(structure, size_scaling, obj):
+    """Return (x,y) positions for cells equal to obj with a fixed -4,-4 offset."""
     objects = []
     for i in range(len(structure)):
         for j in range(len(structure[0])):
             if structure[i][j] == obj:
-                objects.append([i * size_scaling, j * size_scaling])
-
-    return jnp.array(objects)
+                x = i * float(size_scaling) - XY_OFFSET
+                y = j * float(size_scaling) - XY_OFFSET
+                objects.append([x, y])
+    return jnp.array(objects) if objects else jnp.zeros((0, 2))
 
 
 # Create a xml with maze and a list of possible goal positions
 def make_maze(maze_layout_name, maze_size_scaling):
     if maze_layout_name == "square_maze":
         maze_layout = SQUARE_MAZE
+    elif maze_layout_name == "easy_square_maze":
+        maze_layout = EASY_SQUARE_MAZE
+    elif maze_layout_name == "small_square_maze":
+        maze_layout = SMALL_SQUARE_MAZE
     elif maze_layout_name == "u_maze":
         maze_layout = U_MAZE
     elif maze_layout_name == "big_maze":
@@ -77,18 +106,19 @@ def make_maze(maze_layout_name, maze_size_scaling):
     possible_goals = find(maze_layout, maze_size_scaling, GOAL)
     possible_balls = find(maze_layout, maze_size_scaling, BALL)
 
-    # Compute bounds with half-cell padding for nice plotting extents
+    # Compute bounds with fixed -4,-4 world-frame offset and half-cell padding
     rows = len(maze_layout)
     cols = len(maze_layout[0])
-    half = 0.5 * float(maze_size_scaling)
-    x_bounds = (-half, (rows - 1) * float(maze_size_scaling) + half)
-    y_bounds = (-half, (cols - 1) * float(maze_size_scaling) + half)
+    scaling = float(maze_size_scaling)
+    half = 0.5 * scaling
+    x_bounds = (-XY_OFFSET - half, (rows - 1) * scaling - XY_OFFSET + half)
+    y_bounds = (-XY_OFFSET - half, (cols - 1) * scaling - XY_OFFSET + half)
 
     tree = ET.parse(xml_path)
     worldbody = tree.find(".//worldbody")
 
-    for i in range(len(maze_layout)):
-        for j in range(len(maze_layout[0])):
+    for i in range(rows):
+        for j in range(cols):
             struct = maze_layout[i][j]
             if struct == 1:
                 ET.SubElement(
@@ -97,15 +127,15 @@ def make_maze(maze_layout_name, maze_size_scaling):
                     name="block_%d_%d" % (i, j),
                     pos="%f %f %f"
                     % (
-                        i * maze_size_scaling,
-                        j * maze_size_scaling,
-                        MAZE_HEIGHT / 2 * maze_size_scaling,
+                        i * scaling - XY_OFFSET,
+                        j * scaling - XY_OFFSET,
+                        MAZE_HEIGHT / 2 * scaling,
                     ),
                     size="%f %f %f"
                     % (
-                        0.5 * maze_size_scaling,
-                        0.5 * maze_size_scaling,
-                        MAZE_HEIGHT / 2 * maze_size_scaling,
+                        0.5 * scaling,
+                        0.5 * scaling,
+                        MAZE_HEIGHT / 2 * scaling,
                     ),
                     type="box",
                     material="",

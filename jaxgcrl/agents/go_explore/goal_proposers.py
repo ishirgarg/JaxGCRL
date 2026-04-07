@@ -422,7 +422,8 @@ def create_max_critic_to_env_goal_proposer(
             'selected_state_goal': selected_state_goal, # (goal_dim,) - goal coordinates of maximizing state
         }
         
-        return selected_state_goal, goal_proposer_state, log_data
+        # As a goal proposer, return the sampled environment goal.
+        return env_goal, goal_proposer_state, log_data
     
     return propose_goal
 

@@ -1,10 +1,12 @@
 import functools
+import io
 import logging
 import time
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional
 
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import numpy as np
 import optax
 import wandb
@@ -25,11 +27,133 @@ from jaxgcrl.agents.go_explore.losses import (
     update_actor_sac,
     update_critic_sac,
 )
-from jaxgcrl.agents.sac.visualization import (
-                    log_dist_vs_reward_scatter,
-                    log_empowerment_map,
-                )
 from jaxgcrl.agents.go_explore.types import TrainingState as GETrainingState, Transition
+
+Metrics = Any
+
+
+# ---------------------------------------------------------------------------
+# Inline visualization helpers (no external visualization module required)
+# ---------------------------------------------------------------------------
+
+def _fig_to_wandb_image(fig: plt.Figure) -> wandb.Image:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    buf.seek(0)
+    img = wandb.Image(buf)
+    plt.close(fig)
+    return img
+
+
+def _log_dist_vs_reward_scatter(
+    replay_buffer,
+    buffer_state,
+    goal_indices: tuple[int, int],
+    empowerment_reward_scaling: float,
+    current_step: int,
+) -> Any:
+    """Sample the replay buffer and log a scatter of ‖achieved – goal‖ vs reward."""
+    try:
+        buf_state, transitions = replay_buffer.sample(buffer_state)
+        obs = np.asarray(transitions.observation)
+        reward = np.asarray(transitions.reward)
+
+        # Goal position lives at goal_indices (ball_rel x,y in new layout)
+        gi0, gi1 = goal_indices
+        goal_xy = obs[:, gi0 : gi1 + 1]           # (N, 2)
+        # Distance proxy: magnitude of the relative goal vector (already relative)
+        dist = np.linalg.norm(goal_xy, axis=-1)    # (N,)
+        unscaled_reward = reward / max(empowerment_reward_scaling, 1e-8)
+
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.scatter(dist, unscaled_reward, s=4, alpha=0.3)
+        ax.set_xlabel("‖goal_rel‖  (proxy for distance to goal)")
+        ax.set_ylabel("Empowerment reward (unscaled)")
+        ax.set_title(f"Dist vs Reward  step={current_step}")
+        wandb.log({"viz/dist_vs_reward": _fig_to_wandb_image(fig)}, step=current_step)
+    except Exception as exc:
+        logging.warning("log_dist_vs_reward_scatter failed: %s", exc)
+    return buffer_state
+
+
+def _log_empowerment_map(
+    emp_agent,
+    base_og_const: jnp.ndarray,     # fixed head obs (built once at startup)
+    ex_obs_dim: int,
+    ball_x_idx: int,
+    ball_y_idx: int,
+    x_low: float,
+    x_high: float,
+    y_low: float,
+    y_high: float,
+    grid_res: int,
+    current_step: int,
+    rng: jnp.ndarray,
+    fixed_ball_xy: tuple[float, float],
+) -> None:
+    """Build a grid-of-ant-positions empowerment map using the fixed head and log to W&B.
+
+    The fixed head (base_og_const) was constructed once at startup from the canonical
+    placement Ant=(0,0), Ball=(5,0).  For every grid point we copy that template and
+    overwrite only obs[0], obs[1] (ant x,y) and obs[ball_x_idx], obs[ball_y_idx].
+    """
+    try:
+        xs = np.linspace(x_low, x_high, grid_res, dtype=np.float32)
+        ys = np.linspace(y_low, y_high, grid_res, dtype=np.float32)
+        xx, yy = np.meshgrid(xs, ys)
+        flat_x = xx.reshape(-1)
+        flat_y = yy.reshape(-1)
+        N = flat_x.shape[0]
+
+        base_np = np.asarray(base_og_const)
+        obs_batch = np.broadcast_to(base_np[None, :], (N, ex_obs_dim)).copy()
+        obs_batch[:, 0] = flat_x
+        obs_batch[:, 1] = flat_y
+        obs_batch[:, ball_x_idx] = float(fixed_ball_xy[0])
+        obs_batch[:, ball_y_idx] = float(fixed_ball_xy[1])
+
+        # Chunked evaluation to avoid OOM
+        chunk = min(256, N)
+        emps = []
+        for start in range(0, N, chunk):
+            end = min(start + chunk, N)
+            chunk_rng = jax.random.fold_in(rng, start)
+            emps.append(
+                np.asarray(
+                    emp_agent.empowerment(
+                        jnp.asarray(obs_batch[start:end]),
+                        rng=chunk_rng,
+                    )
+                )
+            )
+        emp_map = np.concatenate(emps, axis=0).reshape(grid_res, grid_res)
+
+        fig, ax = plt.subplots(figsize=(5, 5))
+        im = ax.imshow(
+            emp_map,
+            origin="lower",
+            extent=[x_low, x_high, y_low, y_high],
+            aspect="auto",
+            cmap="viridis",
+        )
+        ax.scatter(
+            [fixed_ball_xy[0]], [fixed_ball_xy[1]],
+            c="red", s=60, marker="o", edgecolors="white", linewidths=0.8,
+            label="ball",
+        )
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title(f"Empowerment map  step={current_step}")
+        ax.set_xlabel("Ant x")
+        ax.set_ylabel("Ant y")
+        ax.legend(fontsize=7)
+        wandb.log({"viz/empowerment_map": _fig_to_wandb_image(fig)}, step=current_step)
+    except Exception as exc:
+        logging.warning("log_empowerment_map failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# External imports helper
+# ---------------------------------------------------------------------------
 
 def _setup_external_imports(ogbench_root: str):
     """Prepare OGBench imports and return registry/helpers."""
@@ -44,8 +168,9 @@ def _setup_external_imports(ogbench_root: str):
     return agent_registry, make_env_and_datasets, restore_agent
 
 
-Metrics = Any
-
+# ---------------------------------------------------------------------------
+# Main agent dataclass
+# ---------------------------------------------------------------------------
 
 @dataclass
 class EmpowermentSAC:
@@ -83,7 +208,9 @@ class EmpowermentSAC:
         randomization_fn: Optional[Callable] = None,
         progress_fn: Callable[[int, Metrics, Callable, Any, Any, bool], None] = lambda *args, **kwargs: None,
     ):
+        # ------------------------------------------------------------------
         # Load empowerment checkpoint
+        # ------------------------------------------------------------------
         agent_registry, make_env_and_datasets, restore_agent = _setup_external_imports(
             self.ogbench_root
         )
@@ -111,7 +238,7 @@ class EmpowermentSAC:
             ex_actions=example_batch["actions"],
             config=agent_cfg,
         )
-        # choose latest epoch if not provided
+        # Choose latest epoch if not provided
         if self.epoch is None:
             ckpts = glob.glob(os.path.join(self.run_dir, "params_*.pkl"))
             epochs = []
@@ -127,7 +254,40 @@ class EmpowermentSAC:
         emp_agent = restore_agent(emp_agent, self.run_dir, self_epoch)
         ex_obs_dim = int(example_batch["observations"].shape[-1])
 
-        # Wrap envs like go_explore style (not brax training wrap to keep goal intact)
+        # ------------------------------------------------------------------
+        # Build the fixed head observation once (Ant=(0,0), Ball=(5,0)).
+        # This is the base template used for both online reward shaping and
+        # the empowerment-map visualization.  Only ant x/y and ball x/y
+        # indices are overwritten at inference time.
+        # ------------------------------------------------------------------
+        ogbench_base_obs_dim = 42
+        if ex_obs_dim % ogbench_base_obs_dim != 0:
+            raise ValueError(
+                f"Checkpoint obs dim {ex_obs_dim} must be a multiple of {ogbench_base_obs_dim}."
+            )
+        base_env = ogbench_env.unwrapped if hasattr(ogbench_env, "unwrapped") else ogbench_env
+        base_env.set_agent_ball_xy(
+            np.array([0.0, 0.0], dtype=np.float64),
+            np.array([5.0, 0.0], dtype=np.float64),
+        )
+        if hasattr(base_env, "get_ob"):
+            base_og_np = np.asarray(base_env.get_ob(), dtype=np.float32)
+        else:
+            base_og_np = np.asarray(base_env._get_obs(), dtype=np.float32)
+        # Tile for frame-stacking if needed
+        if int(base_og_np.shape[0]) != int(ex_obs_dim):
+            stack = ex_obs_dim // int(base_og_np.shape[0])
+            if stack > 1 and stack * int(base_og_np.shape[0]) == int(ex_obs_dim):
+                base_og_np = np.concatenate([base_og_np] * stack, axis=-1)
+        base_og_const = jnp.asarray(base_og_np)
+
+        # Hardcoded OGBench indices for ball x,y in qpos layout
+        _ball_x_idx = 15
+        _ball_y_idx = 16
+
+        # ------------------------------------------------------------------
+        # Wrap envs
+        # ------------------------------------------------------------------
         unwrapped_env = train_env
         train_env = VmapWrapper(unwrapped_env)
         train_env = EpisodeWrapper(train_env, config.episode_length, config.action_repeat)
@@ -145,11 +305,13 @@ class EmpowermentSAC:
         action_size = unwrapped_env.action_size
         state_size = int(unwrapped_env.observation_size)
         obs_size_net = state_size
-        # With new layout: tail is [ball_rel(2), goal_rel(2)]
-        goal_indices = (obs_size_net - 4, obs_size_net - 3)  # start of ball_rel (used only for APIs that require it)
-        goal_target_indices = (obs_size_net - 2, obs_size_net - 1)  # goal_rel
+        # Tail layout: [ball_rel(2), goal_rel(2)]
+        goal_indices = (obs_size_net - 4, obs_size_net - 3)
+        goal_target_indices = (obs_size_net - 2, obs_size_net - 1)
 
+        # ------------------------------------------------------------------
         # Networks
+        # ------------------------------------------------------------------
         key = jax.random.PRNGKey(config.seed)
         key, actor_key, critic_key, alpha_key, env_key, eval_env_key, buffer_key = jax.random.split(key, 7)
         actor, critic = get_explore_policy(
@@ -188,7 +350,9 @@ class EmpowermentSAC:
             target_critic_params=target_critic_params,
         )
 
+        # ------------------------------------------------------------------
         # Replay buffer
+        # ------------------------------------------------------------------
         dummy_obs = jnp.zeros((obs_size_net,))
         dummy_action = jnp.zeros((action_size,))
         dummy_transition = Transition(
@@ -232,34 +396,27 @@ class EmpowermentSAC:
         num_prefill_actor_steps = int(np.ceil(self.min_replay_size / self.unroll_length))
         logging.info("Num_prefill_actor_steps: %d", num_prefill_actor_steps)
 
-        # Empowerment reward adapter: pure-JAX mapping to OGBench obs without setting goal (goal zeroed).
-        ogbench_base_obs_dim = 42
-        if ex_obs_dim % ogbench_base_obs_dim != 0:
-            raise ValueError(f"Checkpoint obs dim {ex_obs_dim} must be multiple of {ogbench_base_obs_dim}.")
-        frame_stack = ex_obs_dim // ogbench_base_obs_dim
-        # Capture a constant OGBench head (first 38 dims) from an actual env reset observation.
-        # This mirrors the plotting script preference to use env-generated observation structure.
-        obs_reset, _ = ogbench_env.reset()
-        obs_reset_np = np.asarray(obs_reset, dtype=np.float32)
-        base_frame_np = obs_reset_np[:ogbench_base_obs_dim]  # take first frame if stacked
-        og_head_np = base_frame_np[: ogbench_base_obs_dim - 4]  # first 38 dims
-        og_head_const = jnp.asarray(og_head_np)  # constant used inside jit
-
+        # ------------------------------------------------------------------
+        # Empowerment reward (online, JIT-compiled).
+        # Uses the fixed head (base_og_const); only ant x/y and ball x/y are
+        # overwritten from the current Brax observation.
+        # ------------------------------------------------------------------
         @jax.jit
-        def empowerment_reward_online_with_key(full_obs_batch: jnp.ndarray, rng_key: jnp.ndarray) -> jnp.ndarray:
-            # State obs layout: [ant_xy(2), ..., ball_rel(2), goal_rel(2)].
-            # Build 42-d OGBench obs by taking a fixed head from example obs and inserting current rel terms.
+        def empowerment_reward_online_with_key(
+            full_obs_batch: jnp.ndarray, rng_key: jnp.ndarray
+        ) -> jnp.ndarray:
             batch_size = full_obs_batch.shape[0]
-            ball_rel = full_obs_batch[:, -4:-2]
-            goal_rel = full_obs_batch[:, -2:]
-            head = jnp.broadcast_to(og_head_const, (batch_size, ogbench_base_obs_dim - 4))
-            base_og = jnp.concatenate([head, ball_rel, goal_rel], axis=1)  # [N, 42]
-            if frame_stack > 1:
-                base_og = jnp.tile(base_og, (1, frame_stack))  # [N, 42*stack]
+            base_og = jnp.broadcast_to(base_og_const, (batch_size, ex_obs_dim))
+            base_og = base_og.at[:, 0].set(full_obs_batch[:, 0])
+            base_og = base_og.at[:, 1].set(full_obs_batch[:, 1])
+            # Ball absolute position lives at [-4:-2] in the Brax obs tail
+            base_og = base_og.at[:, _ball_x_idx].set(full_obs_batch[:, -4])
+            base_og = base_og.at[:, _ball_y_idx].set(full_obs_batch[:, -3])
             return emp_agent.empowerment(base_og, rng=rng_key)
 
-
+        # ------------------------------------------------------------------
         # Actor step with empowerment reward
+        # ------------------------------------------------------------------
         def actor_step(training_state, env, env_state, action_key, emp_key, extra_fields=()):
             state_obs = env_state.obs[:, :state_size]
             actions = actor.sample_actions(
@@ -267,8 +424,6 @@ class EmpowermentSAC:
             )
             nstate = env.step(env_state, actions)
             next_state_obs = nstate.obs[:, :state_size]
-
-            # Absolute-empowerment shaping: reward proportional to next state's empowerment.
             next_emp = empowerment_reward_online_with_key(next_state_obs, emp_key)
             combined_reward = self.empowerment_reward_scaling * next_emp # + nstate.reward
             state_extras = {x: nstate.info[x] for x in extra_fields}
@@ -287,10 +442,15 @@ class EmpowermentSAC:
             def f(carry, _):
                 es, bs, k = carry
                 action_key, emp_key, nk = jax.random.split(k, 3)
-                es, transition = actor_step(training_state, train_env, es, action_key, emp_key, extra_fields=("truncation", "traj_id"))
+                es, transition = actor_step(
+                    training_state, train_env, es, action_key, emp_key,
+                    extra_fields=("truncation", "traj_id"),
+                )
                 return (es, bs, nk), transition
 
-            (env_state, buffer_state, _), data = jax.lax.scan(f, (env_state, buffer_state, key), (), length=self.unroll_length)
+            (env_state, buffer_state, _), data = jax.lax.scan(
+                f, (env_state, buffer_state, key), (), length=self.unroll_length
+            )
             buffer_state = replay_buffer.insert(buffer_state, data)
             return env_state, buffer_state
 
@@ -330,27 +490,36 @@ class EmpowermentSAC:
         @jax.jit
         def training_step(training_state, env_state, buffer_state, key):
             exp_key, process_key, train_key = jax.random.split(key, 3)
-            env_state, buffer_state = get_experience(training_state, env_state, buffer_state, exp_key)
-            training_state = training_state.replace(env_steps=training_state.env_steps + env_steps_per_actor_step)
+            env_state, buffer_state = get_experience(
+                training_state, env_state, buffer_state, exp_key
+            )
+            training_state = training_state.replace(
+                env_steps=training_state.env_steps + env_steps_per_actor_step
+            )
             buffer_state, transitions = replay_buffer.sample(buffer_state)
-            # Empowerment reward stats over sampled batch
             r = transitions.reward / self.empowerment_reward_scaling
             transitions, _ = actor.process_transitions(
                 transitions, process_key, self.batch_size, self.discounting,
                 obs_size_net, goal_indices, unwrapped_env.goal_reach_thresh, use_her=False,
             )
-            (training_state, _), metrics = jax.lax.scan(update_networks, (training_state, train_key), transitions)
+            (training_state, _), metrics = jax.lax.scan(
+                update_networks, (training_state, train_key), transitions
+            )
             metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
             metrics["reward_mean"] = jnp.mean(r)
             metrics["reward_min"] = jnp.min(r)
             metrics["reward_max"] = jnp.max(r)
-            # Log absolute empowerment term separately (unscaled and scaled)
             emp_abs = transitions.extras["state_extras"]["emp_abs"]
             metrics["emp_abs_mean"] = jnp.mean(emp_abs)
             metrics["emp_abs_min"] = jnp.min(emp_abs)
             metrics["emp_abs_max"] = jnp.max(emp_abs)
             metrics["emp_abs_scaled_mean"] = self.empowerment_reward_scaling * jnp.mean(emp_abs)
             return (training_state, env_state, buffer_state), metrics
+
+        # Steps-per-epoch scheduling (same as SAC)
+        available_env_steps = config.total_env_steps - (self.min_replay_size * config.num_envs)
+        env_steps_per_epoch = max(1, available_env_steps // max(config.num_evals, 1))
+        num_training_steps_per_epoch = max(1, env_steps_per_epoch // env_steps_per_actor_step)
 
         @jax.jit
         def training_epoch(training_state, env_state, buffer_state, key):
@@ -362,7 +531,8 @@ class EmpowermentSAC:
                 return (ts, es, bs, k), metrics
 
             (training_state, env_state, buffer_state, key), metrics = jax.lax.scan(
-                f, (training_state, env_state, buffer_state, key), (), length=num_training_steps_per_epoch,
+                f, (training_state, env_state, buffer_state, key), (),
+                length=num_training_steps_per_epoch,
             )
             return training_state, env_state, buffer_state, metrics
 
@@ -377,18 +547,24 @@ class EmpowermentSAC:
                 return (ts, es, bs, nk), ()
 
             (training_state, env_state, buffer_state, _), _ = jax.lax.scan(
-                f, (training_state, env_state, buffer_state, key), (), length=num_prefill_actor_steps
+                f, (training_state, env_state, buffer_state, key), (),
+                length=num_prefill_actor_steps,
             )
             return training_state, env_state, buffer_state
 
         key, prefill_key = jax.random.split(key)
-        training_state, env_state, buffer_state = prefill_replay_buffer(training_state, env_state, buffer_state, prefill_key)
+        training_state, env_state, buffer_state = prefill_replay_buffer(
+            training_state, env_state, buffer_state, prefill_key
+        )
 
+        # ------------------------------------------------------------------
         # Evaluator
+        # ------------------------------------------------------------------
         def eval_actor_step(training_state, env, env_state, extra_fields=()):
             state_obs = env_state.obs[:, :state_size]
             actions = actor.sample_actions(
-                training_state.actor_state.params, state_obs, jax.random.PRNGKey(0), is_deterministic=self.deterministic_eval,
+                training_state.actor_state.params, state_obs,
+                jax.random.PRNGKey(0), is_deterministic=self.deterministic_eval,
             )
             nstate = env.step(env_state, actions)
             state_extras = {x: nstate.info[x] for x in extra_fields}
@@ -409,92 +585,81 @@ class EmpowermentSAC:
             key=eval_env_key,
         )
 
-        # Main loop
-        training_walltime = 0.0
-        # Steps per epoch to spread evenly over num_evals (like SAC)
-        available_env_steps = config.total_env_steps - (self.min_replay_size * config.num_envs)
-        env_steps_per_epoch = max(1, available_env_steps // max(config.num_evals, 1))
-        num_training_steps_per_epoch = max(1, env_steps_per_epoch // env_steps_per_actor_step)
-        # Precompute layout metadata for script-style empowerment-map plotting.
-        from jaxgcrl.envs.ant_ball_maze import BIG_MAZE, SQUARE_MAZE, U_MAZE
-        if "square" in config.env:
-            layout = np.array(SQUARE_MAZE, dtype=object)
-            layout_name = "square_maze"
-        elif "u_maze" in config.env:
-            layout = np.array(U_MAZE, dtype=object)
-            layout_name = "u_maze"
-        elif "big_maze" in config.env:
-            layout = np.array(BIG_MAZE, dtype=object)
-            layout_name = "big_maze"
-        else:
-            layout = np.array(SQUARE_MAZE, dtype=object)
-            layout_name = "square_maze"
-        wall_mask = np.equal(layout, 1)
-        x_low = float(unwrapped_env.x_bounds[0])
-        x_high = float(unwrapped_env.x_bounds[1])
-        y_low = float(unwrapped_env.y_bounds[0])
-        y_high = float(unwrapped_env.y_bounds[1])
-        grid_res = 80
-        xs = np.linspace(x_low, x_high, grid_res, dtype=np.float32)
-        ys = np.linspace(y_low, y_high, grid_res, dtype=np.float32)
-        xx, yy = np.meshgrid(xs, ys)
-        maze_size_scaling = (x_high - x_low) / float(layout.shape[0])
-        half = 0.5 * maze_size_scaling
-
-        # Match SAC's make_policy signature: make_policy(params, deterministic=False) -> (obs, key) -> (actions, extras)
         def make_policy(params, deterministic: bool = False):
             def policy(obs, key):
                 actions = actor.sample_actions(params, obs, key, is_deterministic=deterministic)
                 return actions, {}
             return policy
 
+        # Precompute maze bounds for visualization
+        x_low = float(unwrapped_env.x_bounds[0])
+        x_high = float(unwrapped_env.x_bounds[1])
+        y_low = float(unwrapped_env.y_bounds[0])
+        y_high = float(unwrapped_env.y_bounds[1])
+        # Fixed ball position for the empowerment map: centre of the maze bounds
+        _vis_ball_xy = (0.5 * (x_low + x_high), 0.5 * (y_low + y_high))
+
+        # ------------------------------------------------------------------
+        # Main training loop
+        # ------------------------------------------------------------------
+        training_walltime = 0.0
         current_step = 0
         for ne in range(config.num_evals):
             t = time.time()
             key, epoch_key = jax.random.split(key)
-            training_state, env_state, buffer_state, metrics = training_epoch(training_state, env_state, buffer_state, epoch_key)
+            training_state, env_state, buffer_state, metrics = training_epoch(
+                training_state, env_state, buffer_state, epoch_key
+            )
             metrics = jax.tree_util.tree_map(jnp.mean, metrics)
             jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
             epoch_time = time.time() - t
             training_walltime += epoch_time
             current_step = int(training_state.env_steps.item())
             sps = (env_steps_per_actor_step * num_training_steps_per_epoch) / epoch_time
-            log = {"training/sps": sps, "training/walltime": training_walltime, "training/envsteps": current_step}
+            log = {
+                "training/sps": sps,
+                "training/walltime": training_walltime,
+                "training/envsteps": current_step,
+            }
             for name, value in metrics.items():
                 v = float(value.item()) if hasattr(value, "item") else float(value)
                 log[f"training/{name}"] = v
             log = evaluator.run_evaluation(training_state, log)
+
             do_render = (ne % config.visualization_interval) == 0
             if do_render:
-                buffer_state = log_dist_vs_reward_scatter(
+                buffer_state = _log_dist_vs_reward_scatter(
                     replay_buffer,
                     buffer_state,
                     goal_indices,
                     self.empowerment_reward_scaling,
                     current_step,
                 )
-                key, vis_emp_key = jax.random.split(key)
-                buffer_state = log_empowerment_map(
-                    replay_buffer,
-                    buffer_state,
-                    unwrapped_env,
-                    goal_indices,
-                    goal_target_indices,
-                    obs_size_net,
-                    empowerment_reward_online_with_key,
-                    current_step,
-                    config.env,
-                    vis_emp_key,
+                key, vis_key = jax.random.split(key)
+                _log_empowerment_map(
+                    emp_agent=emp_agent,
+                    base_og_const=base_og_const,
+                    ex_obs_dim=ex_obs_dim,
+                    ball_x_idx=_ball_x_idx,
+                    ball_y_idx=_ball_y_idx,
+                    x_low=x_low,
+                    x_high=x_high,
+                    y_low=y_low,
+                    y_high=y_high,
+                    grid_res=80,
+                    current_step=current_step,
+                    rng=vis_key,
+                    fixed_ball_xy=_vis_ball_xy,
                 )
+
             progress_fn(
                 current_step,
                 log,
                 functools.partial(make_policy, deterministic=self.deterministic_eval),
-                training_state.actor_state.params,  # actor params
+                training_state.actor_state.params,
                 unwrapped_env,
                 do_render,
             )
 
         params = training_state.actor_state.params
         return functools.partial(make_policy, deterministic=self.deterministic_eval), params, log
-
