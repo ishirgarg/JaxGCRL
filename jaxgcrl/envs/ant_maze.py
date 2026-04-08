@@ -40,6 +40,16 @@ U_MAZE_EVAL = [
     [1, 1, 1, 1, 1],
 ]
 
+OGBENCH_MEDIUM_NAVIGATE = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, 0, 1, 0, 0, G, 1],
+    [1, 0, 0, 0, 0, 1, 0, 1],
+    [1, 1, 1, G, 1, 0, 0, 1],
+    [1, 1, 0, 0, 0, 0, 1, 1],
+    [1, 0, 0, 1, 0, 1, G, 1],
+    [1, G, 0, 1, G, 0, 0, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
 
 BIG_MAZE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
@@ -91,21 +101,23 @@ MAZE_HEIGHT = 0.5
 
 
 def find_starts(structure, size_scaling):
+    xy_offset = float(size_scaling)  # one maze cell width
     starts = []
     for i in range(len(structure)):
         for j in range(len(structure[0])):
             if structure[i][j] == RESET:
-                starts.append([i * size_scaling, j * size_scaling])
+                starts.append([i * size_scaling - xy_offset, j * size_scaling - xy_offset])
 
     return jnp.array(starts)
 
 
 def find_goals(structure, size_scaling):
+    xy_offset = float(size_scaling)  # one maze cell width
     goals = []
     for i in range(len(structure)):
         for j in range(len(structure[0])):
             if structure[i][j] == GOAL:
-                goals.append([i * size_scaling, j * size_scaling])
+                goals.append([i * size_scaling - xy_offset, j * size_scaling - xy_offset])
 
     return jnp.array(goals)
 
@@ -118,6 +130,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
         maze_layout = U_MAZE_HARD
     elif maze_layout_name == "u_maze_eval":
         maze_layout = U_MAZE_EVAL
+    elif maze_layout_name == "ogbench_medium_navigate":
+        maze_layout = OGBENCH_MEDIUM_NAVIGATE
     elif maze_layout_name == "big_maze":
         maze_layout = BIG_MAZE
     elif maze_layout_name == "big_maze_hard":
@@ -130,6 +144,7 @@ def make_maze(maze_layout_name, maze_size_scaling):
         raise ValueError(f"Unknown maze layout: {maze_layout_name}")
 
     xml_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", "ant_maze.xml")
+    xy_offset = float(maze_size_scaling)  # one maze cell width
 
     possible_starts = find_starts(maze_layout, maze_size_scaling)
     possible_goals = find_goals(maze_layout, maze_size_scaling)
@@ -147,8 +162,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
                     name="block_%d_%d" % (i, j),
                     pos="%f %f %f"
                     % (
-                        i * maze_size_scaling,
-                        j * maze_size_scaling,
+                        i * maze_size_scaling - xy_offset,
+                        j * maze_size_scaling - xy_offset,
                         MAZE_HEIGHT / 2 * maze_size_scaling,
                     ),
                     size="%f %f %f"
@@ -197,6 +212,8 @@ class AntMaze(PipelineEnv):
             maze_layout = U_MAZE_HARD
         elif maze_layout_name == "u_maze_eval":
             maze_layout = U_MAZE_EVAL
+        elif maze_layout_name == "ogbench_medium_navigate":
+            maze_layout = OGBENCH_MEDIUM_NAVIGATE
         elif maze_layout_name == "big_maze":
             maze_layout = BIG_MAZE
         elif maze_layout_name == "big_maze_hard":
@@ -211,13 +228,15 @@ class AntMaze(PipelineEnv):
         # Calculate x and y bounds based on maze layout dimensions
         num_rows = len(maze_layout)
         num_cols = len(maze_layout[0])
+        half = 0.5 * maze_size_scaling
+        xy_offset = float(maze_size_scaling)  # one maze cell width
         self.x_bounds = jnp.array([
-            0.5 * maze_size_scaling,
-            (num_rows - 0.5) * maze_size_scaling
+            -xy_offset - half,
+            (num_rows - 1) * maze_size_scaling - xy_offset + half,
         ])
         self.y_bounds = jnp.array([
-            0.5 * maze_size_scaling,
-            (num_cols - 0.5) * maze_size_scaling
+            -xy_offset - half,
+            (num_cols - 1) * maze_size_scaling - xy_offset + half,
         ])
 
         sys = mjcf.loads(xml_string)

@@ -26,7 +26,7 @@ from jaxgcrl.agents.go_explore.losses import (
     update_alpha_sac,
     update_actor_sac,
     update_critic_sac,
-)
+                )
 from jaxgcrl.agents.go_explore.types import TrainingState as GETrainingState, Transition
 
 Metrics = Any
@@ -53,27 +53,24 @@ def _log_dist_vs_reward_scatter(
     current_step: int,
 ) -> Any:
     """Sample the replay buffer and log a scatter of ‖achieved – goal‖ vs reward."""
-    try:
-        buf_state, transitions = replay_buffer.sample(buffer_state)
-        obs = np.asarray(transitions.observation)
-        reward = np.asarray(transitions.reward)
+    buf_state, transitions = replay_buffer.sample(buffer_state)
+    obs = np.asarray(transitions.observation)
+    reward = np.asarray(transitions.reward)
 
-        # Goal position lives at goal_indices (ball_rel x,y in new layout)
-        gi0, gi1 = goal_indices
-        goal_xy = obs[:, gi0 : gi1 + 1]           # (N, 2)
-        # Distance proxy: magnitude of the relative goal vector (already relative)
-        dist = np.linalg.norm(goal_xy, axis=-1)    # (N,)
-        unscaled_reward = reward / max(empowerment_reward_scaling, 1e-8)
+    # Goal position lives at goal_indices (ball_rel x,y in new layout)
+    gi0, gi1 = goal_indices
+    goal_xy = obs[:, gi0 : gi1 + 1]           # (N, 2)
+    # Distance proxy: magnitude of the relative goal vector (already relative)
+    dist = np.linalg.norm(goal_xy, axis=-1)    # (N,)
+    unscaled_reward = reward / max(empowerment_reward_scaling, 1e-8)
 
-        fig, ax = plt.subplots(figsize=(5, 4))
-        ax.scatter(dist, unscaled_reward, s=4, alpha=0.3)
-        ax.set_xlabel("‖goal_rel‖  (proxy for distance to goal)")
-        ax.set_ylabel("Empowerment reward (unscaled)")
-        ax.set_title(f"Dist vs Reward  step={current_step}")
-        wandb.log({"viz/dist_vs_reward": _fig_to_wandb_image(fig)}, step=current_step)
-    except Exception as exc:
-        logging.warning("log_dist_vs_reward_scatter failed: %s", exc)
-    return buffer_state
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.scatter(dist, unscaled_reward, s=4, alpha=0.3)
+    ax.set_xlabel("‖goal_rel‖  (proxy for distance to goal)")
+    ax.set_ylabel("Empowerment reward (unscaled)")
+    ax.set_title(f"Dist vs Reward  step={current_step}")
+    wandb.log({"viz/dist_vs_reward": _fig_to_wandb_image(fig)}, step=current_step)
+    return buf_state
 
 
 def _log_empowerment_map(
@@ -97,59 +94,76 @@ def _log_empowerment_map(
     placement Ant=(0,0), Ball=(5,0).  For every grid point we copy that template and
     overwrite only obs[0], obs[1] (ant x,y) and obs[ball_x_idx], obs[ball_y_idx].
     """
-    try:
-        xs = np.linspace(x_low, x_high, grid_res, dtype=np.float32)
-        ys = np.linspace(y_low, y_high, grid_res, dtype=np.float32)
-        xx, yy = np.meshgrid(xs, ys)
-        flat_x = xx.reshape(-1)
-        flat_y = yy.reshape(-1)
-        N = flat_x.shape[0]
+    xs = np.linspace(x_low, x_high, grid_res, dtype=np.float32)
+    ys = np.linspace(y_low, y_high, grid_res, dtype=np.float32)
+    xx, yy = np.meshgrid(xs, ys)
+    flat_x = xx.reshape(-1)
+    flat_y = yy.reshape(-1)
+    N = flat_x.shape[0]
 
-        base_np = np.asarray(base_og_const)
-        obs_batch = np.broadcast_to(base_np[None, :], (N, ex_obs_dim)).copy()
-        obs_batch[:, 0] = flat_x
-        obs_batch[:, 1] = flat_y
-        obs_batch[:, ball_x_idx] = float(fixed_ball_xy[0])
-        obs_batch[:, ball_y_idx] = float(fixed_ball_xy[1])
+    base_np = np.asarray(base_og_const)
+    obs_batch = np.broadcast_to(base_np[None, :], (N, ex_obs_dim)).copy()
+    obs_batch[:, 0] = flat_x
+    obs_batch[:, 1] = flat_y
+    obs_batch[:, ball_x_idx] = float(fixed_ball_xy[0])
+    obs_batch[:, ball_y_idx] = float(fixed_ball_xy[1])
 
-        # Chunked evaluation to avoid OOM
-        chunk = min(256, N)
-        emps = []
-        for start in range(0, N, chunk):
-            end = min(start + chunk, N)
-            chunk_rng = jax.random.fold_in(rng, start)
-            emps.append(
-                np.asarray(
-                    emp_agent.empowerment(
-                        jnp.asarray(obs_batch[start:end]),
-                        rng=chunk_rng,
-                    )
+    # Chunked evaluation to avoid OOM
+    chunk = min(256, N)
+    emps = []
+    for start in range(0, N, chunk):
+        end = min(start + chunk, N)
+        chunk_rng = jax.random.fold_in(rng, start)
+        emps.append(
+            np.asarray(
+                emp_agent.empowerment(
+                    jnp.asarray(obs_batch[start:end]),
+                    rng=chunk_rng,
                 )
             )
-        emp_map = np.concatenate(emps, axis=0).reshape(grid_res, grid_res)
-
-        fig, ax = plt.subplots(figsize=(5, 5))
-        im = ax.imshow(
-            emp_map,
-            origin="lower",
-            extent=[x_low, x_high, y_low, y_high],
-            aspect="auto",
-            cmap="viridis",
         )
-        ax.scatter(
-            [fixed_ball_xy[0]], [fixed_ball_xy[1]],
-            c="red", s=60, marker="o", edgecolors="white", linewidths=0.8,
-            label="ball",
-        )
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_title(f"Empowerment map  step={current_step}")
-        ax.set_xlabel("Ant x")
-        ax.set_ylabel("Ant y")
-        ax.legend(fontsize=7)
-        wandb.log({"viz/empowerment_map": _fig_to_wandb_image(fig)}, step=current_step)
-    except Exception as exc:
-        logging.warning("log_empowerment_map failed: %s", exc)
+    emp_map = np.concatenate(emps, axis=0).reshape(grid_res, grid_res)
 
+    fig, ax = plt.subplots(figsize=(5, 5))
+    im = ax.imshow(
+        emp_map,
+        origin="lower",
+        extent=[x_low, x_high, y_low, y_high],
+        aspect="auto",
+        cmap="viridis",
+    )
+    ax.scatter(
+        [fixed_ball_xy[0]], [fixed_ball_xy[1]],
+        c="red", s=60, marker="o", edgecolors="white", linewidths=0.8,
+        label="ball",
+    )
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title(f"Empowerment map  step={current_step}")
+    ax.set_xlabel("Ant x")
+    ax.set_ylabel("Ant y")
+    ax.legend(fontsize=7)
+    wandb.log({"viz/empowerment_map": _fig_to_wandb_image(fig)}, step=current_step)
+
+
+def _log_replay_xy_reward_scatter(
+    replay_buffer,
+    buffer_state,
+    current_step: int,
+) -> Any:
+    """Scatter of (ant x, ant y) colored by reward from a replay buffer sample."""
+    buf_state, transitions = replay_buffer.sample(buffer_state)
+    obs = np.asarray(transitions.observation)
+    reward = np.asarray(transitions.reward)
+    xs = obs[:, 0]
+    ys = obs[:, 1]
+    fig, ax = plt.subplots(figsize=(5, 5))
+    sc = ax.scatter(xs, ys, c=reward, s=8, cmap="viridis")
+    ax.set_xlabel("Ant x")
+    ax.set_ylabel("Ant y")
+    ax.set_title(f"Replay (x,y) colored by reward  step={current_step}")
+    fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label="reward")
+    wandb.log({"viz/replay_xy_reward": _fig_to_wandb_image(fig)}, step=current_step)
+    return buf_state
 
 # ---------------------------------------------------------------------------
 # External imports helper
@@ -433,7 +447,7 @@ class EmpowermentSAC:
                 emp_delta = next_emp - cur_emp
                 shaped_reward = emp_delta
             else:
-                next_emp = empowerment_reward_online_with_key(next_state_obs, emp_key)
+            next_emp = empowerment_reward_online_with_key(next_state_obs, emp_key)
                 emp_delta = jnp.zeros_like(next_emp)
                 shaped_reward = next_emp
             combined_reward = self.empowerment_reward_scaling * shaped_reward
@@ -650,6 +664,11 @@ class EmpowermentSAC:
                     buffer_state,
                     goal_indices,
                     self.empowerment_reward_scaling,
+                    current_step,
+                )
+                buffer_state = _log_replay_xy_reward_scatter(
+                    replay_buffer,
+                    buffer_state,
                     current_step,
                 )
                 key, vis_key = jax.random.split(key)
