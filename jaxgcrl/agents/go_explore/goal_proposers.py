@@ -20,6 +20,7 @@ def create_goal_proposer(
     actor: Optional[Any] = None,
     critic: Optional[Any] = None,
     discounting: float=0.99,
+    offline_empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
 ) -> Callable:
     """
     Factory function to create a goal proposer function.
@@ -60,6 +61,15 @@ def create_goal_proposer(
         return create_mega_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices)
     elif goal_proposer_name == "omega":
         return create_omega_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices)
+    elif goal_proposer_name == "empowerment":
+        return create_empowerment_goal_proposer(
+            env,
+            num_envs,
+            num_candidates,
+            state_size,
+            goal_indices,
+            offline_empowerment_scorer,
+        )
     else:
         raise ValueError(f"Unknown goal proposer: {goal_proposer_name}")
 
@@ -425,6 +435,50 @@ def create_max_critic_to_env_goal_proposer(
         # As a goal proposer, return the sampled environment goal.
         return env_goal, goal_proposer_state, log_data
     
+    return propose_goal
+
+
+def create_empowerment_goal_proposer(
+    env,
+    num_envs: int,
+    num_candidates: int,
+    state_size: Optional[int] = None,
+    goal_indices: Optional[tuple] = None,
+    offline_empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
+) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
+    """Selects the replay-buffer candidate state with maximal offline empowerment."""
+    if offline_empowerment_scorer is None:
+        raise ValueError("offline_empowerment_scorer must be provided for empowerment proposer.")
+
+    goal_idx_array = jnp.array(goal_indices)
+
+    def propose_goal(rng: jax.Array, start_obs: jnp.ndarray, goal_proposer_state: GoalProposerState):
+        transitions_sample = goal_proposer_state.transitions_sample
+        obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
+        states = obs_flat[:, :state_size]  # (N, state_size)
+
+        num_states = states.shape[0]
+        rng, sample_rng, emp_rng = jax.random.split(rng, 3)
+        candidate_indices = jax.random.randint(sample_rng, (num_candidates,), 0, num_states)
+        candidate_states = states[candidate_indices]  # (num_candidates, state_size)
+
+        emp_scores = offline_empowerment_scorer(candidate_states, emp_rng)  # (num_candidates,)
+        best_idx = jnp.argmax(emp_scores)
+        selected_state = candidate_states[best_idx]
+        selected_goal = selected_state[goal_idx_array]
+
+        first_obs_state = start_obs[:state_size]
+        first_obs_position = first_obs_state[goal_idx_array]
+        candidate_goals = candidate_states[:, goal_idx_array]
+
+        log_data = {
+            "candidate_goals": candidate_goals,
+            "first_obs_position": first_obs_position,
+            "emp_scores": emp_scores,
+            "selected_goal": selected_goal,
+        }
+        return selected_goal, goal_proposer_state, log_data
+
     return propose_goal
 
 

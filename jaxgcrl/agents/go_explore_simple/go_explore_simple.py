@@ -48,6 +48,11 @@ from jaxgcrl.agents.go_explore.goal_proposers import (
     create_goal_proposer,
     create_random_env_goals_proposer,
 )
+from jaxgcrl.agents.go_explore.empowerment import (
+    load_offline_empowerment_agent,
+    make_empowerment_obs_builder,
+    make_offline_empowerment_scorer,
+)
 import numpy as np
 import os
 
@@ -97,8 +102,12 @@ class GoExploreSimple:
     n_critics: int = 2
     use_her: bool = True
 
-    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega"] = "random_env_goals"
+    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega", "empowerment"] = "random_env_goals"
     num_candidates: int = 512
+    empowerment_ogbench_root: str = "/home/ishir/ogbench"
+    empowerment_run_dir: Optional[str] = None
+    empowerment_epoch: Optional[int] = None
+    empowerment_num_splus_samples: int = 128
 
     # ── Go Explore specific parameters ──────────────────────────────────────
     num_gcp_steps: int = 250      # max steps in go phase before forcing explore
@@ -223,6 +232,24 @@ class GoExploreSimple:
             target_critic_params=target_critic_params,
         )
 
+        # ── Optional offline-empowerment scorer for goal proposer ───────────
+        offline_empowerment_scorer = None
+        if self.goal_proposer_name == "empowerment":
+            if self.empowerment_run_dir is None:
+                raise ValueError("empowerment_run_dir must be set when goal_proposer_name='empowerment'.")
+            emp_agent, ex_obs_dim = load_offline_empowerment_agent(
+                ogbench_root=self.empowerment_ogbench_root,
+                run_dir=self.empowerment_run_dir,
+                epoch=self.empowerment_epoch,
+                num_splus_samples=self.empowerment_num_splus_samples,
+            )
+            obs_builder = make_empowerment_obs_builder(
+                ex_obs_dim=ex_obs_dim,
+                overwrite_map=None,
+                base_obs=None,
+            )
+            offline_empowerment_scorer = make_offline_empowerment_scorer(emp_agent, obs_builder)
+
         # ── Goal proposer ────────────────────────────────────────────────────
         goal_proposer = create_goal_proposer(
             self.goal_proposer_name,
@@ -234,6 +261,7 @@ class GoExploreSimple:
             actor=gcp_actor,
             critic=gcp_critic,
             discounting=self.discounting,
+            offline_empowerment_scorer=offline_empowerment_scorer,
         )
 
         # ── Env reset ────────────────────────────────────────────────────────

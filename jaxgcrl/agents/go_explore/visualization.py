@@ -681,7 +681,48 @@ def handle_goal_proposer_visualization(
             x_bounds=x_bounds,
             y_bounds=y_bounds,
         )
+    elif goal_proposer_name == "empowerment":
+        visualize_empowerment_candidates(
+            candidate_goals=log_data["candidate_goals"],
+            first_obs_position=log_data["first_obs_position"],
+            emp_scores=log_data["emp_scores"],
+            selected_goal=log_data["selected_goal"],
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+        )
     # Add more goal proposer visualizations here as needed
+
+
+def visualize_empowerment_candidates(
+    candidate_goals: np.ndarray,
+    first_obs_position: np.ndarray,
+    emp_scores: np.ndarray,
+    selected_goal: np.ndarray,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+) -> None:
+    """Visualize empowerment-scored candidate goals."""
+    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+    sc = ax.scatter(
+        candidate_goals[:, 0],
+        candidate_goals[:, 1],
+        c=emp_scores,
+        cmap="viridis",
+        s=18,
+        alpha=0.8,
+    )
+    ax.scatter(first_obs_position[0], first_obs_position[1], c="red", s=120, marker="x", linewidths=2, label="start")
+    ax.scatter(selected_goal[0], selected_goal[1], c="gold", s=140, marker="*", edgecolors="black", linewidths=0.8, label="selected")
+    ax.set_xlim(x_bounds[0], x_bounds[1])
+    ax.set_ylim(y_bounds[0], y_bounds[1])
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_title("Empowerment Goal Proposer")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    plt.colorbar(sc, ax=ax, label="offline empowerment")
+    wandb.log({"goal_proposer/empowerment_candidates": wandb.Image(fig)})
+    plt.close(fig)
 
 
 def visualize_q_epistemic_candidates(
