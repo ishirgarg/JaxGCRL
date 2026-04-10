@@ -686,6 +686,8 @@ def handle_goal_proposer_visualization(
             candidate_goals=log_data["candidate_goals"],
             first_obs_position=log_data["first_obs_position"],
             emp_scores=log_data["emp_scores"],
+            log_densities=log_data["log_densities"],
+            selection_logits=log_data["selection_logits"],
             selected_goal=log_data["selected_goal"],
             x_bounds=x_bounds,
             y_bounds=y_bounds,
@@ -697,30 +699,67 @@ def visualize_empowerment_candidates(
     candidate_goals: np.ndarray,
     first_obs_position: np.ndarray,
     emp_scores: np.ndarray,
+    log_densities: np.ndarray,
+    selection_logits: np.ndarray,
     selected_goal: np.ndarray,
     x_bounds: np.ndarray,
     y_bounds: np.ndarray,
 ) -> None:
-    """Visualize empowerment-scored candidate goals."""
-    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
-    sc = ax.scatter(
-        candidate_goals[:, 0],
-        candidate_goals[:, 1],
-        c=emp_scores,
-        cmap="viridis",
-        s=18,
-        alpha=0.8,
-    )
-    ax.scatter(first_obs_position[0], first_obs_position[1], c="red", s=120, marker="x", linewidths=2, label="start")
-    ax.scatter(selected_goal[0], selected_goal[1], c="gold", s=140, marker="*", edgecolors="black", linewidths=0.8, label="selected")
-    ax.set_xlim(x_bounds[0], x_bounds[1])
-    ax.set_ylim(y_bounds[0], y_bounds[1])
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_title("Empowerment Goal Proposer")
-    ax.grid(True, alpha=0.25)
-    ax.legend()
-    plt.colorbar(sc, ax=ax, label="offline empowerment")
+    """Three panels: offline empowerment, negative log KDE density, combined selection score."""
+    cg = np.asarray(candidate_goals, dtype=np.float64)
+    fo = np.asarray(first_obs_position, dtype=np.float64)
+    es = np.asarray(emp_scores, dtype=np.float64).ravel()
+    ld = np.asarray(log_densities, dtype=np.float64).ravel()
+    comb = np.asarray(selection_logits, dtype=np.float64).ravel()
+    sg = np.asarray(selected_goal, dtype=np.float64)
+    neg_log_d = -ld
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5), sharex=True, sharey=True)
+    specs = [
+        (es, "Empowerment", "offline empowerment"),
+        (neg_log_d, "Negative log density", "-log KDE density"),
+        (comb, "Combined", "empowerment - log density"),
+    ]
+    for ax, (values, title, cbar_label) in zip(axes, specs):
+        sc = ax.scatter(
+            cg[:, 0],
+            cg[:, 1],
+            c=values,
+            cmap="viridis",
+            s=18,
+            alpha=0.8,
+        )
+        ax.scatter(
+            fo[0],
+            fo[1],
+            c="red",
+            s=100,
+            marker="x",
+            linewidths=2,
+            label="start",
+            zorder=5,
+        )
+        ax.scatter(
+            sg[0],
+            sg[1],
+            c="gold",
+            s=120,
+            marker="*",
+            edgecolors="black",
+            linewidths=0.8,
+            label="selected",
+            zorder=5,
+        )
+        ax.set_xlim(float(x_bounds[0]), float(x_bounds[1]))
+        ax.set_ylim(float(y_bounds[0]), float(y_bounds[1]))
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_title(title)
+        ax.grid(True, alpha=0.25)
+        plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label=cbar_label)
+    axes[0].legend(loc="best", fontsize=8)
+    fig.suptitle("Empowerment goal proposer", fontsize=13, y=1.02)
+    plt.tight_layout()
     wandb.log({"goal_proposer/empowerment_candidates": wandb.Image(fig)})
     plt.close(fig)
 
