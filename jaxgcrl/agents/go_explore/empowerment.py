@@ -284,11 +284,37 @@ def make_empowerment_obs_builder(
 def make_offline_empowerment_scorer(
     emp_agent,
     obs_builder: Callable[[jnp.ndarray], jnp.ndarray],
+    *,
+    chunk_size: int = 32,
 ) -> Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
-    """Returns scorer(states, rng)->empowerment score per state."""
+    """Returns scorer(states, rng) -> empowerment score per state row.
+
+    Runs ``emp_agent.empowerment`` on batches of at most ``chunk_size`` rows so peak
+    activation memory scales with ``chunk_size`` instead of ``states.shape[0]`` (e.g. all
+    ``num_candidates`` at once). Uses ``lax.fori_loop`` so the trace stays JIT-friendly.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1.")
 
     def _score(states: jnp.ndarray, rng: jnp.ndarray) -> jnp.ndarray:
-        emp_obs = obs_builder(states)
-        return emp_agent.empowerment(emp_obs, rng=rng)
+        n = states.shape[0]
+        pad = (chunk_size - (n % chunk_size)) % chunk_size
+        states_pad = jnp.pad(states, ((0, pad), (0, 0)))
+        total = states_pad.shape[0]
+        n_chunks = total // chunk_size
+        acc0 = jnp.zeros((total,), dtype=jnp.float32)
+
+        def body(i, acc):
+            chunk = jax.lax.dynamic_slice_in_dim(
+                states_pad, i * chunk_size, chunk_size, axis=0
+            )
+            emp_obs = obs_builder(chunk)
+            ki = jax.random.fold_in(rng, i)
+            s = emp_agent.empowerment(emp_obs, rng=ki)
+            s = jnp.reshape(s, (chunk_size,)).astype(jnp.float32)
+            return jax.lax.dynamic_update_slice(acc, s, (i * chunk_size,))
+
+        acc = jax.lax.fori_loop(0, n_chunks, body, acc0)
+        return acc[:n]
 
     return _score

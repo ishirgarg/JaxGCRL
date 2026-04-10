@@ -109,6 +109,7 @@ class GoExploreSimple:
     empowerment_run_dir: Optional[str] = None
     empowerment_epoch: Optional[int] = None
     empowerment_num_splus_samples: int = 128
+    empowerment_score_chunk_size: int = 32
 
     # ── Go Explore specific parameters ──────────────────────────────────────
     num_gcp_steps: int = 250      # max steps in go phase before forcing explore
@@ -255,7 +256,11 @@ class GoExploreSimple:
                 jaxgcrl_state_indices,
                 state_size=state_size,
             )
-            offline_empowerment_scorer = make_offline_empowerment_scorer(emp_agent, obs_builder)
+            offline_empowerment_scorer = make_offline_empowerment_scorer(
+                emp_agent,
+                obs_builder,
+                chunk_size=self.empowerment_score_chunk_size,
+            )
 
         # ── Goal proposer ────────────────────────────────────────────────────
         goal_proposer = create_goal_proposer(
