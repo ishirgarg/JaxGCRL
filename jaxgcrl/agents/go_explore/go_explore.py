@@ -55,6 +55,7 @@ from .goal_proposers import (
     create_explore_reward_fn,
 )
 from .empowerment import (
+    infer_empowerment_override_indices_from_env,
     load_offline_empowerment_agent,
     make_empowerment_obs_builder,
     make_offline_empowerment_scorer,
@@ -109,7 +110,7 @@ class GoExplore:
     goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega", "empowerment"] = "random_env_goals"
     ep_goal_proposer_name: Literal["nearest_env_goal_to_gcp_goal"] = "nearest_env_goal_to_gcp_goal"
     num_candidates: int = 512
-    empowerment_ogbench_root: str = "/home/ishir/ogbench"
+    goal_proposer_temperature: float = 0.0
     empowerment_run_dir: Optional[str] = None
     empowerment_epoch: Optional[int] = None
     empowerment_num_splus_samples: int = 128
@@ -277,16 +278,22 @@ class GoExplore:
         if self.goal_proposer_name == "empowerment":
             if self.empowerment_run_dir is None:
                 raise ValueError("empowerment_run_dir must be set when goal_proposer_name='empowerment'.")
-            emp_agent, ex_obs_dim = load_offline_empowerment_agent(
-                ogbench_root=self.empowerment_ogbench_root,
+            key, empowerment_template_key = jax.random.split(key)
+            ogbench_obs_indices, jaxgcrl_state_indices = infer_empowerment_override_indices_from_env(
+                unwrapped_env
+            )
+            emp_agent, _ex_obs_dim, base_obs_template = load_offline_empowerment_agent(
                 run_dir=self.empowerment_run_dir,
+                jax_env=unwrapped_env,
+                template_rng=empowerment_template_key,
                 epoch=self.empowerment_epoch,
                 num_splus_samples=self.empowerment_num_splus_samples,
             )
             obs_builder = make_empowerment_obs_builder(
-                ex_obs_dim=ex_obs_dim,
-                overwrite_map=None,  # default identity/pad-truncate for extensibility
-                base_obs=None,
+                jnp.asarray(base_obs_template),
+                ogbench_obs_indices,
+                jaxgcrl_state_indices,
+                state_size=state_size,
             )
             offline_empowerment_scorer = make_offline_empowerment_scorer(emp_agent, obs_builder)
 
@@ -302,6 +309,7 @@ class GoExplore:
             critic=gcp_critic,
             discounting=self.discounting,
             offline_empowerment_scorer=offline_empowerment_scorer,
+            goal_proposer_temperature=self.goal_proposer_temperature,
         )
         
         # ── Explore reward factory ───────────────────────────────────────────

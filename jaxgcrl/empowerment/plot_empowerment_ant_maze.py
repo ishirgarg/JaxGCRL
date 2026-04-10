@@ -50,7 +50,7 @@ def _choose_layout(name: str):
     if name == "u_maze": return np.array(U_MAZE, dtype=object)
     if name == "u_maze_hard": return np.array(U_MAZE_HARD, dtype=object)
     if name == "u_maze_eval": return np.array(U_MAZE_EVAL, dtype=object)
-    if name == "ogbench_medium_navigate": return np.array(OGBENCH_MEDIUM_NAVIGATE, dtype=object)
+    if name == "maze_ogbench_medium_navigate": return np.array(OGBENCH_MEDIUM_NAVIGATE, dtype=object)
     if name == "big_maze": return np.array(BIG_MAZE, dtype=object)
     if name == "big_maze_hard": return np.array(BIG_MAZE_HARD, dtype=object)
     if name == "big_maze_eval": return np.array(BIG_MAZE_EVAL, dtype=object)
@@ -105,8 +105,8 @@ def main():
     parser.add_argument("--ckpt_root", type=str, default="/home/ishir/ogbench/impls/ckpts")
     parser.add_argument("--run_dir", type=str, default=None)
     parser.add_argument("--epoch", type=int, default=None)
-    parser.add_argument("--layout_name", type=str, default="ogbench_medium_navigate",
-                        choices=["ogbench_medium_navigate","u_maze","u_maze_hard","u_maze_eval","big_maze","big_maze_hard","big_maze_eval","hardest_maze"])
+    parser.add_argument("--layout_name", type=str, default="maze_ogbench_medium_navigate",
+                        choices=["maze_ogbench_medium_navigate","u_maze","u_maze_hard","u_maze_eval","big_maze","big_maze_hard","big_maze_eval","hardest_maze"])
     parser.add_argument("--maze_size_scaling", type=float, default=4.0)
     parser.add_argument("--backend", type=str, default="spring")
     parser.add_argument("--grid_res", type=int, default=80)

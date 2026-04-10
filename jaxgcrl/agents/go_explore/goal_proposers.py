@@ -2,6 +2,7 @@ from typing import Callable, Dict, Any, Optional
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 import numpy as np
 from jaxgcrl.agents.go_explore.utils import sample_trajectories_from_buffer, flatten_batch
 from jaxgcrl.agents.go_explore.algorithms_utils import reconstruct_full_critic_params
@@ -21,6 +22,7 @@ def create_goal_proposer(
     critic: Optional[Any] = None,
     discounting: float=0.99,
     offline_empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
+    goal_proposer_temperature: float = 0.0,
 ) -> Callable:
     """
     Factory function to create a goal proposer function.
@@ -35,7 +37,9 @@ def create_goal_proposer(
         actor: Optional actor network object (for goal proposers that need to sample actions)
         critic: Optional critic network object (for goal proposers that need to compute values)
         discounting: Discount factor for geometric future-state sampling (ucgr only)
-        
+        goal_proposer_temperature: For ``mega``, ``omega`` (MEGA branch), and ``empowerment``:
+            sample index from ``softmax(logits / T)``; ``T <= 0`` means greedy ``argmax(logits)``.
+
     Returns:
         A goal proposer function that takes (rng, start_obs, goal_proposer_state) and returns (goal, updated_state).
         The goal proposer state can be read from and written to.
@@ -58,9 +62,23 @@ def create_goal_proposer(
     elif goal_proposer_name == "max_critic_to_env":
         return create_max_critic_to_env_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices, actor, critic)
     elif goal_proposer_name == "mega":
-        return create_mega_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices)
+        return create_mega_goal_proposer(
+            env,
+            num_envs,
+            num_candidates,
+            state_size,
+            goal_indices,
+            temperature=goal_proposer_temperature,
+        )
     elif goal_proposer_name == "omega":
-        return create_omega_goal_proposer(env, num_envs, num_candidates, state_size, goal_indices)
+        return create_omega_goal_proposer(
+            env,
+            num_envs,
+            num_candidates,
+            state_size,
+            goal_indices,
+            temperature=goal_proposer_temperature,
+        )
     elif goal_proposer_name == "empowerment":
         return create_empowerment_goal_proposer(
             env,
@@ -69,6 +87,7 @@ def create_goal_proposer(
             state_size,
             goal_indices,
             offline_empowerment_scorer,
+            temperature=goal_proposer_temperature,
         )
     else:
         raise ValueError(f"Unknown goal proposer: {goal_proposer_name}")
@@ -445,8 +464,15 @@ def create_empowerment_goal_proposer(
     state_size: Optional[int] = None,
     goal_indices: Optional[tuple] = None,
     offline_empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
+    temperature: float = 0.0,
+    kde_bandwidth: float = 0.1,
+    kde_eps: float = 1e-8,
 ) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
-    """Selects the replay-buffer candidate state with maximal offline empowerment."""
+    """Replay-buffer candidates scored by offline empowerment minus KDE log-density (MEGA-style).
+
+    Selection: ``softmax((empowerment - log_density) / T)`` when ``T > 0``, else
+    ``argmax(empowerment - log_density)``.
+    """
     if offline_empowerment_scorer is None:
         raise ValueError("offline_empowerment_scorer must be provided for empowerment proposer.")
 
@@ -456,25 +482,33 @@ def create_empowerment_goal_proposer(
         transitions_sample = goal_proposer_state.transitions_sample
         obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
         states = obs_flat[:, :state_size]  # (N, state_size)
+        all_goals = states[:, goal_idx_array]  # (N_buf, goal_dim) — same KDE reference as MEGA
 
         num_states = states.shape[0]
-        rng, sample_rng, emp_rng = jax.random.split(rng, 3)
+        rng, sample_rng, emp_rng, select_rng = jax.random.split(rng, 4)
         candidate_indices = jax.random.randint(sample_rng, (num_candidates,), 0, num_states)
         candidate_states = states[candidate_indices]  # (num_candidates, state_size)
+        candidate_goals = candidate_states[:, goal_idx_array]
+
+        densities = _jax_gaussian_kde(candidate_goals, all_goals, kde_bandwidth)
+        log_density = jnp.log(densities + kde_eps)
 
         emp_scores = offline_empowerment_scorer(candidate_states, emp_rng)  # (num_candidates,)
-        best_idx = jnp.argmax(emp_scores)
+        logits = emp_scores - log_density
+        best_idx = _sample_idx_from_temperature_logits(select_rng, logits, temperature)
         selected_state = candidate_states[best_idx]
         selected_goal = selected_state[goal_idx_array]
 
         first_obs_state = start_obs[:state_size]
         first_obs_position = first_obs_state[goal_idx_array]
-        candidate_goals = candidate_states[:, goal_idx_array]
 
         log_data = {
             "candidate_goals": candidate_goals,
             "first_obs_position": first_obs_position,
             "emp_scores": emp_scores,
+            "densities": densities,
+            "log_densities": log_density,
+            "selection_logits": logits,
             "selected_goal": selected_goal,
         }
         return selected_goal, goal_proposer_state, log_data
@@ -574,6 +608,27 @@ def create_explore_reward_fn(
         raise ValueError(f"Unknown explore reward_type: {reward_type}")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Temperature-weighted softmax sampling
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sample_idx_from_temperature_logits(
+    rng: jax.Array,
+    logits: jnp.ndarray,
+    temperature: float,
+) -> jnp.ndarray:
+    """``argmax(logits)`` if ``temperature <= 0``; else one draw from ``Categorical(softmax(logits / T))``."""
+    t = jnp.asarray(temperature, dtype=logits.dtype)
+
+    def sample_branch(_):
+        return jax.random.categorical(rng, logits / t).astype(jnp.int32)
+
+    def greedy_branch(_):
+        return jnp.argmax(logits).astype(jnp.int32)
+
+    return lax.cond(t > 0, sample_branch, greedy_branch, operand=None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # JAX Gaussian KDE helper (shared by MEGA and OMEGA)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -625,6 +680,8 @@ def create_mega_goal_proposer(
     state_size: Optional[int] = None,
     goal_indices: Optional[tuple] = None,
     kde_bandwidth: float = 0.1,
+    temperature: float = 0.0,
+    kde_eps: float = 1e-8,
 ) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
     """Create a MEGA (Maximum Entropy Goal Achievement) goal proposer.
 
@@ -635,8 +692,8 @@ def create_mega_goal_proposer(
     At each call the proposer:
       1. Samples ``num_candidates`` past achieved goals from the replay buffer.
       2. Fits a Gaussian KDE to ALL achieved goals in the current buffer sample.
-      3. Returns the candidate whose KDE density is lowest — i.e. the most
-         sparsely explored region of the achieved-goal space (the frontier).
+      3. Selects a candidate using ``softmax((-log p) / T)`` when ``T > 0`` (sample),
+         else ``argmin`` density (frontier), i.e. ``argmax(-log_density)``.
 
     The density estimates are returned in ``log_data`` so they can be colour-
     coded in the visualisation.
@@ -648,6 +705,7 @@ def create_mega_goal_proposer(
         state_size:     Number of elements in the state portion of an observation.
         goal_indices:   Indices within the state that encode the goal.
         kde_bandwidth:  Gaussian kernel bandwidth (applied after normalisation).
+        temperature:    Softmax temperature; ``<= 0`` restores greedy minimum-density.
     """
     goal_idx_array = jnp.array(goal_indices)
 
@@ -668,7 +726,7 @@ def create_mega_goal_proposer(
 
         # ── 2. Sample num_candidates candidates ───────────────────────────────
         n_buf = all_goals.shape[0]
-        rng, sample_rng = jax.random.split(rng)
+        rng, sample_rng, select_rng = jax.random.split(rng, 3)
         cand_indices = jax.random.randint(sample_rng, (num_candidates,), 0, n_buf)
         candidate_goals = all_goals[cand_indices]  # (num_candidates, goal_dim)
 
@@ -676,8 +734,11 @@ def create_mega_goal_proposer(
         densities = _jax_gaussian_kde(candidate_goals, all_goals, kde_bandwidth)
         # (num_candidates,) — lower density ↔ more sparsely explored
 
-        # ── 4. Select the minimum-density candidate (frontier goal) ──────────
-        best_idx     = jnp.argmin(densities)
+        log_density = jnp.log(densities + kde_eps)
+        logits = -log_density
+
+        # ── 4. Minimum-density (frontier) as greedy limit; else softmax sample ─
+        best_idx = _sample_idx_from_temperature_logits(select_rng, logits, temperature)
         selected_goal = candidate_goals[best_idx]  # (goal_dim,)
 
         # ── 5. Build log_data for visualisation ──────────────────────────────
@@ -685,6 +746,8 @@ def create_mega_goal_proposer(
         log_data = {
             "candidate_goals":    candidate_goals,    # (num_candidates, goal_dim)
             "densities":          densities,          # (num_candidates,)
+            "log_densities":      log_density,
+            "selection_logits":   logits,
             "first_obs_position": first_obs_position, # (goal_dim,)
             "selected_goal":      selected_goal,      # (goal_dim,)
         }
@@ -707,6 +770,8 @@ def create_omega_goal_proposer(
     kde_bandwidth: float = 0.1,
     omega_bias: float = -3.0,
     n_desired_eval: int = 100,
+    temperature: float = 0.0,
+    kde_eps: float = 1e-8,
 ) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
     """Create an OMEGA goal proposer.
 
@@ -717,7 +782,8 @@ def create_omega_goal_proposer(
     Concretely, at each call:
       * α  = 1 / max(b + DKL(p_dg ‖ p_ag), 1)   where b = ``omega_bias``
       * With probability α  → return a random desired (environment) goal.
-      * With probability 1-α → return the MEGA minimum-density goal.
+      * With probability 1-α → return a MEGA goal: softmax sample over ``-log p`` / ``temperature``
+        when ``temperature > 0``, else the minimum-density candidate (same as plain MEGA).
 
     DKL(p_dg ‖ p_ag) is estimated by evaluating the KDE density p_ag at a
     random sample of desired goals (uniform over ``env.possible_goals``):
@@ -736,6 +802,7 @@ def create_omega_goal_proposer(
         kde_bandwidth:   Gaussian KDE bandwidth (post-normalisation).
         omega_bias:      Bias b in the α formula; paper uses b = -3.
         n_desired_eval:  How many desired goals to sample when estimating DKL.
+        temperature:     MEGA-branch softmax temperature (``<= 0`` → greedy min-density).
     """
     goal_idx_array  = jnp.array(goal_indices)
     possible_goals  = jnp.array(env.possible_goals)  # (N_goals, goal_dim)
@@ -757,7 +824,7 @@ def create_omega_goal_proposer(
 
         # ── 2. Sample candidates ───────────────────────────────────────────────
         n_buf     = all_goals.shape[0]
-        rng, sample_rng, desired_rng, env_rng, alpha_rng = jax.random.split(rng, 5)
+        rng, mega_select_rng, sample_rng, desired_rng, env_rng, alpha_rng = jax.random.split(rng, 6)
 
         cand_indices   = jax.random.randint(sample_rng, (num_candidates,), 0, n_buf)
         candidate_goals = all_goals[cand_indices]  # (num_candidates, goal_dim)
@@ -766,9 +833,10 @@ def create_omega_goal_proposer(
         densities = _jax_gaussian_kde(candidate_goals, all_goals, kde_bandwidth)
         # (num_candidates,) — lower = frontier
 
-        # ── 4. MEGA goal: minimum-density candidate ───────────────────────────
-        best_idx   = jnp.argmin(densities)
-        mega_goal  = candidate_goals[best_idx]  # (goal_dim,)
+        log_density = jnp.log(densities + kde_eps)
+        mega_logits = -log_density
+        best_idx = _sample_idx_from_temperature_logits(mega_select_rng, mega_logits, temperature)
+        mega_goal = candidate_goals[best_idx]  # (goal_dim,)
 
         # ── 5. Compute α via DKL(p_dg ‖ p_ag) ────────────────────────────────
         # Sample n_desired_eval goals from the desired distribution
@@ -803,6 +871,8 @@ def create_omega_goal_proposer(
         log_data = {
             "candidate_goals":    candidate_goals,    # (num_candidates, goal_dim)
             "densities":          densities,          # (num_candidates,)
+            "log_densities":      log_density,
+            "mega_selection_logits": mega_logits,
             "first_obs_position": first_obs_position, # (goal_dim,)
             "selected_goal":      selected_goal,      # (goal_dim,)
             "mega_goal":          mega_goal,          # (goal_dim,)  — always the MEGA choice

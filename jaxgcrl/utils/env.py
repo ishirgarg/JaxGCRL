@@ -55,6 +55,7 @@ legal_envs = (
     "ant_ball_square_maze",
     "ant_ball_easy_square_maze",
     "ant_ball_small_square_maze",
+    "ant_maze_ogbench_medium_navigate",
     "ant_u_maze",
     "ant_u_maze_hard",
     "ant_big_maze",

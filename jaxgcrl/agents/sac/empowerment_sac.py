@@ -22,6 +22,10 @@ from jaxgcrl.envs.wrappers import (
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 from jaxgcrl.agents.go_explore.algorithms import get_explore_policy
+from jaxgcrl.agents.go_explore.empowerment import (
+    build_ogbench_empowerment_obs_template,
+    infer_ogbench_root_from_run_dir,
+)
 from jaxgcrl.agents.go_explore.losses import (
     update_alpha_sac,
     update_actor_sac,
@@ -207,10 +211,8 @@ class EmpowermentSAC:
     use_empowerment_diff: bool = False
     deterministic_eval: bool = True
 
-    # Empowerment checkpoint args
-    ogbench_root: str = "/home/ishir/ogbench"
-    ckpt_root: str = "/home/ishir/ogbench/impls/ckpts"
-    run_dir: Optional[str] = "/home/ishir/ogbench/impls/ckpts/sd000_s_32837516.0.20260319_183520"
+    # Empowerment checkpoint args (OGBench import path is inferred from ``run_dir``).
+    run_dir: Optional[str] = None
     epoch: Optional[int] = None
     num_splus_samples: int = 128
     ogbench_xy_offset: Optional[float] = None
@@ -226,8 +228,9 @@ class EmpowermentSAC:
         # ------------------------------------------------------------------
         # Load empowerment checkpoint
         # ------------------------------------------------------------------
+        ogbench_root = infer_ogbench_root_from_run_dir(self.run_dir)
         agent_registry, make_env_and_datasets, restore_agent = _setup_external_imports(
-            self.ogbench_root
+            ogbench_root
         )
         if self.run_dir is None:
             raise ValueError("run_dir must be provided for empowerment checkpoint.")
@@ -270,30 +273,17 @@ class EmpowermentSAC:
         ex_obs_dim = int(example_batch["observations"].shape[-1])
 
         # ------------------------------------------------------------------
-        # Build the fixed head observation once (Ant=(0,0), Ball=(5,0)).
-        # This is the base template used for both online reward shaping and
-        # the empowerment-map visualization.  Only ant x/y and ball x/y
-        # indices are overwritten at inference time.
+        # Base observation template from OGBench env (same stacking rules as offline plotting).
+        # Only ant x/y and ball x/y indices are overwritten at inference time.
         # ------------------------------------------------------------------
-        ogbench_base_obs_dim = 42
-        if ex_obs_dim % ogbench_base_obs_dim != 0:
-            raise ValueError(
-                f"Checkpoint obs dim {ex_obs_dim} must be a multiple of {ogbench_base_obs_dim}."
-            )
         base_env = ogbench_env.unwrapped if hasattr(ogbench_env, "unwrapped") else ogbench_env
-        base_env.set_agent_ball_xy(
-            np.array([0.0, 0.0], dtype=np.float64),
-            np.array([5.0, 0.0], dtype=np.float64),
+        base_og_np = build_ogbench_empowerment_obs_template(
+            ogbench_env,
+            base_env,
+            ex_obs_dim,
+            head_ant_xy=(0.0, 0.0),
+            head_ball_xy=(5.0, 0.0),
         )
-        if hasattr(base_env, "get_ob"):
-            base_og_np = np.asarray(base_env.get_ob(), dtype=np.float32)
-        else:
-            base_og_np = np.asarray(base_env._get_obs(), dtype=np.float32)
-        # Tile for frame-stacking if needed
-        if int(base_og_np.shape[0]) != int(ex_obs_dim):
-            stack = ex_obs_dim // int(base_og_np.shape[0])
-            if stack > 1 and stack * int(base_og_np.shape[0]) == int(ex_obs_dim):
-                base_og_np = np.concatenate([base_og_np] * stack, axis=-1)
         base_og_const = jnp.asarray(base_og_np)
 
         # Hardcoded OGBench indices for ball x,y in qpos layout
@@ -447,7 +437,7 @@ class EmpowermentSAC:
                 emp_delta = next_emp - cur_emp
                 shaped_reward = emp_delta
             else:
-            next_emp = empowerment_reward_online_with_key(next_state_obs, emp_key)
+                next_emp = empowerment_reward_online_with_key(next_state_obs, emp_key)
                 emp_delta = jnp.zeros_like(next_emp)
                 shaped_reward = next_emp
             combined_reward = self.empowerment_reward_scaling * shaped_reward
