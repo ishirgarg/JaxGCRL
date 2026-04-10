@@ -96,10 +96,19 @@ def build_empowerment_base_obs_template(
 
 
 def infer_ogbench_root_from_run_dir(run_dir: str) -> str:
-    """Walk parents of ``run_dir`` until we find a directory containing ``impls/``."""
+    """Infer OGBench repo root (the directory that contains ``impls/``).
+
+    Handles:
+    - Checkpoints under ``<root>/impls/ckpts/...`` (walk hits ``impls``; root is its parent).
+    - Any ancestor ``<root>`` with a child directory named ``impls``.
+    """
     path = os.path.abspath(run_dir)
     current = path
     while True:
+        if os.path.basename(current) == "impls":
+            parent = os.path.dirname(current)
+            if parent != current:
+                return parent
         impls = os.path.join(current, "impls")
         if os.path.isdir(impls):
             return current
@@ -107,7 +116,8 @@ def infer_ogbench_root_from_run_dir(run_dir: str) -> str:
         if parent == current:
             raise ValueError(
                 f"Could not infer OGBench repo root from empowerment run_dir={run_dir!r}: "
-                "no ancestor directory contains an 'impls' subdirectory."
+                "no ancestor directory contains an 'impls' subdirectory, and the path is not under "
+                "a directory named 'impls'."
             )
         current = parent
 
