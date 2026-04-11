@@ -17,6 +17,7 @@ import wandb
 from jaxgcrl.envs.ant import Ant
 from jaxgcrl.envs.ant_ball import AntBall
 from jaxgcrl.envs.ant_ball_maze import AntBallMaze
+from jaxgcrl.envs.ant_ball_ogbench import AntBallOGBench
 from jaxgcrl.envs.ant_maze import AntMaze
 from jaxgcrl.envs.ant_push import AntPush
 from jaxgcrl.envs.half_cheetah import Halfcheetah
@@ -55,6 +56,9 @@ legal_envs = (
     "ant_ball_square_maze",
     "ant_ball_easy_square_maze",
     "ant_ball_small_square_maze",
+    "ant_ball_ogbench_arena",
+    "ant_ball_ogbench_medium",
+    "ant_maze_ogbench_arena",
     "ant_maze_ogbench_medium_navigate",
     "ant_u_maze",
     "ant_u_maze_hard",
@@ -93,6 +97,10 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         env = Ant(backend=backend or "spring", randomize_start=True)
     elif env_name == "ant_ball":
         env = AntBall(backend=backend or "spring")
+    elif env_name.startswith("ant_ball_ogbench_"):
+        # ant_ball_ogbench_arena, ant_ball_ogbench_medium
+        layout = env_name[len("ant_ball_ogbench_"):]
+        env = AntBallOGBench(backend=backend or "spring", maze_layout_name=layout)
     elif env_name == "ant_push":
         # This is stable only in mjx backend
         assert backend == "mjx" or backend is None

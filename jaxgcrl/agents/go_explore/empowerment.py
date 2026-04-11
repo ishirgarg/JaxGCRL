@@ -12,6 +12,7 @@ import numpy as np
 
 from jaxgcrl.envs.ant_ball import AntBall
 from jaxgcrl.envs.ant_ball_maze import AntBallMaze
+from jaxgcrl.envs.ant_ball_ogbench import AntBallOGBench
 from jaxgcrl.envs.ant_maze import AntMaze
 
 # Same override layout as ``plot_empowerment_ant_soccer`` (AntBall / AntBallMaze) and
@@ -30,13 +31,17 @@ def infer_empowerment_override_indices_from_env(
     Ant soccer (``AntBall``) and maze + ball (``AntBallMaze``): indices ``0, 1, 15, 16`` ←
     ``0, 1, -4, -3`` (ant xy + object xy), matching ``plot_empowerment_ant_soccer.py``.
     """
+    if isinstance(jax_env, AntBallOGBench):
+        # OGBench-compatible layout: ant x,y at state[0:2], ball x,y at state[15:17].
+        # State indices map 1:1 to OGBench obs indices (same structure).
+        return (0, 1, 15, 16), (0, 1, 15, 16)
     if isinstance(jax_env, _BALL_SOCCER_ENV_TYPES):
         return (0, 1, 15, 16), (0, 1, -4, -3)
     if isinstance(jax_env, AntMaze):
         return (0, 1), (0, 1)
     raise ValueError(
-        "Offline empowerment mapping is only defined for AntMaze, AntBall, and AntBallMaze; "
-        f"got env type {type(jax_env).__name__!r}."
+        "Offline empowerment mapping is only defined for AntMaze, AntBall, AntBallMaze, "
+        f"and AntBallOGBench; got env type {type(jax_env).__name__!r}."
     )
 
 
@@ -74,6 +79,20 @@ def build_empowerment_base_obs_template(
     Candidate-state positions are **not** baked in here; ``make_empowerment_obs_builder`` overwrites
     the slots returned by ``infer_empowerment_override_indices_from_env``.
     """
+    if isinstance(jax_env, AntBallOGBench):
+        # OGBench-compatible layout: state[:42] already matches OGBench obs.
+        # Use state[0:2] for ant xy, state[15:17] for ball xy.
+        state = jax_env.reset(template_rng)
+        obs = np.asarray(state.obs, dtype=np.float64)
+        head_ant_xy = (float(obs[0]), float(obs[1]))
+        head_ball_xy = (float(obs[15]), float(obs[16]))
+        return build_ogbench_empowerment_obs_template(
+            ogbench_env,
+            base_env,
+            ex_obs_dim,
+            head_ant_xy=head_ant_xy,
+            head_ball_xy=head_ball_xy,
+        )
     if isinstance(jax_env, _BALL_SOCCER_ENV_TYPES):
         state = jax_env.reset(template_rng)
         obs = np.asarray(state.obs, dtype=np.float64)
@@ -90,8 +109,8 @@ def build_empowerment_base_obs_template(
         state = jax_env.reset(template_rng)
         return _jax_obs_resize_to_ex_dim(state.obs, ex_obs_dim)
     raise ValueError(
-        "Empowerment base template is only defined for AntMaze, AntBall, and AntBallMaze; "
-        f"got env type {type(jax_env).__name__!r}."
+        "Empowerment base template is only defined for AntMaze, AntBall, AntBallMaze, "
+        f"and AntBallOGBench; got env type {type(jax_env).__name__!r}."
     )
 
 
