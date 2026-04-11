@@ -111,6 +111,9 @@ class GoExploreSimple:
     empowerment_num_splus_samples: int = 128
     empowerment_score_chunk_size: int = 32
 
+    # ── RLPD (offline data mixing) ─────────────────────────────────────────
+    use_rlpd: bool = False  # Mix 50% offline OGBench data into each training batch
+
     # ── Go Explore specific parameters ──────────────────────────────────────
     num_gcp_steps: int = 250      # max steps in go phase before forcing explore
     num_ep_steps: int = 250        # steps in explore phase before reset to go
@@ -340,6 +343,21 @@ class GoExploreSimple:
             critic_params={i: cs.params for i, cs in enumerate(gcp_critic_states)},
         )
 
+        # ── RLPD: offline buffer ─────────────────────────────────────────────
+        offline_buffer = None
+        if self.use_rlpd:
+            from jaxgcrl.utils.offline_buffer import load_and_prepare_offline_buffer
+            offline_buffer = load_and_prepare_offline_buffer(
+                env_name=config.env,
+                episode_length=config.episode_length,
+                num_slots=config.num_envs,
+                obs_size=obs_size,
+                action_size=action_size,
+                state_size=state_size,
+                agent_type=self.agent_type,
+                include_phase=True,
+            )
+
         # ── actor_step ────────────────────────────────────────────────────────
         deterministic_go = self.deterministic_go_phase
         eps_random = self.eps_random_action
@@ -562,12 +580,33 @@ class GoExploreSimple:
             )
 
             # GCP update on all transitions
-            buffer_state, transitions = replay_buffer.sample(buffer_state)
+            buffer_state, online_transitions = replay_buffer.sample(buffer_state)
+
+            if self.use_rlpd:
+                # Mix 50% offline data: concatenate along num_envs axis
+                offline_key, process_key = jax.random.split(process_key)
+                offline_transitions = offline_buffer.sample(offline_key, config.num_envs)
+                transitions = jax.tree_util.tree_map(
+                    lambda a, b: jnp.concatenate([a, b], axis=0),
+                    online_transitions, offline_transitions,
+                )
+            else:
+                transitions = online_transitions
+
             transitions, _ = gcp_actor.process_transitions(
                 transitions, process_key, self.batch_size, self.discounting,
                 state_size, tuple(train_env.goal_indices),
                 train_env.goal_reach_thresh, self.use_her,
             )
+
+            if self.use_rlpd:
+                # Slice to original num_batches so gradient step count stays the same.
+                # The random permutation in process_transitions already mixed
+                # online+offline within each batch (~50/50).
+                num_batches = config.num_envs * (config.episode_length - 1) // self.batch_size
+                transitions = jax.tree_util.tree_map(
+                    lambda x: x[:num_batches], transitions
+                )
             (training_state, _), metrics = jax.lax.scan(
                 update_networks, (training_state, train_key), transitions
             )
