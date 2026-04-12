@@ -22,6 +22,9 @@ from jaxgcrl.agents.go_explore.types import Transition
 JAXGCRL_TO_OGBENCH = {
     "ant_maze_ogbench_medium_navigate": "antmaze-medium-navigate-v0",
     "ant_maze_ogbench_arena": "antmaze-arena-v0",
+    "ant_ball_ogbench_arena": "antsoccer-arena-navigate-v0",
+    "ant_ball_ogbench_medium": "antsoccer-arena-navigate-v0",
+    "ant_ball_ogbench_small_square": "antsoccer-arena-navigate-v0",
 }
 
 

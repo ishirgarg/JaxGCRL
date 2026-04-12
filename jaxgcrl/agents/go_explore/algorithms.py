@@ -304,46 +304,63 @@ class SACActor(Actor):
         # SAC: Apply HER if enabled (matching original SAC implementation)
         if use_her:
             def apply_her(transition: Transition) -> Transition:
-                """Apply HER to a single transition (matching original SAC flatten_batch)."""
-                # Find truncation indexes if present
+                """Apply HER: relabel goal to terminal state of the same trajectory.
+
+                If no truncation point exists in the future of the same traj
+                within this window, fall back to the *last* same-traj state
+                in the window (not the original goal, which may be meaningless
+                for offline data).
+                """
                 seq_len = transition.observation.shape[0]
                 arrangement = jnp.arange(seq_len)
-                is_future_mask = jnp.array(arrangement[:, None] < arrangement[None], dtype=jnp.float32)
+                is_future_or_self_mask = jnp.array(
+                    arrangement[:, None] <= arrangement[None], dtype=jnp.float32
+                )
+                traj_ids = transition.extras["state_extras"]["traj_id"]
                 single_trajectories = jnp.concatenate(
-                    [transition.extras["state_extras"]["traj_id"][:, jnp.newaxis].T] * seq_len,
-                    axis=0,
+                    [traj_ids[:, jnp.newaxis].T] * seq_len, axis=0,
+                )
+                same_traj = jnp.equal(single_trajectories, single_trajectories.T)
+
+                # Primary: find truncation point in future of same traj
+                trunc_mask = (
+                    is_future_or_self_mask * same_traj
+                    * transition.extras["state_extras"]["truncation"][None, :]
                 )
 
-                # final_step_mask.shape == (seq_len, seq_len)
-                final_step_mask = (
-                    is_future_mask * jnp.equal(single_trajectories, single_trajectories.T) + jnp.eye(seq_len) * 1e-5
-                )
-                final_step_mask = jnp.logical_and(
-                    final_step_mask,
-                    transition.extras["state_extras"]["truncation"][None, :],
-                )
-                non_zero_columns = jnp.nonzero(final_step_mask, size=seq_len)[1]
+                # Fallback: last same-traj state in the window (regardless of truncation).
+                # For each row i, we want the max column index j where same_traj[i,j]
+                # and j >= i.  We achieve this by masking with large negative values
+                # and taking argmax.
+                future_same_traj = is_future_or_self_mask * same_traj
+                # Use column indices weighted by the mask; argmax gives the last match
+                weighted = future_same_traj * arrangement[None, :]
+                # Where no match, set to -1 so argmax picks a real match
+                weighted = jnp.where(future_same_traj, weighted, -1)
+                last_same_traj_idx = jnp.argmax(weighted, axis=1)  # (seq_len,)
 
-                # If final state is not present use original goal (i.e. don't change anything)
-                new_goals_idx = jnp.where(non_zero_columns == 0, arrangement, non_zero_columns)
-                binary_mask = jnp.logical_and(non_zero_columns, non_zero_columns)
+                # Use truncation point if available, else last same-traj state
+                has_trunc = jnp.any(trunc_mask, axis=1)  # (seq_len,)
+                # For truncation: pick the first truncation point (smallest column)
+                # Set non-matches to seq_len so argmin picks a real match
+                trunc_weighted = jnp.where(trunc_mask, arrangement[None, :], seq_len)
+                trunc_idx = jnp.argmin(trunc_weighted, axis=1)  # (seq_len,)
 
-                # Extract goal from observations (matching original SAC exactly - line 115-118)
-                # Original: binary_mask * obs[new_goals_idx][:, goal_indices] + (1-binary_mask) * obs[new_goals_idx][:, state_dim:]
+                new_goals_idx = jnp.where(has_trunc, trunc_idx, last_same_traj_idx)
+
+                # Extract goal from the selected state's goal_indices
                 selected_obs = transition.observation[new_goals_idx]
-                new_goals = (
-                    binary_mask[:, None] * selected_obs[:, jnp.array(goal_indices)]
-                    + jnp.logical_not(binary_mask)[:, None]
-                    * selected_obs[:, state_size:]
-                )
+                new_goals = selected_obs[:, jnp.array(goal_indices)]
 
                 # Transform observation: replace goal with new_goals
                 state = transition.observation[:, :state_size]
                 new_obs = jnp.concatenate([state, new_goals], axis=1)
 
-                # Recalculate reward (matching original SAC line 126)
-                dist = jnp.linalg.norm(new_obs[:, state_size:] - new_obs[:, jnp.array(goal_indices)], axis=1)
-                new_reward = jnp.array(dist < goal_reach_thresh, dtype=float)  # Matching original SAC line 127
+                # Recalculate reward
+                dist = jnp.linalg.norm(
+                    new_obs[:, state_size:] - new_obs[:, jnp.array(goal_indices)], axis=1
+                )
+                new_reward = jnp.array(dist < goal_reach_thresh, dtype=float)
 
                 # Transform next observation
                 next_state = transition.next_observation[:, :state_size]

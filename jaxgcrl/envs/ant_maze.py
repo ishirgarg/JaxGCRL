@@ -40,6 +40,7 @@ U_MAZE_EVAL = [
     [1, 1, 1, 1, 1],
 ]
 
+# Transposed from OGBench arena so physical layout matches OGBench
 OGBENCH_ARENA = [
     [1, 1, 1, 1, 1, 1, 1, 1],
     [1, R, G, G, G, G, G, 1],
@@ -51,14 +52,16 @@ OGBENCH_ARENA = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
+# Transposed from OGBench medium maze so physical layout matches OGBench
+# (OGBench uses pos_x=j, pos_y=i; JaxGCRL uses pos_x=i, pos_y=j)
 OGBENCH_MEDIUM_NAVIGATE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, G, 1, 1, G, G, 1],
-    [1, R, G, 1, G, G, G, 1],
-    [1, 1, G, G, G, 1, 1, 1],
+    [1, R, R, 1, G, G, G, 1],
+    [1, G, G, G, G, 1, G, 1],
+    [1, 1, 1, G, 1, G, G, 1],
+    [1, 1, G, G, G, G, 1, 1],
+    [1, G, G, 1, G, 1, G, 1],
     [1, G, G, 1, G, G, G, 1],
-    [1, G, 1, G, G, 1, G, 1],
-    [1, G, G, G, 1, G, G, 1],
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 

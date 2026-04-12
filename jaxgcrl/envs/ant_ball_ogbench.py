@@ -42,15 +42,28 @@ ARENA = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
-# OGBench medium: 8x8 with internal walls (exact copy of OGBench maze.py)
+# Small square: ball in a quarter of the maze (ported from ant_ball_maze.py)
+SMALL_SQUARE = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, 0, 0, G, 0, 0, 1],
+    [1, 0, B, 0, G, 0, 0, 1],
+    [1, 0, 0, 0, G, 0, 0, 1],
+    [1, G, G, G, G, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+# OGBench medium: transposed so physical layout matches OGBench
+# (OGBench uses pos_x=j, pos_y=i; JaxGCRL uses pos_x=i, pos_y=j)
 MEDIUM = [
     [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, 0, 0, 1, 1, 0, 0, 1],
     [1, 0, 0, 1, 0, 0, 0, 1],
-    [1, 1, 0, 0, 0, 1, 1, 1],
+    [1, 0, 0, 0, 0, 1, 0, 1],
+    [1, 1, 1, 0, 1, 0, 0, 1],
+    [1, 1, 0, 0, 0, 0, 1, 1],
+    [1, 0, 0, 1, 0, 1, 0, 1],
     [1, 0, 0, 1, 0, 0, 0, 1],
-    [1, 0, 1, 0, 0, 1, 0, 1],
-    [1, 0, 0, 0, 1, 0, 0, 1],
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
@@ -73,6 +86,8 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
         maze_layout = ARENA
     elif maze_layout_name == "medium":
         maze_layout = MEDIUM
+    elif maze_layout_name == "small_square":
+        maze_layout = SMALL_SQUARE
     else:
         raise ValueError(f"Unknown OGBench ball maze layout: {maze_layout_name}")
 
