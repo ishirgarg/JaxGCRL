@@ -109,10 +109,7 @@ def _log_reward_heatmap(
     ax.set_xlabel("Ant x")
     ax.set_ylabel("Ant y")
     ax.set_title(f"Transition reward heatmap  step={current_step}")
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-    buf.seek(0)
-    _wandb.log({"viz/reward_heatmap": _wandb.Image(buf)}, step=current_step)
+    _wandb.log({"viz/reward_heatmap": _wandb.Image(fig)}, step=current_step)
     _plt.close(fig)
 
 
