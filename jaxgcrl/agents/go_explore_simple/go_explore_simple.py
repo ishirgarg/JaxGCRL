@@ -71,44 +71,42 @@ def _log_reward_heatmap(
     x_bounds,
     y_bounds,
     current_step: int,
-    grid_res: int = 40,
 ):
-    """Log a 2D heatmap of mean post-bonus transition reward per (ant x, ant y)
-    cell. ``reward_viz`` is the ``(xs, ys, rewards)`` snapshot taken inside
-    ``training_step`` right after the exploration bonus is added."""
+    """Log scatters of raw (ant x, ant y) transition samples colored by their
+    post-bonus reward and (if present) the scaled exploration bonus alone.
+    ``reward_viz`` is the ``(xs, ys, rewards, scaled_bonus)`` snapshot taken
+    inside ``training_step`` right after the exploration bonus is added."""
     if _plt is None or _wandb is None:
         return
 
     xs = np.asarray(reward_viz[0]).reshape(-1)
     ys = np.asarray(reward_viz[1]).reshape(-1)
     rs = np.asarray(reward_viz[2]).reshape(-1)
+    bonus = np.asarray(reward_viz[3]).reshape(-1) if len(reward_viz) > 3 else None
 
     x_low, x_high = float(x_bounds[0]), float(x_bounds[1])
     y_low, y_high = float(y_bounds[0]), float(y_bounds[1])
 
-    sum_grid, _, _ = np.histogram2d(
-        xs, ys, bins=grid_res,
-        range=[[x_low, x_high], [y_low, y_high]], weights=rs,
-    )
-    cnt_grid, _, _ = np.histogram2d(
-        xs, ys, bins=grid_res,
-        range=[[x_low, x_high], [y_low, y_high]],
-    )
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mean_grid = np.where(cnt_grid > 0, sum_grid / cnt_grid, np.nan)
+    has_bonus = bonus is not None and np.any(bonus != 0)
+    ncols = 2 if has_bonus else 1
+    fig, axes = _plt.subplots(1, ncols, figsize=(5 * ncols, 5), squeeze=False)
 
-    fig, ax = _plt.subplots(figsize=(5, 5))
-    im = ax.imshow(
-        mean_grid.T,
-        origin="lower",
-        extent=[x_low, x_high, y_low, y_high],
-        aspect="auto",
-        cmap="viridis",
-    )
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="reward (post-bonus)")
-    ax.set_xlabel("Ant x")
-    ax.set_ylabel("Ant y")
-    ax.set_title(f"Transition reward heatmap  step={current_step}")
+    def _draw(ax, values, label):
+        sc = ax.scatter(xs, ys, c=values, cmap="viridis", s=6, linewidths=0)
+        ax.set_xlim(x_low, x_high)
+        ax.set_ylim(y_low, y_high)
+        ax.set_aspect("equal")
+        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label=label)
+        ax.set_xlabel("Ant x")
+        ax.set_ylabel("Ant y")
+        ax.set_title(label)
+
+    _draw(axes[0, 0], rs, "reward (post-bonus)")
+    if has_bonus:
+        _draw(axes[0, 1], bonus, "scaled exploration bonus")
+
+    fig.suptitle(f"step={current_step}")
+    fig.tight_layout()
     _wandb.log({"viz/reward_heatmap": _wandb.Image(fig)}, step=current_step)
     _plt.close(fig)
 
@@ -688,14 +686,18 @@ class GoExploreSimple:
             if exploration_bonus_fn is not None:
                 bonus_key, train_key = jax.random.split(train_key)
                 bonus = exploration_bonus_fn(transitions, bonus_key)
+                scaled_bonus = self.exploration_bonus_weight * bonus
                 transitions = transitions._replace(
-                    reward=transitions.reward + self.exploration_bonus_weight * bonus
+                    reward=transitions.reward + scaled_bonus
                 )
+            else:
+                scaled_bonus = jnp.zeros_like(transitions.reward)
 
             reward_viz = (
                 transitions.observation[..., 0],
                 transitions.observation[..., 1],
                 transitions.reward,
+                scaled_bonus,
             )
 
             (training_state, _), metrics = jax.lax.scan(
