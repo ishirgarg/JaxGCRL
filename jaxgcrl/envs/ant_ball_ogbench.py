@@ -68,8 +68,20 @@ MEDIUM = [
 ]
 
 
+def _find_cells(maze_layout, maze_size_scaling, obj):
+    """Return (x,y) positions of cells matching obj."""
+    xy_offset = float(maze_size_scaling)
+    cells = []
+    for i in range(len(maze_layout)):
+        for j in range(len(maze_layout[0])):
+            if maze_layout[i][j] == obj:
+                cells.append([i * maze_size_scaling - xy_offset,
+                              j * maze_size_scaling - xy_offset])
+    return jnp.array(cells) if cells else jnp.zeros((0, 2))
+
+
 def _open_cells(maze_layout, maze_size_scaling):
-    """Return (x,y) positions of all open cells (non-wall, non-boundary)."""
+    """Return (x,y) positions of all open cells (non-wall)."""
     xy_offset = float(maze_size_scaling)
     cells = []
     for i in range(len(maze_layout)):
@@ -95,8 +107,21 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
                             "assets", "ant_ball_ogbench.xml")
     xy_offset = float(maze_size_scaling)
 
-    # All open cells are potential start / goal / ball positions
-    open_cells = _open_cells(maze_layout, maze_size_scaling)
+    # Check if the layout uses R/G/B markers for separate spawn regions
+    has_markers = any(
+        cell in (R, G, B)
+        for row in maze_layout
+        for cell in row
+    )
+    if has_markers:
+        starts = _find_cells(maze_layout, maze_size_scaling, R)
+        goals = _find_cells(maze_layout, maze_size_scaling, G)
+        balls = _find_cells(maze_layout, maze_size_scaling, B)
+    else:
+        open_cells = _open_cells(maze_layout, maze_size_scaling)
+        starts = open_cells
+        goals = open_cells
+        balls = open_cells
 
     rows = len(maze_layout)
     cols = len(maze_layout[0])
@@ -133,7 +158,7 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
 
     tree = tree.getroot()
     xml_string = ET.tostring(tree)
-    return xml_string, open_cells, x_bounds, y_bounds
+    return xml_string, starts, goals, balls, x_bounds, y_bounds
 
 
 class AntBallOGBench(PipelineEnv):
@@ -173,13 +198,14 @@ class AntBallOGBench(PipelineEnv):
         dense_reward: bool = False,
         **kwargs,
     ):
-        xml_string, open_cells, x_bounds, y_bounds = make_ball_maze(
+        xml_string, starts, goals, balls, x_bounds, y_bounds = make_ball_maze(
             maze_layout_name, maze_size_scaling
         )
 
         sys = mjcf.loads(xml_string)
-        self.possible_goals = open_cells
-        self.possible_starts = open_cells
+        self.possible_goals = goals
+        self.possible_starts = starts
+        self.possible_balls = balls
         self.x_bounds = tuple(float(v) for v in x_bounds)
         self.y_bounds = tuple(float(v) for v in y_bounds)
 
@@ -241,13 +267,13 @@ class AntBallOGBench(PipelineEnv):
 
         # Ant start position
         if start is None:
-            start_xy = self._random_cell(rng_ant)
+            start_xy = self._random_start(rng_ant)
         else:
             start_xy = jnp.asarray(start, dtype=q.dtype)
         q = q.at[:2].set(start_xy)
 
         # Ball position (free joint qpos at indices _ANT_Q : _ANT_Q + _BALL_Q)
-        ball_xy = self._random_cell(rng_ball)
+        ball_xy = self._random_ball(rng_ball)
         ball_q_start = self._ANT_Q  # 15
         q = q.at[ball_q_start].set(ball_xy[0])      # ball x
         q = q.at[ball_q_start + 1].set(ball_xy[1])   # ball y
@@ -263,7 +289,7 @@ class AntBallOGBench(PipelineEnv):
 
         # Target position (last 2 elements of q)
         if goal is None:
-            target_xy = self._random_cell(rng_goal)
+            target_xy = self._random_goal(rng_goal)
         else:
             target_xy = jnp.asarray(goal, dtype=q.dtype)
         q = q.at[-self._TARGET_Q:].set(target_xy)
@@ -362,7 +388,14 @@ class AntBallOGBench(PipelineEnv):
 
         return jnp.concatenate([qpos, qvel, target_pos])
 
-    def _random_cell(self, rng: jax.Array) -> jax.Array:
-        """Returns a random open-cell position from the maze."""
+    def _random_start(self, rng: jax.Array) -> jax.Array:
+        idx = jax.random.randint(rng, (1,), 0, len(self.possible_starts))
+        return self.possible_starts[idx][0]
+
+    def _random_goal(self, rng: jax.Array) -> jax.Array:
         idx = jax.random.randint(rng, (1,), 0, len(self.possible_goals))
         return self.possible_goals[idx][0]
+
+    def _random_ball(self, rng: jax.Array) -> jax.Array:
+        idx = jax.random.randint(rng, (1,), 0, len(self.possible_balls))
+        return self.possible_balls[idx][0]

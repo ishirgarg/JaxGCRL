@@ -114,6 +114,10 @@ class GoExploreSimple:
     # ── RLPD (offline data mixing) ─────────────────────────────────────────
     use_rlpd: bool = False  # Mix 50% offline OGBench data into each training batch
 
+    # ── Exploration bonus (added to reward after HER) ──────────────────────
+    exploration_bonus_type: Optional[str] = None  # "empowerment" or None
+    exploration_bonus_weight: float = 0.1
+
     # ── Go Explore specific parameters ──────────────────────────────────────
     num_gcp_steps: int = 250      # max steps in go phase before forcing explore
     num_ep_steps: int = 250        # steps in explore phase before reset to go
@@ -356,6 +360,22 @@ class GoExploreSimple:
                 state_size=state_size,
                 agent_type=self.agent_type,
                 include_phase=True,
+            )
+
+        # ── Exploration bonus ─────────────────────────────────────────────────
+        exploration_bonus_fn = None
+        if self.exploration_bonus_type is not None:
+            from jaxgcrl.agents.go_explore.exploration import create_exploration_bonus
+            key, bonus_init_key = jax.random.split(key)
+            exploration_bonus_fn = create_exploration_bonus(
+                self.exploration_bonus_type,
+                env=unwrapped_env,
+                state_size=state_size,
+                key=bonus_init_key,
+                empowerment_run_dir=self.empowerment_run_dir,
+                empowerment_epoch=self.empowerment_epoch,
+                empowerment_num_splus_samples=self.empowerment_num_splus_samples,
+                empowerment_score_chunk_size=self.empowerment_score_chunk_size,
             )
 
         # ── actor_step ────────────────────────────────────────────────────────
@@ -607,6 +627,15 @@ class GoExploreSimple:
                 transitions = jax.tree_util.tree_map(
                     lambda x: x[:num_batches], transitions
                 )
+
+            # Add exploration bonus to reward (after HER, so it always persists)
+            if exploration_bonus_fn is not None:
+                bonus_key, train_key = jax.random.split(train_key)
+                bonus = exploration_bonus_fn(transitions, bonus_key)
+                transitions = transitions._replace(
+                    reward=transitions.reward + self.exploration_bonus_weight * bonus
+                )
+
             (training_state, _), metrics = jax.lax.scan(
                 update_networks, (training_state, train_key), transitions
             )
