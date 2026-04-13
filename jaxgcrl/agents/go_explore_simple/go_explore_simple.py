@@ -54,8 +54,67 @@ from jaxgcrl.agents.go_explore.empowerment import (
     make_empowerment_obs_builder,
     make_offline_empowerment_scorer,
 )
+import io
 import numpy as np
 import os
+
+try:
+    import matplotlib.pyplot as _plt
+    import wandb as _wandb
+except Exception:  # pragma: no cover
+    _plt = None
+    _wandb = None
+
+
+def _log_reward_heatmap(
+    reward_viz,
+    x_bounds,
+    y_bounds,
+    current_step: int,
+    grid_res: int = 40,
+):
+    """Log a 2D heatmap of mean post-bonus transition reward per (ant x, ant y)
+    cell. ``reward_viz`` is the ``(xs, ys, rewards)`` snapshot taken inside
+    ``training_step`` right after the exploration bonus is added."""
+    if _plt is None or _wandb is None:
+        return
+
+    xs = np.asarray(reward_viz[0]).reshape(-1)
+    ys = np.asarray(reward_viz[1]).reshape(-1)
+    rs = np.asarray(reward_viz[2]).reshape(-1)
+
+    x_low, x_high = float(x_bounds[0]), float(x_bounds[1])
+    y_low, y_high = float(y_bounds[0]), float(y_bounds[1])
+
+    sum_grid, _, _ = np.histogram2d(
+        xs, ys, bins=grid_res,
+        range=[[x_low, x_high], [y_low, y_high]], weights=rs,
+    )
+    cnt_grid, _, _ = np.histogram2d(
+        xs, ys, bins=grid_res,
+        range=[[x_low, x_high], [y_low, y_high]],
+    )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean_grid = np.where(cnt_grid > 0, sum_grid / cnt_grid, np.nan)
+
+    fig, ax = _plt.subplots(figsize=(5, 5))
+    im = ax.imshow(
+        mean_grid.T,
+        origin="lower",
+        extent=[x_low, x_high, y_low, y_high],
+        aspect="auto",
+        cmap="viridis",
+    )
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="reward (post-bonus)")
+    ax.set_xlabel("Ant x")
+    ax.set_ylabel("Ant y")
+    ax.set_title(f"Transition reward heatmap  step={current_step}")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    buf.seek(0)
+    _wandb.log({"viz/reward_heatmap": _wandb.Image(buf)}, step=current_step)
+    _plt.close(fig)
+
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -636,11 +695,17 @@ class GoExploreSimple:
                     reward=transitions.reward + self.exploration_bonus_weight * bonus
                 )
 
+            reward_viz = (
+                transitions.observation[..., 0],
+                transitions.observation[..., 1],
+                transitions.reward,
+            )
+
             (training_state, _), metrics = jax.lax.scan(
                 update_networks, (training_state, train_key), transitions
             )
 
-            return (training_state, env_state, buffer_state, updated_gps), metrics
+            return (training_state, env_state, buffer_state, updated_gps), (metrics, reward_viz)
 
         # ── training_epoch ────────────────────────────────────────────────────
         @jax.jit
@@ -655,15 +720,18 @@ class GoExploreSimple:
             def f(carry, _):
                 ts, es, bs, k, gps = carry
                 k, train_key = jax.random.split(k)
-                (ts, es, bs, gps), metrics = training_step(ts, es, bs, train_key, gps)
-                return (ts, es, bs, k, gps), metrics
+                (ts, es, bs, gps), (metrics, reward_viz) = training_step(ts, es, bs, train_key, gps)
+                return (ts, es, bs, k, gps), (metrics, reward_viz)
 
-            (training_state, env_state, buffer_state, key, goal_proposer_state), metrics = jax.lax.scan(
+            (training_state, env_state, buffer_state, key, goal_proposer_state), (metrics, reward_viz) = jax.lax.scan(
                 f,
                 (training_state, env_state, buffer_state, key, goal_proposer_state),
                 (),
                 length=num_training_steps_per_epoch,
             )
+
+            # Keep only the final step's snapshot for visualization.
+            last_reward_viz = jax.tree_util.tree_map(lambda x: x[-1], reward_viz)
 
             # Go Explore phase metrics — epoch-level (current policy performance)
             epoch_completions   = jnp.sum(env_state.info['go_completions_total']) - pre_completions
@@ -682,7 +750,7 @@ class GoExploreSimple:
             metrics["avg_go_phase_steps"]    = jnp.broadcast_to(avg_go_steps, scan_shape)
             metrics["buffer_current_size"]   = jnp.broadcast_to(replay_buffer.size(buffer_state), scan_shape)
 
-            return training_state, env_state, buffer_state, goal_proposer_state, metrics
+            return training_state, env_state, buffer_state, goal_proposer_state, metrics, last_reward_viz
 
         # ── prefill ───────────────────────────────────────────────────────────
         key, prefill_key = jax.random.split(key)
@@ -726,7 +794,7 @@ class GoExploreSimple:
             t = time.time()
             key, epoch_key = jax.random.split(key)
 
-            training_state, env_state, buffer_state, goal_proposer_state, metrics = training_epoch(
+            training_state, env_state, buffer_state, goal_proposer_state, metrics, last_reward_viz = training_epoch(
                 training_state, env_state, buffer_state, epoch_key, goal_proposer_state
             )
 
@@ -777,6 +845,13 @@ class GoExploreSimple:
                     state_size=state_size,
                     goal_indices=tuple(train_env.goal_indices),
                 )
+                if exploration_bonus_fn is not None:
+                    _log_reward_heatmap(
+                        reward_viz=last_reward_viz,
+                        x_bounds=unwrapped_env.x_bounds,
+                        y_bounds=unwrapped_env.y_bounds,
+                        current_step=current_step,
+                    )
                 last_visualization_step = current_step
 
             do_render = ne % config.visualization_interval == 0
