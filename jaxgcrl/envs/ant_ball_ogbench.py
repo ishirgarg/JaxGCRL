@@ -54,6 +54,19 @@ SMALL_SQUARE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
+# Easy square: ball spawn fixed near center, goals along right/bottom edges
+# (ported from ant_ball_maze.py EASY_SQUARE_MAZE)
+EASY_SQUARE = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, 0, 0, 0, 0, G, 1],
+    [1, 0, 0, 0, 0, 0, G, 1],
+    [1, 0, 0, B, 0, 0, G, 1],
+    [1, 0, 0, 0, 0, 0, G, 1],
+    [1, 0, 0, 0, 0, 0, G, 1],
+    [1, G, G, G, G, G, G, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
 # OGBench medium: transposed so physical layout matches OGBench
 # (OGBench uses pos_x=j, pos_y=i; JaxGCRL uses pos_x=i, pos_y=j)
 MEDIUM = [
@@ -100,6 +113,8 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
         maze_layout = MEDIUM
     elif maze_layout_name == "small_square":
         maze_layout = SMALL_SQUARE
+    elif maze_layout_name == "easy_square":
+        maze_layout = EASY_SQUARE
     else:
         raise ValueError(f"Unknown OGBench ball maze layout: {maze_layout_name}")
 

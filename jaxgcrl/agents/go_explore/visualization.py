@@ -692,6 +692,18 @@ def handle_goal_proposer_visualization(
             x_bounds=x_bounds,
             y_bounds=y_bounds,
         )
+    elif goal_proposer_name == "empowerment_density_ratio":
+        visualize_empowerment_density_ratio_candidates(
+            candidate_goals=log_data["candidate_goals"],
+            first_obs_position=log_data["first_obs_position"],
+            emp_scores=log_data["emp_scores"],
+            densities=log_data["densities"],
+            log_densities=log_data["log_densities"],
+            selection_logits=log_data["selection_logits"],
+            selected_goal=log_data["selected_goal"],
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+        )
     # Add more goal proposer visualizations here as needed
 
 
@@ -761,6 +773,76 @@ def visualize_empowerment_candidates(
     fig.suptitle("Empowerment goal proposer", fontsize=13, y=1.02)
     plt.tight_layout()
     wandb.log({"goal_proposer/empowerment_candidates": wandb.Image(fig)})
+    plt.close(fig)
+
+
+def visualize_empowerment_density_ratio_candidates(
+    candidate_goals: np.ndarray,
+    first_obs_position: np.ndarray,
+    emp_scores: np.ndarray,
+    densities: np.ndarray,
+    log_densities: np.ndarray,
+    selection_logits: np.ndarray,
+    selected_goal: np.ndarray,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+) -> None:
+    """Three panels: empowerment, density, and their ratio (empowerment / log_density)."""
+    cg = np.asarray(candidate_goals, dtype=np.float64)
+    fo = np.asarray(first_obs_position, dtype=np.float64)
+    es = np.asarray(emp_scores, dtype=np.float64).ravel()
+    ds = np.asarray(densities, dtype=np.float64).ravel()
+    ratio = np.asarray(selection_logits, dtype=np.float64).ravel()
+    sg = np.asarray(selected_goal, dtype=np.float64)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5), sharex=True, sharey=True)
+    specs = [
+        (es, "Empowerment", "offline empowerment", "max"),
+        (ds, "Density", "KDE density", "min"),
+        (ratio, "Ratio", "empowerment / log_density", "max"),
+    ]
+    for ax, (values, title, cbar_label, mode) in zip(axes, specs):
+        sc = ax.scatter(
+            cg[:, 0],
+            cg[:, 1],
+            c=values,
+            cmap="viridis",
+            s=18,
+            alpha=0.8,
+        )
+        ax.scatter(
+            fo[0],
+            fo[1],
+            c="red",
+            s=100,
+            marker="x",
+            linewidths=2,
+            label="start",
+            zorder=5,
+        )
+        best_idx = int(np.argmin(values) if mode == "min" else np.argmax(values))
+        ax.scatter(
+            cg[best_idx, 0],
+            cg[best_idx, 1],
+            c="gold",
+            s=180,
+            marker="*",
+            edgecolors="black",
+            linewidths=0.8,
+            label="argmin" if mode == "min" else "argmax",
+            zorder=6,
+        )
+        ax.set_xlim(float(x_bounds[0]), float(x_bounds[1]))
+        ax.set_ylim(float(y_bounds[0]), float(y_bounds[1]))
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_title(title)
+        ax.grid(True, alpha=0.25)
+        plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label=cbar_label)
+    axes[0].legend(loc="best", fontsize=8)
+    fig.suptitle("Empowerment / density ratio goal proposer", fontsize=13, y=1.02)
+    plt.tight_layout()
+    wandb.log({"goal_proposer/empowerment_density_ratio_candidates": wandb.Image(fig)})
     plt.close(fig)
 
 

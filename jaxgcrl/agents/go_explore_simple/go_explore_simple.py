@@ -157,7 +157,7 @@ class GoExploreSimple:
     n_critics: int = 2
     use_her: bool = True
 
-    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega", "empowerment"] = "random_env_goals"
+    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega", "empowerment", "empowerment_density_ratio"] = "random_env_goals"
     num_candidates: int = 512
     goal_proposer_temperature: float = 0.0
     empowerment_run_dir: Optional[str] = None
@@ -272,7 +272,7 @@ class GoExploreSimple:
         )
         gcp_critic_states = gcp_critic.create_critic_states(gcp_critic_params, self.critic_lr)
 
-        target_entropy = -0.5 * action_size
+        target_entropy = -1 * action_size
         log_alpha      = jnp.asarray(0.0, dtype=jnp.float32)
         alpha_state    = TrainState.create(
             apply_fn=None,
@@ -297,9 +297,9 @@ class GoExploreSimple:
 
         # ── Optional offline-empowerment scorer for goal proposer ───────────
         offline_empowerment_scorer = None
-        if self.goal_proposer_name == "empowerment":
+        if self.goal_proposer_name in ("empowerment", "empowerment_density_ratio"):
             if self.empowerment_run_dir is None:
-                raise ValueError("empowerment_run_dir must be set when goal_proposer_name='empowerment'.")
+                raise ValueError(f"empowerment_run_dir must be set when goal_proposer_name='{self.goal_proposer_name}'.")
             key, empowerment_template_key = jax.random.split(key)
             ogbench_obs_indices, jaxgcrl_state_indices = infer_empowerment_override_indices_from_env(
                 unwrapped_env

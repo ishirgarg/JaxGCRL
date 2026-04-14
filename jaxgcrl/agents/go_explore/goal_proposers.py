@@ -89,6 +89,16 @@ def create_goal_proposer(
             offline_empowerment_scorer,
             temperature=goal_proposer_temperature,
         )
+    elif goal_proposer_name == "empowerment_density_ratio":
+        return create_empowerment_density_ratio_goal_proposer(
+            env,
+            num_envs,
+            num_candidates,
+            state_size,
+            goal_indices,
+            offline_empowerment_scorer,
+            temperature=goal_proposer_temperature,
+        )
     else:
         raise ValueError(f"Unknown goal proposer: {goal_proposer_name}")
 
@@ -495,6 +505,69 @@ def create_empowerment_goal_proposer(
 
         emp_scores = offline_empowerment_scorer(candidate_states, emp_rng)  # (num_candidates,)
         logits = emp_scores - log_density
+        best_idx = _sample_idx_from_temperature_logits(select_rng, logits, temperature)
+        selected_state = candidate_states[best_idx]
+        selected_goal = selected_state[goal_idx_array]
+
+        first_obs_state = start_obs[:state_size]
+        first_obs_position = first_obs_state[goal_idx_array]
+
+        log_data = {
+            "candidate_goals": candidate_goals,
+            "first_obs_position": first_obs_position,
+            "emp_scores": emp_scores,
+            "densities": densities,
+            "log_densities": log_density,
+            "selection_logits": logits,
+            "selected_goal": selected_goal,
+        }
+        return selected_goal, goal_proposer_state, log_data
+
+    return propose_goal
+
+
+def create_empowerment_density_ratio_goal_proposer(
+    env,
+    num_envs: int,
+    num_candidates: int,
+    state_size: Optional[int] = None,
+    goal_indices: Optional[tuple] = None,
+    offline_empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
+    temperature: float = 0.0,
+    kde_bandwidth: float = 0.1,
+    kde_eps: float = 1e-8,
+) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
+    """Replay-buffer candidates scored by empowerment divided by KDE log-density.
+
+    Since log_density is negative (densities < 1 after eps), dividing empowerment
+    by log_density yields a score that is higher for rarer states (more negative
+    denominator → larger magnitude, with sign depending on empowerment).
+
+    Selection: ``softmax((empowerment / log_density) / T)`` when ``T > 0``, else
+    ``argmax(empowerment / log_density)``.
+    """
+    if offline_empowerment_scorer is None:
+        raise ValueError("offline_empowerment_scorer must be provided for empowerment_density_ratio proposer.")
+
+    goal_idx_array = jnp.array(goal_indices)
+
+    def propose_goal(rng: jax.Array, start_obs: jnp.ndarray, goal_proposer_state: GoalProposerState):
+        transitions_sample = goal_proposer_state.transitions_sample
+        obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
+        states = obs_flat[:, :state_size]
+        all_goals = states[:, goal_idx_array]
+
+        num_states = states.shape[0]
+        rng, sample_rng, emp_rng, select_rng = jax.random.split(rng, 4)
+        candidate_indices = jax.random.randint(sample_rng, (num_candidates,), 0, num_states)
+        candidate_states = states[candidate_indices]
+        candidate_goals = candidate_states[:, goal_idx_array]
+
+        densities = _jax_gaussian_kde(candidate_goals, all_goals, kde_bandwidth)
+        log_density = jnp.log(densities + kde_eps)
+
+        emp_scores = offline_empowerment_scorer(candidate_states, emp_rng)
+        logits = emp_scores / log_density
         best_idx = _sample_idx_from_temperature_logits(select_rng, logits, temperature)
         selected_state = candidate_states[best_idx]
         selected_goal = selected_state[goal_idx_array]

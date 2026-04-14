@@ -1,5 +1,4 @@
 import functools
-import io
 import logging
 import time
 from typing import Any, Callable, Optional
@@ -40,40 +39,30 @@ Metrics = Any
 # Inline visualization helpers (no external visualization module required)
 # ---------------------------------------------------------------------------
 
-def _fig_to_wandb_image(fig: plt.Figure) -> wandb.Image:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-    buf.seek(0)
-    img = wandb.Image(buf)
-    plt.close(fig)
-    return img
-
-
 def _log_dist_vs_reward_scatter(
     replay_buffer,
     buffer_state,
-    goal_indices: tuple[int, int],
+    ball_indices: tuple[int, int],
     empowerment_reward_scaling: float,
     current_step: int,
 ) -> Any:
-    """Sample the replay buffer and log a scatter of ‖achieved – goal‖ vs reward."""
+    """Sample the replay buffer and log a scatter of ‖ant – ball‖ vs reward."""
     buf_state, transitions = replay_buffer.sample(buffer_state)
-    obs = np.asarray(transitions.observation)
-    reward = np.asarray(transitions.reward)
+    obs = np.asarray(transitions.observation).reshape(-1, transitions.observation.shape[-1])
+    reward = np.asarray(transitions.reward).reshape(-1)
 
-    # Goal position lives at goal_indices (ball_rel x,y in new layout)
-    gi0, gi1 = goal_indices
-    goal_xy = obs[:, gi0 : gi1 + 1]           # (N, 2)
-    # Distance proxy: magnitude of the relative goal vector (already relative)
-    dist = np.linalg.norm(goal_xy, axis=-1)    # (N,)
+    ant_xy = obs[:, 0:2]
+    ball_xy = obs[:, list(ball_indices)]
+    dist = np.linalg.norm(ant_xy - ball_xy, axis=-1)
     unscaled_reward = reward / max(empowerment_reward_scaling, 1e-8)
 
     fig, ax = plt.subplots(figsize=(5, 4))
     ax.scatter(dist, unscaled_reward, s=4, alpha=0.3)
-    ax.set_xlabel("‖goal_rel‖  (proxy for distance to goal)")
+    ax.set_xlabel("‖ant - ball‖")
     ax.set_ylabel("Empowerment reward (unscaled)")
     ax.set_title(f"Dist vs Reward  step={current_step}")
-    wandb.log({"viz/dist_vs_reward": _fig_to_wandb_image(fig)}, step=current_step)
+    wandb.log({"viz/dist_vs_reward": wandb.Image(fig)}, step=current_step)
+    plt.close(fig)
     return buf_state
 
 
@@ -146,7 +135,8 @@ def _log_empowerment_map(
     ax.set_xlabel("Ant x")
     ax.set_ylabel("Ant y")
     ax.legend(fontsize=7)
-    wandb.log({"viz/empowerment_map": _fig_to_wandb_image(fig)}, step=current_step)
+    wandb.log({"viz/empowerment_map": wandb.Image(fig)}, step=current_step)
+    plt.close(fig)
 
 
 def _log_replay_xy_reward_scatter(
@@ -156,8 +146,8 @@ def _log_replay_xy_reward_scatter(
 ) -> Any:
     """Scatter of (ant x, ant y) colored by reward from a replay buffer sample."""
     buf_state, transitions = replay_buffer.sample(buffer_state)
-    obs = np.asarray(transitions.observation)
-    reward = np.asarray(transitions.reward)
+    obs = np.asarray(transitions.observation).reshape(-1, transitions.observation.shape[-1])
+    reward = np.asarray(transitions.reward).reshape(-1)
     xs = obs[:, 0]
     ys = obs[:, 1]
     fig, ax = plt.subplots(figsize=(5, 5))
@@ -166,7 +156,39 @@ def _log_replay_xy_reward_scatter(
     ax.set_ylabel("Ant y")
     ax.set_title(f"Replay (x,y) colored by reward  step={current_step}")
     fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label="reward")
-    wandb.log({"viz/replay_xy_reward": _fig_to_wandb_image(fig)}, step=current_step)
+    wandb.log({"viz/replay_xy_reward": wandb.Image(fig)}, step=current_step)
+    plt.close(fig)
+    return buf_state
+
+
+def _log_replay_empowerment_scatter(
+    replay_buffer,
+    buffer_state,
+    ball_indices: tuple[int, int],
+    current_step: int,
+) -> Any:
+    """Scatter of (ball x, ball y) coords from the replay buffer colored by empowerment.
+
+    Uses the unscaled empowerment value stored in transition extras (``emp_abs``).
+    Plots every sampled point — no binning or aggregation.
+    """
+    buf_state, transitions = replay_buffer.sample(buffer_state)
+    obs = np.asarray(transitions.observation).reshape(-1, transitions.observation.shape[-1])
+    emp_abs = np.asarray(
+        transitions.extras["state_extras"]["emp_abs"]
+    ).reshape(-1)
+
+    bx = obs[:, ball_indices[0]]
+    by = obs[:, ball_indices[1]]
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    sc = ax.scatter(bx, by, c=emp_abs, s=8, cmap="viridis")
+    ax.set_xlabel("ball x")
+    ax.set_ylabel("ball y")
+    ax.set_title(f"Replay (ball x,y) colored by empowerment  step={current_step}")
+    fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label="empowerment")
+    wandb.log({"viz/replay_empowerment": wandb.Image(fig)}, step=current_step)
+    plt.close(fig)
     return buf_state
 
 # ---------------------------------------------------------------------------
@@ -209,7 +231,13 @@ class EmpowermentSAC:
     alpha_lr: float = 3e-4
     empowerment_reward_scaling: float = 1.0
     use_empowerment_diff: bool = False
+    normalize_rewards: bool = False
     deterministic_eval: bool = True
+
+    # RLPD: mix offline OGBench data into each training batch (50/50)
+    use_rlpd: bool = False
+    # Chunk size for empowerment scoring of offline transitions (memory control)
+    offline_emp_chunk_size: int = 1024
 
     # Empowerment checkpoint args (OGBench import path is inferred from ``run_dir``).
     run_dir: Optional[str] = None
@@ -307,12 +335,15 @@ class EmpowermentSAC:
         eval_env = EvalAutoResetWrapper(eval_env)
 
         # Dimensions
+        # ant_ball_ogbench obs layout = [qpos(22), qvel(20), target_xy(2)] = 44
+        # Ant xy at [0,1]; ball xy at [15,16]; goal target at [-2:].
+        # We strip the trailing 2 (target) so the policy never sees the goal.
         action_size = unwrapped_env.action_size
-        state_size = int(unwrapped_env.observation_size)
-        obs_size_net = state_size
-        # Tail layout: [ball_rel(2), goal_rel(2)]
-        goal_indices = (obs_size_net - 4, obs_size_net - 3)
-        goal_target_indices = (obs_size_net - 2, obs_size_net - 1)
+        full_obs_size = int(unwrapped_env.observation_size)
+        goal_dim = 2
+        obs_size_net = full_obs_size - goal_dim   # policy / network obs dim (42)
+        ball_indices = (_ball_x_idx, _ball_y_idx)  # (15, 16) — ball in OGBench obs
+        goal_indices = ball_indices  # used by process_transitions API
 
         # ------------------------------------------------------------------
         # Networks
@@ -337,7 +368,7 @@ class EmpowermentSAC:
             tx=optax.adam(learning_rate=self.policy_lr),
         )
         critic_states = critic.create_critic_states(critic_params, self.critic_lr)
-        target_entropy = -0.5 * action_size
+        target_entropy = -1.0 * action_size
         log_alpha = jnp.asarray(0.0, dtype=jnp.float32)
         alpha_state = TrainState.create(
             apply_fn=None,
@@ -403,41 +434,86 @@ class EmpowermentSAC:
         logging.info("Num_prefill_actor_steps: %d", num_prefill_actor_steps)
 
         # ------------------------------------------------------------------
-        # Empowerment reward (online, JIT-compiled).
-        # Uses the fixed head (base_og_const); only ant x/y and ball x/y are
-        # overwritten from the current Brax observation.
+        # RLPD: optional offline OGBench buffer
         # ------------------------------------------------------------------
-        @jax.jit
-        def empowerment_reward_online_with_key(
+        offline_buffer = None
+        if self.use_rlpd:
+            from jaxgcrl.utils.offline_buffer import load_and_prepare_offline_buffer
+            # offline_buffer pads the OGBench obs (state_size dim) with `goal_dim`
+            # zeros at the tail, producing full_obs_size-dim observations that
+            # match the env's raw obs layout.  We then slice off the trailing
+            # goal pad in the labelling step before mixing with online data.
+            offline_buffer = load_and_prepare_offline_buffer(
+                env_name=config.env,
+                episode_length=config.episode_length,
+                num_slots=config.num_envs,
+                obs_size=full_obs_size,
+                action_size=action_size,
+                state_size=full_obs_size - goal_dim,
+                agent_type="sac",
+                include_phase=False,
+            )
+
+        # ------------------------------------------------------------------
+        # Empowerment scoring.  Single chunked entry point used by both the
+        # online actor step (small batch, fits in one chunk) and offline RLPD
+        # labelling (large batch, scanned across many chunks).  Uses the fixed
+        # OGBench head template; only ant x/y and ball x/y are overwritten.
+        # ant_ball_ogbench obs match the OGBench layout for the first 42 dims,
+        # so the brax-side and template-side ball indices are identical.
+        # ------------------------------------------------------------------
+        offline_chunk = int(self.offline_emp_chunk_size)
+
+        def _empowerment_one_chunk(
             full_obs_batch: jnp.ndarray, rng_key: jnp.ndarray
         ) -> jnp.ndarray:
             batch_size = full_obs_batch.shape[0]
             base_og = jnp.broadcast_to(base_og_const, (batch_size, ex_obs_dim))
             base_og = base_og.at[:, 0].set(full_obs_batch[:, 0])
             base_og = base_og.at[:, 1].set(full_obs_batch[:, 1])
-            # Ball absolute position lives at [-4:-2] in the Brax obs tail
-            base_og = base_og.at[:, _ball_x_idx].set(full_obs_batch[:, -4])
-            base_og = base_og.at[:, _ball_y_idx].set(full_obs_batch[:, -3])
+            base_og = base_og.at[:, _ball_x_idx].set(full_obs_batch[:, _ball_x_idx])
+            base_og = base_og.at[:, _ball_y_idx].set(full_obs_batch[:, _ball_y_idx])
             return emp_agent.empowerment(base_og, rng=rng_key)
+
+        @jax.jit
+        def empowerment_reward(
+            full_obs_batch: jnp.ndarray, rng_key: jnp.ndarray
+        ) -> jnp.ndarray:
+            """Chunked empowerment scoring for any batch size."""
+            n = full_obs_batch.shape[0]
+            num_chunks = (n + offline_chunk - 1) // offline_chunk
+            pad = num_chunks * offline_chunk - n
+            padded = jnp.pad(full_obs_batch, ((0, pad), (0, 0)))
+            chunks = padded.reshape(num_chunks, offline_chunk, full_obs_batch.shape[-1])
+            chunk_keys = jax.random.split(rng_key, num_chunks)
+
+            def step(_, args):
+                c, kk = args
+                return None, _empowerment_one_chunk(c, kk)
+
+            _, emps = jax.lax.scan(step, None, (chunks, chunk_keys))
+            return emps.reshape(-1)[:n]
 
         # ------------------------------------------------------------------
         # Actor step with empowerment reward
         # ------------------------------------------------------------------
         def actor_step(training_state, env, env_state, action_key, emp_key, extra_fields=()):
-            state_obs = env_state.obs[:, :state_size]
+            full_obs = env_state.obs[:, :full_obs_size]
+            policy_obs = full_obs[:, :obs_size_net]   # drop trailing goal target
             actions = actor.sample_actions(
-                training_state.actor_state.params, state_obs, action_key, is_deterministic=False
+                training_state.actor_state.params, policy_obs, action_key, is_deterministic=False
             )
             nstate = env.step(env_state, actions)
-            next_state_obs = nstate.obs[:, :state_size]
+            next_full_obs = nstate.obs[:, :full_obs_size]
+            next_policy_obs = next_full_obs[:, :obs_size_net]
             if self.use_empowerment_diff:
                 emp_key_cur, emp_key_next = jax.random.split(emp_key)
-                cur_emp = empowerment_reward_online_with_key(state_obs, emp_key_cur)
-                next_emp = empowerment_reward_online_with_key(next_state_obs, emp_key_next)
+                cur_emp = empowerment_reward(full_obs, emp_key_cur)
+                next_emp = empowerment_reward(next_full_obs, emp_key_next)
                 emp_delta = next_emp - cur_emp
                 shaped_reward = emp_delta
             else:
-                next_emp = empowerment_reward_online_with_key(next_state_obs, emp_key)
+                next_emp = empowerment_reward(next_full_obs, emp_key)
                 emp_delta = jnp.zeros_like(next_emp)
                 shaped_reward = next_emp
             combined_reward = self.empowerment_reward_scaling * shaped_reward
@@ -445,11 +521,11 @@ class EmpowermentSAC:
             state_extras["emp_abs"] = next_emp
             state_extras["emp_delta"] = emp_delta
             return nstate, Transition(
-                observation=state_obs,
+                observation=policy_obs,
                 action=actions,
                 reward=combined_reward,
                 discount=1 - nstate.done,
-                next_observation=next_state_obs,
+                next_observation=next_policy_obs,
                 extras={"state_extras": state_extras},
             )
 
@@ -503,6 +579,45 @@ class EmpowermentSAC:
             metrics.update(actor_metrics)
             return (training_state, key), metrics
 
+        # ------------------------------------------------------------------
+        # Offline empowerment labelling.  Reuses the chunked `empowerment_reward`
+        # entry point on flattened (num_envs * episode_length) batches, then
+        # replaces observation/next_observation with the goal-stripped policy
+        # obs so shapes match the online buffer.
+        # ------------------------------------------------------------------
+        def label_offline_with_empowerment(transitions, key):
+            full_obs = transitions.observation
+            next_full_obs = transitions.next_observation
+            N, L = full_obs.shape[0], full_obs.shape[1]
+            flat_obs = full_obs.reshape(N * L, -1)
+            flat_next = next_full_obs.reshape(N * L, -1)
+
+            k1, k2 = jax.random.split(key)
+            cur_emp = empowerment_reward(flat_obs, k1).reshape(N, L)
+            next_emp = empowerment_reward(flat_next, k2).reshape(N, L)
+
+            if self.use_empowerment_diff:
+                emp_delta = next_emp - cur_emp
+                shaped_reward = emp_delta
+            else:
+                emp_delta = jnp.zeros_like(next_emp)
+                shaped_reward = next_emp
+            new_reward = self.empowerment_reward_scaling * shaped_reward
+
+            new_extras = dict(transitions.extras["state_extras"])
+            new_extras["emp_abs"] = next_emp
+            new_extras["emp_delta"] = emp_delta
+
+            sliced_obs = full_obs[..., :obs_size_net]
+            sliced_next = next_full_obs[..., :obs_size_net]
+
+            return transitions._replace(
+                observation=sliced_obs,
+                next_observation=sliced_next,
+                reward=new_reward,
+                extras={"state_extras": new_extras},
+            )
+
         @jax.jit
         def training_step(training_state, env_state, buffer_state, key):
             exp_key, process_key, train_key = jax.random.split(key, 3)
@@ -512,12 +627,38 @@ class EmpowermentSAC:
             training_state = training_state.replace(
                 env_steps=training_state.env_steps + env_steps_per_actor_step
             )
-            buffer_state, transitions = replay_buffer.sample(buffer_state)
+            buffer_state, online_transitions = replay_buffer.sample(buffer_state)
+
+            if self.use_rlpd:
+                offline_key, emp_key, process_key = jax.random.split(process_key, 3)
+                raw_offline = offline_buffer.sample(offline_key, config.num_envs)
+                offline_transitions = label_offline_with_empowerment(raw_offline, emp_key)
+                transitions = jax.tree_util.tree_map(
+                    lambda a, b: jnp.concatenate([a, b], axis=0),
+                    online_transitions, offline_transitions,
+                )
+            else:
+                transitions = online_transitions
+
             r = transitions.reward / self.empowerment_reward_scaling
             transitions, _ = actor.process_transitions(
                 transitions, process_key, self.batch_size, self.discounting,
                 obs_size_net, goal_indices, unwrapped_env.goal_reach_thresh, use_her=False,
             )
+
+            if self.use_rlpd:
+                # After concat, process_transitions produces 2x the online batch
+                # count.  Slicing in half restores the original gradient-step
+                # count; the random permutation inside process_transitions has
+                # already mixed online and offline samples within each batch.
+                num_batches = transitions.observation.shape[0] // 2
+                transitions = jax.tree_util.tree_map(lambda x: x[:num_batches], transitions)
+            if self.normalize_rewards:
+                r_all = transitions.reward
+                r_mean = jnp.mean(r_all)
+                r_std = jnp.std(r_all)
+                normalized = (r_all - r_mean) / (r_std + 1e-8)
+                transitions = transitions._replace(reward=normalized)
             (training_state, _), metrics = jax.lax.scan(
                 update_networks, (training_state, train_key), transitions
             )
@@ -582,9 +723,10 @@ class EmpowermentSAC:
         # Evaluator
         # ------------------------------------------------------------------
         def eval_actor_step(training_state, env, env_state, extra_fields=()):
-            state_obs = env_state.obs[:, :state_size]
+            full_obs = env_state.obs[:, :full_obs_size]
+            policy_obs = full_obs[:, :obs_size_net]
             actions = actor.sample_actions(
-                training_state.actor_state.params, state_obs,
+                training_state.actor_state.params, policy_obs,
                 jax.random.PRNGKey(0), is_deterministic=self.deterministic_eval,
             )
             nstate = env.step(env_state, actions)
@@ -608,7 +750,10 @@ class EmpowermentSAC:
 
         def make_policy(params, deterministic: bool = False):
             def policy(obs, key):
-                actions = actor.sample_actions(params, obs, key, is_deterministic=deterministic)
+                # Strip trailing goal target so render-time obs (full env obs)
+                # matches the policy's expected input dim.
+                policy_obs = obs[..., :obs_size_net]
+                actions = actor.sample_actions(params, policy_obs, key, is_deterministic=deterministic)
                 return actions, {}
             return policy
 
@@ -652,13 +797,19 @@ class EmpowermentSAC:
                 buffer_state = _log_dist_vs_reward_scatter(
                     replay_buffer,
                     buffer_state,
-                    goal_indices,
+                    ball_indices,
                     self.empowerment_reward_scaling,
                     current_step,
                 )
                 buffer_state = _log_replay_xy_reward_scatter(
                     replay_buffer,
                     buffer_state,
+                    current_step,
+                )
+                buffer_state = _log_replay_empowerment_scatter(
+                    replay_buffer,
+                    buffer_state,
+                    ball_indices,
                     current_step,
                 )
                 key, vis_key = jax.random.split(key)
