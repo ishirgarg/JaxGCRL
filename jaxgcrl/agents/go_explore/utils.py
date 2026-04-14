@@ -125,13 +125,15 @@ def sample_trajectories_from_buffer(
     traj_id_flat = jnp.reshape(transitions.extras["state_extras"]["traj_id"], (-1,))
     truncation_flat = jnp.reshape(transitions.extras["state_extras"]["truncation"], (-1,))
     
-    # Extract x, y positions from observations (first state_size elements contain state)
-    positions = obs_flat[:, :state_size][:, list(goal_indices)]  # (N, 2)
-    
-    # Extract goal positions from latter part of observation
-    # Goals are at state_size:state_size+goal_size (observation = [state, goal])
+    # Extract x, y positions from observations (first state_size elements contain state).
+    # Only use the first two goal_indices entries so downstream 2D plotting
+    # code works even when the env exposes a >2-dim goal (e.g. ant_ball_4d_ogbench).
+    xy_goal_indices = list(goal_indices)[:2]
+    positions = obs_flat[:, :state_size][:, xy_goal_indices]  # (N, 2)
+    # Goals live at obs[state_size:] (length len(goal_indices)); slice the
+    # first two entries to get the matching xy for 2D plots.
     goal_size = len(goal_indices)
-    goal_positions = obs_flat[:, -goal_size:]  # (N, goal_size)
+    goal_positions = obs_flat[:, state_size:state_size + goal_size][:, :2]  # (N, 2)
     
     # Convert to numpy for easier processing
     positions_np = np.array(positions)
@@ -352,10 +354,12 @@ def sample_trajectory_sequences(
     traj_id_flat = jnp.reshape(transitions.extras["state_extras"]["traj_id"], (-1,))
     truncation_flat = jnp.reshape(transitions.extras["state_extras"]["truncation"], (-1,))
     
-    # Extract positions and goals
-    positions = obs_flat[:, :state_size][:, list(goal_indices)]  # (N, 2)
+    # Extract positions and goals. Only use the first two goal_indices entries
+    # so downstream 2D plotting code works with >2-dim goal envs.
+    xy_goal_indices = list(goal_indices)[:2]
+    positions = obs_flat[:, :state_size][:, xy_goal_indices]  # (N, 2)
     goal_size = len(goal_indices)
-    goal_positions = obs_flat[:, -goal_size:]  # (N, goal_size)
+    goal_positions = obs_flat[:, state_size:state_size + goal_size][:, :2]  # (N, 2)
     
     # Convert to numpy
     positions_np = np.array(positions)

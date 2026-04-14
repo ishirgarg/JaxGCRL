@@ -33,12 +33,12 @@ MAZE_HEIGHT = 0.5
 # OGBench arena: 8x8 open space
 ARENA = [
     [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, R, B, R, B, R, B, 1],
+    [1, B, B, B, B, B, B, 1],
+    [1, R, B, G, G, B, R, 1],
+    [1, B, B, G, G, B, B, 1],
+    [1, R, B, G, G, B, R, 1],
+    [1, B, R, B, R, B, R, 1],
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
@@ -211,6 +211,7 @@ class AntBallOGBench(PipelineEnv):
         maze_layout_name="arena",
         maze_size_scaling=4.0,
         dense_reward: bool = False,
+        add_ant_to_goal: bool = False,
         **kwargs,
     ):
         xml_string, starts, goals, balls, x_bounds, y_bounds = make_ball_maze(
@@ -218,6 +219,11 @@ class AntBallOGBench(PipelineEnv):
         )
 
         sys = mjcf.loads(xml_string)
+        if add_ant_to_goal:
+            # Each G cell is interpreted as (ant_goal, ball_goal) at the same
+            # square, so possible_goals are 4D and every proposer / HER path
+            # consistently sees length-4 goals.
+            goals = jnp.concatenate([goals, goals], axis=-1)
         self.possible_goals = goals
         self.possible_starts = starts
         self.possible_balls = balls
@@ -258,15 +264,22 @@ class AntBallOGBench(PipelineEnv):
         self._reset_noise_scale = reset_noise_scale
         self._exclude_current_positions_from_observation = exclude_current_positions_from_observation
         self.dense_reward = dense_reward
+        self.add_ant_to_goal = add_ant_to_goal
         self.maze_layout_name = maze_layout_name
         self.maze_size_scaling = float(maze_size_scaling)
 
         self._ball_idx = self.sys.link_names.index("ball")
 
         # OGBench-compatible dimensions:
-        # state = [qpos(22), qvel(20)] = 42,  goal = target_xy(2)
+        # state = [qpos(22), qvel(20)] = 42.
+        # goal = target_xy(2) if add_ant_to_goal is False, else
+        #        target_ant_xy + target_ball_xy = 4 (both set to the same G cell).
         self.state_dim = self._ANT_Q + self._BALL_Q + self._ANT_QD + self._BALL_QD  # 42
-        self.goal_indices = jnp.array([15, 16])  # ball x,y in qpos portion
+        if self.add_ant_to_goal:
+            # Ant xy lives at state[0:2] (free root joint).
+            self.goal_indices = jnp.array([0, 1, 15, 16])
+        else:
+            self.goal_indices = jnp.array([15, 16])  # ball x,y in qpos portion
         self.goal_reach_thresh = 0.5
 
         if self._use_contact_forces:
@@ -280,16 +293,26 @@ class AntBallOGBench(PipelineEnv):
         q = self.sys.init_q + jax.random.uniform(rng1, (self.sys.q_size(),), minval=low, maxval=hi)
         qd = hi * jax.random.normal(rng2, (self.sys.qd_size(),))
 
-        # Ant start position
+        # Start position. `start` can be either length-2 (ant xy only) or
+        # length-4 (ant xy + ball xy); the latter is used by GoExploreWrapper to
+        # restore the full ant+ball pose at the start of each go phase in the
+        # 4D-goal variant.
         if start is None:
             start_xy = self._random_start(rng_ant)
+            ball_xy = self._random_ball(rng_ball)
         else:
-            start_xy = jnp.asarray(start, dtype=q.dtype)
+            start_arr = jnp.asarray(start, dtype=q.dtype)
+            start_xy = start_arr[:2]
+            if start_arr.shape[-1] == 4:
+                ball_xy = start_arr[2:4]
+            else:
+                ball_xy = self._random_ball(rng_ball)
         q = q.at[:2].set(start_xy)
 
         # Ball position (free joint qpos at indices _ANT_Q : _ANT_Q + _BALL_Q)
-        ball_xy = self._random_ball(rng_ball)
         ball_q_start = self._ANT_Q  # 15
+        # ball_xy was resolved above from the `start` argument (4D case) or
+        # randomly sampled (2D or None case).
         q = q.at[ball_q_start].set(ball_xy[0])      # ball x
         q = q.at[ball_q_start + 1].set(ball_xy[1])   # ball y
         q = q.at[ball_q_start + 2].set(0.5)          # ball z (on ground)
@@ -302,11 +325,16 @@ class AntBallOGBench(PipelineEnv):
         ball_qd_start = self._ANT_QD  # 14
         qd = qd.at[ball_qd_start:ball_qd_start + self._BALL_QD].set(0.0)
 
-        # Target position (last 2 elements of q)
+        # Target marker position. The XML's "target" body has 2 slide joints
+        # and lives at q[-2:] — it is a non-physical sphere used to store the
+        # GCRL goal location (the ball's target xy). In 4D-goal mode the goal
+        # is [ant_goal_xy, ball_goal_xy]; we bake the ball-target xy into the
+        # marker and rely on _get_obs duplicating it for the ant-target slot.
         if goal is None:
-            target_xy = self._random_goal(rng_goal)
+            goal_arr = self._random_goal(rng_goal)
         else:
-            target_xy = jnp.asarray(goal, dtype=q.dtype)
+            goal_arr = jnp.asarray(goal, dtype=q.dtype)
+        target_xy = goal_arr[-2:]
         q = q.at[-self._TARGET_Q:].set(target_xy)
         qd = qd.at[-self._TARGET_QD:].set(0.0)
 
@@ -350,7 +378,9 @@ class AntBallOGBench(PipelineEnv):
         contact_cost = 0.0
 
         obs = self._get_obs(pipeline_state)
-        # Ball xy = state[15:17], target xy = obs[-2:]
+        # Ball xy = state[15:17]. The target xy (G cell) is always the last
+        # two elements of obs, and in 4D-goal mode the preceding two are the
+        # ant-goal copy (same value).
         ball_xy = obs[15:17]
         target_xy = obs[-2:]
         dist = jnp.linalg.norm(ball_xy - target_xy)
@@ -361,8 +391,17 @@ class AntBallOGBench(PipelineEnv):
         old_dist = jnp.linalg.norm(old_ball_xy - old_target_xy)
 
         vel_to_target = (old_dist - dist) / self.dt
-        success = jnp.array(dist < self.goal_reach_thresh, dtype=float)
-        success_easy = jnp.array(dist < 2.0, dtype=float)
+        if self.add_ant_to_goal:
+            ant_xy = obs[0:2]
+            ant_dist = jnp.linalg.norm(ant_xy - target_xy)
+            success = jnp.array(
+                (dist < self.goal_reach_thresh) & (ant_dist < self.goal_reach_thresh),
+                dtype=float,
+            )
+            success_easy = jnp.array((dist < 2.0) & (ant_dist < 2.0), dtype=float)
+        else:
+            success = jnp.array(dist < self.goal_reach_thresh, dtype=float)
+            success_easy = jnp.array(dist < 2.0, dtype=float)
 
         if self.dense_reward:
             reward = 10 * vel_to_target + healthy_reward - ctrl_cost - contact_cost
@@ -400,6 +439,11 @@ class AntBallOGBench(PipelineEnv):
 
         if self._exclude_current_positions_from_observation:
             qpos = qpos[2:]
+
+        if self.add_ant_to_goal:
+            # Duplicate the G cell for ant and ball targets so that obs[-4:]
+            # aligns with goal_indices=[0,1,15,16] (ant_xy, ball_xy).
+            target_pos = jnp.concatenate([target_pos, target_pos])
 
         return jnp.concatenate([qpos, qvel, target_pos])
 

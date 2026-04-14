@@ -452,7 +452,9 @@ def visualize_go_explore_phases(
     traj_id_flat  = np.array(jnp.reshape(transitions.extras["state_extras"]["traj_id"], (-1,)))
     trunc_flat    = np.array(jnp.reshape(transitions.extras["state_extras"]["truncation"], (-1,)))
 
-    goal_idx_list = list(goal_indices)
+    # Slice to the first two goal_indices so this 2D phase viz works with
+    # envs that expose a higher-dimensional goal (e.g. ant_ball_4d_ogbench).
+    goal_idx_list = list(goal_indices)[:2]
     positions     = obs_flat[:, :state_size][:, goal_idx_list]        # (N, 2)
     goals         = obs_flat[:, state_size:][:, :len(goal_idx_list)]  # (N, 2)
 
@@ -621,61 +623,62 @@ def handle_goal_proposer_visualization(
         if _last_viz_env_steps >= 0 and (env_steps - _last_viz_env_steps) < 1_000_000:
             return
         _last_viz_env_steps = env_steps
-    
-    if goal_proposer_name == "q_epistemic":
-        # Extract data for q_epistemic visualization
-        candidate_goals = log_data["candidate_goals"]
-        first_obs_position = log_data["first_obs_position"]
-        q_means = log_data["q_means"]
-        q_stds = log_data["q_stds"]
-        selected_goal = log_data.get("selected_goal")
 
+    # Slice any position-like field to its first two dimensions so these
+    # visualizations work in envs with >2-dim goal spaces (e.g.
+    # ant_ball_4d_ogbench). By convention, the first two entries of a goal
+    # are the xy coordinates we want to plot.
+    def _xy(arr):
+        a = np.asarray(arr)
+        return a[..., :2] if a.ndim >= 1 and a.shape[-1] > 2 else a
+
+    if goal_proposer_name == "q_epistemic":
         visualize_q_epistemic_candidates(
-            candidate_goals,
-            first_obs_position,
-            q_means,
-            q_stds,
+            _xy(log_data["candidate_goals"]),
+            _xy(log_data["first_obs_position"]),
+            log_data["q_means"],
+            log_data["q_stds"],
             x_bounds,
             y_bounds,
-            selected_goal,
+            _xy(log_data.get("selected_goal")),
         )
     elif goal_proposer_name == "ucgr":
         visualize_ucgr_candidates(
-            candidate_goals=log_data["candidate_goals"],
-            first_obs_position=log_data["first_obs_position"],
+            candidate_goals=_xy(log_data["candidate_goals"]),
+            first_obs_position=_xy(log_data["first_obs_position"]),
             minlse_scores=log_data["minlse_scores"],
-            selected_goal=log_data["selected_goal"],
+            selected_goal=_xy(log_data["selected_goal"]),
             x_bounds=x_bounds,
             y_bounds=y_bounds,
         )
     elif goal_proposer_name == "max_critic_to_env":
         visualize_max_critic_to_env_candidates(
-            candidate_goals=log_data["candidate_goals"],
-            first_obs_position=log_data["first_obs_position"],
+            candidate_goals=_xy(log_data["candidate_goals"]),
+            first_obs_position=_xy(log_data["first_obs_position"]),
             q_means=log_data["q_means"],
-            env_goal=log_data["selected_goal"],
-            selected_state_goal=log_data["selected_state_goal"],
+            env_goal=_xy(log_data["selected_goal"]),
+            selected_state_goal=_xy(log_data["selected_state_goal"]),
             x_bounds=x_bounds,
             y_bounds=y_bounds,
         )
     elif goal_proposer_name == "mega":
         visualize_mega_candidates(
-            candidate_goals=log_data["candidate_goals"],
-            first_obs_position=log_data["first_obs_position"],
+            candidate_goals=_xy(log_data["candidate_goals"]),
+            first_obs_position=_xy(log_data["first_obs_position"]),
             densities=log_data["densities"],
-            selected_goal=log_data["selected_goal"],
+            selected_goal=_xy(log_data["selected_goal"]),
             x_bounds=x_bounds,
             y_bounds=y_bounds,
             title_prefix="MEGA",
         )
     elif goal_proposer_name == "omega":
         visualize_omega_candidates(
-            candidate_goals=log_data["candidate_goals"],
-            first_obs_position=log_data["first_obs_position"],
+            candidate_goals=_xy(log_data["candidate_goals"]),
+            first_obs_position=_xy(log_data["first_obs_position"]),
             densities=log_data["densities"],
-            selected_goal=log_data["selected_goal"],
-            mega_goal=log_data["mega_goal"],
-            env_goal=log_data["env_goal"],
+            selected_goal=_xy(log_data["selected_goal"]),
+            mega_goal=_xy(log_data["mega_goal"]),
+            env_goal=_xy(log_data["env_goal"]),
             alpha=log_data["alpha"],
             kl_div=log_data["kl_div"],
             x_bounds=x_bounds,
@@ -683,24 +686,24 @@ def handle_goal_proposer_visualization(
         )
     elif goal_proposer_name == "empowerment":
         visualize_empowerment_candidates(
-            candidate_goals=log_data["candidate_goals"],
-            first_obs_position=log_data["first_obs_position"],
+            candidate_goals=_xy(log_data["candidate_goals"]),
+            first_obs_position=_xy(log_data["first_obs_position"]),
             emp_scores=log_data["emp_scores"],
             log_densities=log_data["log_densities"],
             selection_logits=log_data["selection_logits"],
-            selected_goal=log_data["selected_goal"],
+            selected_goal=_xy(log_data["selected_goal"]),
             x_bounds=x_bounds,
             y_bounds=y_bounds,
         )
     elif goal_proposer_name == "empowerment_density_ratio":
         visualize_empowerment_density_ratio_candidates(
-            candidate_goals=log_data["candidate_goals"],
-            first_obs_position=log_data["first_obs_position"],
+            candidate_goals=_xy(log_data["candidate_goals"]),
+            first_obs_position=_xy(log_data["first_obs_position"]),
             emp_scores=log_data["emp_scores"],
             densities=log_data["densities"],
             log_densities=log_data["log_densities"],
             selection_logits=log_data["selection_logits"],
-            selected_goal=log_data["selected_goal"],
+            selected_goal=_xy(log_data["selected_goal"]),
             x_bounds=x_bounds,
             y_bounds=y_bounds,
         )

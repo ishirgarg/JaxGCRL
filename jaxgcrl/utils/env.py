@@ -60,6 +60,10 @@ legal_envs = (
     "ant_ball_ogbench_medium",
     "ant_ball_ogbench_small_square",
     "ant_ball_ogbench_easy_square",
+    "ant_ball_4d_ogbench_arena",
+    "ant_ball_4d_ogbench_medium",
+    "ant_ball_4d_ogbench_small_square",
+    "ant_ball_4d_ogbench_easy_square",
     "ant_maze_ogbench_arena",
     "ant_maze_ogbench_medium_navigate",
     "ant_u_maze",
@@ -99,6 +103,15 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         env = Ant(backend=backend or "spring", randomize_start=True)
     elif env_name == "ant_ball":
         env = AntBall(backend=backend or "spring")
+    elif env_name.startswith("ant_ball_4d_ogbench_"):
+        # 4D-goal variant: goal = [ant_x, ant_y, ball_x, ball_y] where both
+        # ant and ball must reach the same G cell for default goals.
+        layout = env_name[len("ant_ball_4d_ogbench_"):]
+        env = AntBallOGBench(
+            backend=backend or "spring",
+            maze_layout_name=layout,
+            add_ant_to_goal=True,
+        )
     elif env_name.startswith("ant_ball_ogbench_"):
         # ant_ball_ogbench_arena, ant_ball_ogbench_medium
         layout = env_name[len("ant_ball_ogbench_"):]

@@ -26,6 +26,10 @@ JAXGCRL_TO_OGBENCH = {
     "ant_ball_ogbench_medium": "antsoccer-arena-navigate-v0",
     "ant_ball_ogbench_small_square": "antsoccer-arena-navigate-v0",
     "ant_ball_ogbench_easy_square": "antsoccer-arena-navigate-v0",
+    "ant_ball_4d_ogbench_small_square": "antsoccer-arena-navigate-v0",
+    "ant_ball_4d_ogbench_easy_square": "antsoccer-arena-navigate-v0",
+    "ant_ball_4d_ogbench_medium": "antsoccer-arena-navigate-v0",
+    "ant_ball_4d_ogbench_arena": "antsoccer-arena-navigate-v0",
 }
 
 
@@ -100,10 +104,12 @@ class OfflineTrajectoryBuffer:
         num_slots: int,
         obs_size: int,
         action_size: int,
+        state_size: int,
         agent_type: str = "crl",
         include_phase: bool = False,
     ):
-        state_size = obs_size - 2  # goal is 2-dim (xy)
+        # Goal dim is whatever remains after the env's true state_size. For the
+        # default 2D-goal envs this is 2; for ant_ball_4d_ogbench it is 4.
         goal_dim = obs_size - state_size
 
         # Assign a unique traj_id per episode (negative to avoid online collision)
@@ -322,6 +328,7 @@ def load_and_prepare_offline_buffer(
         num_slots=num_slots,
         obs_size=obs_size,
         action_size=action_size,
+        state_size=state_size,
         agent_type=agent_type,
         include_phase=include_phase,
     )
