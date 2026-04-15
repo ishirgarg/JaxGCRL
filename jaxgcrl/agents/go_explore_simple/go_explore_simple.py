@@ -156,6 +156,7 @@ class GoExploreSimple:
     tau: float = 0.005
     n_critics: int = 2
     use_her: bool = True
+    use_sac_critic_mean: bool = False  # SAC: average critic ensemble instead of min
 
     goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega", "empowerment", "empowerment_density_ratio"] = "random_env_goals"
     num_candidates: int = 512

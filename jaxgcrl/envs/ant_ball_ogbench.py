@@ -302,11 +302,15 @@ class AntBallOGBench(PipelineEnv):
             ball_xy = self._random_ball(rng_ball)
         else:
             start_arr = jnp.asarray(start, dtype=q.dtype)
-            start_xy = start_arr[:2]
             if start_arr.shape[-1] == 4:
+                start_xy = start_arr[:2]
                 ball_xy = start_arr[2:4]
             else:
-                ball_xy = self._random_ball(rng_ball)
+                # 2D-goal variant: goal_indices=[15,16] are ball xy, so the
+                # GoExploreWrapper-stored first_start is the ball's initial
+                # position. Treat it as such and randomize the ant start.
+                start_xy = self._random_start(rng_ant)
+                ball_xy = start_arr[:2]
         q = q.at[:2].set(start_xy)
 
         # Ball position (free joint qpos at indices _ANT_Q : _ANT_Q + _BALL_Q)

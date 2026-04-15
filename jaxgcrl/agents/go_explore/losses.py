@@ -259,7 +259,10 @@ def update_actor_sac(config: Dict[str, Any], networks: Dict[str, Any],
         # Use critic API to get Q-values
         critic = networks["critic"]
         q_values = critic.apply(q_params, obs, actions)
-        q_value = jnp.min(q_values, axis=-1, keepdims=True)  # Min over critics
+        if config.get("use_sac_critic_mean", False):
+            q_value = jnp.mean(q_values, axis=-1, keepdims=True)
+        else:
+            q_value = jnp.min(q_values, axis=-1, keepdims=True)  # Min over critics
 
         sample_weights = config.get("sample_weights", None)
         if sample_weights is None:
@@ -330,9 +333,12 @@ def update_critic_sac(config: Dict[str, Any], networks: Dict[str, Any],
     next_log_prob -= jnp.log((1 - jnp.square(next_actions)) + 1e-6)
     next_log_prob = next_log_prob.sum(-1, keepdims=True)
 
-    # Use critic API for target Q-values (min over all critics)
+    # Use critic API for target Q-values (min over all critics, or mean if flag set)
     target_q_values = critic.apply(target_q_params, next_obs, next_actions)
-    target_q_value = jnp.min(target_q_values, axis=-1, keepdims=True)  # Min over critics: (batch_size, 1)
+    if config.get("use_sac_critic_mean", False):
+        target_q_value = jnp.mean(target_q_values, axis=-1, keepdims=True)
+    else:
+        target_q_value = jnp.min(target_q_values, axis=-1, keepdims=True)  # (batch_size, 1)
     target = rewards[:, None] + config["discounting"] * discounts[:, None] * (
         target_q_value - alpha * next_log_prob
     )  # target shape: (batch_size, 1)
