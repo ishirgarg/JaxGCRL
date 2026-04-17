@@ -108,14 +108,14 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         # ant and ball must reach the same G cell for default goals.
         layout = env_name[len("ant_ball_4d_ogbench_"):]
         env = AntBallOGBench(
-            backend=backend or "spring",
+            backend=backend or "mjx",
             maze_layout_name=layout,
             add_ant_to_goal=True,
         )
     elif env_name.startswith("ant_ball_ogbench_"):
         # ant_ball_ogbench_arena, ant_ball_ogbench_medium
         layout = env_name[len("ant_ball_ogbench_"):]
-        env = AntBallOGBench(backend=backend or "spring", maze_layout_name=layout)
+        env = AntBallOGBench(backend=backend or "mjx", maze_layout_name=layout)
     elif env_name == "ant_push":
         # This is stable only in mjx backend
         assert backend == "mjx" or backend is None
@@ -124,8 +124,14 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         if "ant_ball" in env_name:
             env = AntBallMaze(backend=backend or "spring", maze_layout_name=env_name[9:])
         elif "ant" in env_name:
-            # Possible env_name = {'ant_u_maze', 'ant_big_maze', 'ant_hardest_maze'}
-            env = AntMaze(backend=backend or "spring", maze_layout_name=env_name[4:])
+            # Any "ogbench"-tagged layout loads the ogbench-aligned XML and
+            # defaults to mjx so physics match the OGBench offline dataset
+            # (timestep=0.02, RK4, gear=30). Legacy layouts stay on spring.
+            layout = env_name[4:]
+            if "ogbench" in layout:
+                env = AntMaze(backend=backend or "mjx", maze_layout_name=layout)
+            else:
+                env = AntMaze(backend=backend or "spring", maze_layout_name=layout)
         elif "humanoid" in env_name:
             # Possible env_name = {'humanoid_u_maze', 'humanoid_big_maze', 'humanoid_hardest_maze'}
             env = HumanoidMaze(backend=backend or "spring", maze_layout_name=env_name[9:])

@@ -340,7 +340,7 @@ class EmpowermentSAC:
         # We strip the trailing 2 (target) so the policy never sees the goal.
         action_size = unwrapped_env.action_size
         full_obs_size = int(unwrapped_env.observation_size)
-        goal_dim = 2
+        goal_dim = len(unwrapped_env.goal_indices)
         obs_size_net = full_obs_size - goal_dim   # policy / network obs dim (42)
         ball_indices = (_ball_x_idx, _ball_y_idx)  # (15, 16) — ball in OGBench obs
         goal_indices = ball_indices  # used by process_transitions API

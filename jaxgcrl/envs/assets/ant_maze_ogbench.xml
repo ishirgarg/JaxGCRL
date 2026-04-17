@@ -1,17 +1,17 @@
-<mujoco model="ant">
-    <!-- OGBench-aligned Ant + Ball for antsoccer datasets.
+<mujoco model="ant_maze_ogbench">
+    <!-- OGBench-aligned Ant for antmaze datasets.
 
-         The ant body, physics (timestep, integrator, gear, armature, damping),
-         textures, and materials mirror ogbench/locomaze/assets/ant.xml exactly.
-         The ball body mirrors what OGBench maze.py BallEnv.update_tree()
-         dynamically adds (freejoint, size=.25, condim=6, priority=1).
+         Physics (timestep, integrator, gear, armature, damping) mirror
+         ogbench/locomaze/assets/ant.xml exactly so that (s, a, s') tuples
+         from OGBench antmaze-*-navigate-v0 are consistent with this env
+         when simulated under brax mjx.
 
          Extras compared to ogbench ant.xml:
-           - Ball body with freejoint (OGBench adds this dynamically).
            - A non-physical "target" body with 2 slide joints at the end of
-             the kinematic tree, used only as a goal marker for GCRL.
-         qpos layout: ant_root(7) + 8_hinges(8) + ball_root(7) + target_slides(2) = 24
-         qvel layout: ant_root(6) + 8_hinges(8) + ball_root(6) + target_slides(2) = 22
+             the kinematic tree, used only as a goal marker for GCRL
+             (matches the structure of jaxgcrl/envs/assets/ant_maze.xml).
+         qpos layout: ant_root(7) + 8 hinges(8) + target_slides(2) = 17
+         qvel layout: ant_root(6) + 8 hinges(8) + target_slides(2) = 16
     -->
     <compiler inertiafromgeom="true" angle="degree" coordinate="local"/>
 
@@ -19,8 +19,8 @@
 
     <custom>
         <!-- brax custom params -->
-        <!-- qpos layout: ant_root(7) + 8_hinges(8) + ball_root(7) + target_slides(2) = 24 -->
-        <numeric data="0.0 0.0 0.55 1.0 0.0 0.0 0.0 0.0 1.0 0.0 -1.0 0.0 -1.0 0.0 1.0 0.0 0.0 0.5 1.0 0.0 0.0 0.0 0.0 0.0" name="init_qpos"/>
+        <!-- qpos layout: ant_root(7) + 8_hinges(8) + target_slides(2) = 17 -->
+        <numeric data="0.0 0.0 0.55 1.0 0.0 0.0 0.0 0.0 1.0 0.0 -1.0 0.0 -1.0 0.0 1.0 0.0 0.0" name="init_qpos"/>
         <numeric data="1000" name="constraint_limit_stiffness"/>
         <numeric data="4000" name="constraint_stiffness"/>
         <numeric data="10" name="constraint_ang_damping"/>
@@ -103,21 +103,12 @@
             </body>
         </body>
 
-        <!-- Ball with freejoint matching OGBench BallEnv.update_tree():
-             freejoint, size=.25, material=ball, priority=1, conaffinity=1, condim=6.
-             qpos: 7 (x,y,z,qw,qx,qy,qz), qvel: 6 (linvel(3), angvel(3)). -->
-        <body name="ball" pos="0 0 0.5">
-            <freejoint name="ball_root"/>
-            <geom name="ball" size=".25" material="ball" priority="1" conaffinity="1" condim="6"/>
-            <light name="ball_light" pos="0 0 4" mode="trackcom"/>
-        </body>
-
         <!-- Non-physical target marker for GCRL goal specification.
              Two slide joints at the end of q/qd, stripped by _get_obs via q[:-2]. -->
         <body name="target" pos="0 0 0.01">
             <joint armature="0" axis="1 0 0" damping="0" limited="true" name="target_x" pos="0 0 0" range="-100 100" stiffness="0" type="slide"/>
             <joint armature="0" axis="0 1 0" damping="0" limited="true" name="target_y" pos="0 0 0" range="-100 100" stiffness="0" type="slide"/>
-            <geom conaffinity="0" contype="0" name="target" pos="0 0 0" size=".9" type="sphere" mass="1.0" material="target"/>
+            <geom conaffinity="0" contype="0" name="target" pos="0 0 0" size=".5" type="sphere" mass="1.0" material="target"/>
         </body>
     </worldbody>
 

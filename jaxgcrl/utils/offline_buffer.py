@@ -50,7 +50,7 @@ def load_ogbench_dataset(dataset_name: str) -> dict:
     import os
 
     # Add the ogbench repo (sibling to JaxGCRL) to sys.path so we can import it.
-    ogbench_root = os.path.expanduser("~/ogbench")
+    ogbench_root = os.path.expanduser("~/ishir/ogbench")
     if ogbench_root not in sys.path:
         sys.path.insert(0, ogbench_root)
 

@@ -136,6 +136,21 @@ def find_goals(structure, size_scaling):
     return jnp.array(goals)
 
 
+# Maze layouts whose walls and physical constants are aligned to OGBench so
+# that RLPD with antmaze-*-navigate-v0 offline datasets sees consistent
+# (s, a, s') transitions. These layouts use `ant_maze_ogbench.xml`, which
+# mirrors ogbench/locomaze/assets/ant.xml (timestep=0.02, integrator=RK4,
+# gear=30) instead of the legacy `ant_maze.xml` (timestep=0.01, gear=150).
+OGBENCH_MAZE_LAYOUTS = {
+    "maze_ogbench_arena",
+    "maze_ogbench_medium_navigate",
+}
+
+
+def is_ogbench_maze(maze_layout_name: str) -> bool:
+    return maze_layout_name in OGBENCH_MAZE_LAYOUTS
+
+
 # Create a xml with maze and a list of possible goal positions
 def make_maze(maze_layout_name, maze_size_scaling):
     if maze_layout_name == "u_maze":
@@ -159,7 +174,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
     else:
         raise ValueError(f"Unknown maze layout: {maze_layout_name}")
 
-    xml_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", "ant_maze.xml")
+    xml_name = "ant_maze_ogbench.xml" if is_ogbench_maze(maze_layout_name) else "ant_maze.xml"
+    xml_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", xml_name)
     xy_offset = float(maze_size_scaling)  # one maze cell width
 
     possible_starts = find_starts(maze_layout, maze_size_scaling)
@@ -260,12 +276,25 @@ class AntMaze(PipelineEnv):
         sys = mjcf.loads(xml_string)
         self.possible_starts = possible_starts
         self.possible_goals = possible_goals
+        self._is_ogbench_layout = is_ogbench_maze(maze_layout_name)
 
-        n_frames = 5
-
-        if backend in ["spring", "positional"]:
-            sys = sys.tree_replace({"opt.timestep": 0.005})
-            n_frames = 10
+        if self._is_ogbench_layout:
+            # OGBench antmaze control: mujoco timestep=0.02 with frame_skip=5
+            # -> dt=0.1 s (10 Hz). The ogbench XML already carries timestep=0.02
+            # + integrator=RK4, so mjx inherits the right physics directly.
+            n_frames = 5
+            if backend in ["spring", "positional"]:
+                # Brax approximate backends: sub-step more aggressively so the
+                # control dt still lands at 0.1 s. These will never exactly
+                # match mujoco dynamics — prefer mjx when training against
+                # OGBench offline data.
+                sys = sys.tree_replace({"opt.timestep": 0.005})
+                n_frames = 20
+        else:
+            n_frames = 5
+            if backend in ["spring", "positional"]:
+                sys = sys.tree_replace({"opt.timestep": 0.005})
+                n_frames = 10
 
         if backend == "mjx":
             sys = sys.tree_replace(

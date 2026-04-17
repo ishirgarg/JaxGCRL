@@ -11,7 +11,7 @@ Phase management is handled by ``GoExploreWrapper`` (see ``jaxgcrl/envs/wrappers
 import logging
 import random
 import time
-from typing import Callable, Literal, Optional, Tuple, Union
+from typing import Callable, List, Literal, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -111,6 +111,84 @@ def _log_reward_heatmap(
     _plt.close(fig)
 
 
+def _log_trajectory_reward(
+    reward_viz,
+    current_step: int,
+):
+    """Plot the actual reward SAC saw in the final training_step of the epoch.
+
+    ``reward_viz[2]`` is ``transitions.reward`` captured right after
+    ``transitions._replace(reward=env_reward + total_bonus)`` — i.e. exactly
+    the scalar fed into the SAC critic. Shape is ``(num_batches, batch_size)``;
+    we flatten to a 1-D sequence of samples."""
+    if _plt is None or _wandb is None:
+        return
+
+    reward = np.asarray(reward_viz[2]).reshape(-1)
+
+    fig, ax = _plt.subplots(figsize=(6, 3))
+    ax.plot(np.arange(reward.shape[0]), reward, lw=0.5)
+    ax.set_xlabel("training sample index")
+    ax.set_ylabel("SAC training reward")
+    ax.set_title(f"Reward fed to SAC (env + bonus)  step={current_step}")
+    fig.tight_layout()
+    _wandb.log({"viz/trajectory_reward": _wandb.Image(fig)}, step=current_step)
+    _plt.close(fig)
+
+
+def _log_exploration_bonus_goal_heatmap(
+    reward_viz,
+    goal_indices,
+    current_step: int,
+):
+    """Scatter the total exploration bonus (no env reward) over the first-two
+    and last-two ``goal_indices`` columns of the sampled states. ``reward_viz``
+    must carry ``(..., goal_feat)`` at index 4, where ``goal_feat`` is
+    ``transitions.observation[..., goal_indices]``; the scatter is taken
+    from the final training step in an epoch."""
+    if _plt is None or _wandb is None:
+        return
+    if len(reward_viz) < 5 or len(goal_indices) < 2:
+        return
+
+    bonus = np.asarray(reward_viz[3]).reshape(-1)
+    goal_feat = np.asarray(reward_viz[4]).reshape(-1, len(goal_indices))
+
+    first_x = goal_feat[:, 0]
+    first_y = goal_feat[:, 1]
+    last_x = goal_feat[:, -2]
+    last_y = goal_feat[:, -1]
+
+    fig, axes = _plt.subplots(1, 2, figsize=(10, 5))
+
+    def _draw(ax, xs, ys, title, xlabel, ylabel):
+        sc = ax.scatter(xs, ys, c=bonus, cmap="viridis", s=6, linewidths=0)
+        ax.set_aspect("equal")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label="exploration bonus")
+
+    _draw(
+        axes[0], first_x, first_y,
+        "bonus vs first two goal idx",
+        f"obs[{goal_indices[0]}]", f"obs[{goal_indices[1]}]",
+    )
+    _draw(
+        axes[1], last_x, last_y,
+        "bonus vs last two goal idx",
+        f"obs[{goal_indices[-2]}]", f"obs[{goal_indices[-1]}]",
+    )
+
+    fig.suptitle(f"step={current_step}")
+    fig.tight_layout()
+    _wandb.log(
+        {"viz/exploration_bonus_goal_heatmap": _wandb.Image(fig)},
+        step=current_step,
+    )
+    _plt.close(fig)
+
+
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
 State = Union[envs.State, envs_v1.State]
@@ -167,11 +245,22 @@ class GoExploreSimple:
     empowerment_score_chunk_size: int = 32
 
     # ── RLPD (offline data mixing) ─────────────────────────────────────────
-    use_rlpd: bool = False  # Mix 50% offline OGBench data into each training batch
+    use_rlpd: bool = True  # Mix 50% offline OGBench data into each training batch
 
     # ── Exploration bonus (added to reward after HER) ──────────────────────
-    exploration_bonus_type: Optional[str] = None  # "empowerment" or None
-    exploration_bonus_weight: float = 0.1
+    exploration_bonus_type: Optional[Tuple[str, ...]] = None
+    exploration_bonus_weight: Tuple[float, ...] = (0.1,)
+
+    # Empowerment global normalization: emitted bonus is (raw_emp - mean) / scale.
+    empowerment_bonus_mean: float = 1.0
+    empowerment_bonus_scale: float = 1.0
+
+    # RND predictor/target network shape.
+    rnd_feature_dim: int = 64
+    rnd_hidden_dim: int = 256
+    rnd_num_hidden: int = 2
+    rnd_learning_rate: float = 1e-4
+    rnd_obs_clip: float = 5.0
 
     # ── Go Explore specific parameters ──────────────────────────────────────
     num_gcp_steps: int = 250      # max steps in go phase before forcing explore
@@ -417,21 +506,33 @@ class GoExploreSimple:
                 include_phase=True,
             )
 
-        # ── Exploration bonus ─────────────────────────────────────────────────
-        exploration_bonus_fn = None
-        if self.exploration_bonus_type is not None:
-            from jaxgcrl.agents.go_explore.exploration import create_exploration_bonus
-            key, bonus_init_key = jax.random.split(key)
-            exploration_bonus_fn = create_exploration_bonus(
-                self.exploration_bonus_type,
-                env=unwrapped_env,
-                state_size=state_size,
-                key=bonus_init_key,
-                empowerment_run_dir=self.empowerment_run_dir,
-                empowerment_epoch=self.empowerment_epoch,
-                empowerment_num_splus_samples=self.empowerment_num_splus_samples,
-                empowerment_score_chunk_size=self.empowerment_score_chunk_size,
-            )
+        # ── Exploration bonus(es) ─────────────────────────────────────────────
+        from jaxgcrl.agents.go_explore.exploration import create_exploration_bonuses
+        key, bonus_init_key = jax.random.split(key)
+        exploration_bonuses = create_exploration_bonuses(
+            self.exploration_bonus_type,
+            self.exploration_bonus_weight,
+            env=unwrapped_env,
+            state_size=state_size,
+            key=bonus_init_key,
+            empowerment_run_dir=self.empowerment_run_dir,
+            empowerment_epoch=self.empowerment_epoch,
+            empowerment_num_splus_samples=self.empowerment_num_splus_samples,
+            empowerment_score_chunk_size=self.empowerment_score_chunk_size,
+            empowerment_mean=self.empowerment_bonus_mean,
+            empowerment_scale=self.empowerment_bonus_scale,
+            rnd_feature_dim=self.rnd_feature_dim,
+            rnd_hidden_dim=self.rnd_hidden_dim,
+            rnd_num_hidden=self.rnd_num_hidden,
+            rnd_learning_rate=self.rnd_learning_rate,
+            rnd_obs_clip=self.rnd_obs_clip,
+        )
+        exploration_bonus_state = exploration_bonuses.initial_state
+
+        # Goal-index columns captured for the exploration-bonus heatmap viz.
+        goal_indices_arr = jnp.asarray(
+            tuple(unwrapped_env.goal_indices), dtype=jnp.int32
+        )
 
         # ── actor_step ────────────────────────────────────────────────────────
         deterministic_go = self.deterministic_go_phase
@@ -642,7 +743,10 @@ class GoExploreSimple:
 
         # ── training_step ─────────────────────────────────────────────────────
         @jax.jit
-        def training_step(training_state, env_state, buffer_state, key, goal_proposer_state):
+        def training_step(
+            training_state, env_state, buffer_state, key,
+            goal_proposer_state, exploration_bonus_state,
+        ):
             exp_key, process_key, train_key = jax.random.split(key, 3)
 
             env_state, buffer_state, updated_ec, updated_gps = get_experience(
@@ -677,39 +781,50 @@ class GoExploreSimple:
             if self.use_rlpd:
                 # Slice to original num_batches so gradient step count stays the same.
                 # The random permutation in process_transitions already mixed
-                # online+offline within each batch (~50/50).
+                # online+offline within each batch (~50/50), so the surviving
+                # slice still covers both offline and online transitions.
                 num_batches = config.num_envs * (config.episode_length - 1) // self.batch_size
                 transitions = jax.tree_util.tree_map(
                     lambda x: x[:num_batches], transitions
                 )
 
-            # Add exploration bonus to reward (after HER, so it always persists)
-            if exploration_bonus_fn is not None:
-                bonus_key, train_key = jax.random.split(train_key)
-                bonus = exploration_bonus_fn(transitions, bonus_key)
-                scaled_bonus = self.exploration_bonus_weight * bonus
-                transitions = transitions._replace(
-                    reward=transitions.reward + scaled_bonus
-                )
-            else:
-                scaled_bonus = jnp.zeros_like(transitions.reward)
+            # Exploration bonus is summed across all configured bonuses and
+            # added to the post-HER, post-RLPD reward so it shapes both the
+            # online and (mixed-in) offline transitions that flow into the
+            # GCP update below.
+            bonus_key, train_key = jax.random.split(train_key)
+            total_bonus, exploration_bonus_state, bonus_metrics = exploration_bonuses.compute(
+                exploration_bonus_state, transitions, bonus_key
+            )
+            transitions = transitions._replace(
+                reward=transitions.reward + total_bonus
+            )
 
             reward_viz = (
                 transitions.observation[..., 0],
                 transitions.observation[..., 1],
                 transitions.reward,
-                scaled_bonus,
+                total_bonus,
+                transitions.observation[..., goal_indices_arr],
             )
 
             (training_state, _), metrics = jax.lax.scan(
                 update_networks, (training_state, train_key), transitions
             )
+            metrics.update(bonus_metrics)
+            metrics["reward_mean"] = jnp.mean(transitions.reward)
 
-            return (training_state, env_state, buffer_state, updated_gps), (metrics, reward_viz)
+            return (
+                (training_state, env_state, buffer_state, updated_gps, exploration_bonus_state),
+                (metrics, reward_viz),
+            )
 
         # ── training_epoch ────────────────────────────────────────────────────
         @jax.jit
-        def training_epoch(training_state, env_state, buffer_state, key, goal_proposer_state):
+        def training_epoch(
+            training_state, env_state, buffer_state, key,
+            goal_proposer_state, exploration_bonus_state,
+        ):
             # Snapshot cumulative counters *before* the epoch so we can compute
             # epoch-level deltas (rather than a lifetime average).
             pre_completions   = jnp.sum(env_state.info['go_completions_total'])
@@ -718,14 +833,21 @@ class GoExploreSimple:
 
             @jax.jit
             def f(carry, _):
-                ts, es, bs, k, gps = carry
+                ts, es, bs, k, gps, ebs = carry
                 k, train_key = jax.random.split(k)
-                (ts, es, bs, gps), (metrics, reward_viz) = training_step(ts, es, bs, train_key, gps)
-                return (ts, es, bs, k, gps), (metrics, reward_viz)
+                (ts, es, bs, gps, ebs), (metrics, reward_viz) = training_step(
+                    ts, es, bs, train_key, gps, ebs
+                )
+                return (ts, es, bs, k, gps, ebs), (metrics, reward_viz)
 
-            (training_state, env_state, buffer_state, key, goal_proposer_state), (metrics, reward_viz) = jax.lax.scan(
+            (
+                (training_state, env_state, buffer_state, key,
+                 goal_proposer_state, exploration_bonus_state),
+                (metrics, reward_viz),
+            ) = jax.lax.scan(
                 f,
-                (training_state, env_state, buffer_state, key, goal_proposer_state),
+                (training_state, env_state, buffer_state, key,
+                 goal_proposer_state, exploration_bonus_state),
                 (),
                 length=num_training_steps_per_epoch,
             )
@@ -750,13 +872,27 @@ class GoExploreSimple:
             metrics["avg_go_phase_steps"]    = jnp.broadcast_to(avg_go_steps, scan_shape)
             metrics["buffer_current_size"]   = jnp.broadcast_to(replay_buffer.size(buffer_state), scan_shape)
 
-            return training_state, env_state, buffer_state, goal_proposer_state, metrics, last_reward_viz
+            return (
+                training_state, env_state, buffer_state,
+                goal_proposer_state, exploration_bonus_state,
+                metrics, last_reward_viz,
+            )
 
         # ── prefill ───────────────────────────────────────────────────────────
         key, prefill_key = jax.random.split(key)
         training_state, env_state, buffer_state, _, goal_proposer_state = prefill_replay_buffer(
             training_state, env_state, buffer_state, prefill_key, goal_proposer_state
         )
+
+        # Seed per-bonus observation normalization (e.g. RND) from post-prefill
+        # rollouts, per the RND paper's random-agent warmup.
+        if not exploration_bonuses.is_empty:
+            key, seed_key = jax.random.split(key)
+            buffer_state, seed_transitions = replay_buffer.sample(buffer_state)
+            seed_states = seed_transitions.observation[..., :state_size]
+            exploration_bonus_state = exploration_bonuses.init_from_states(
+                exploration_bonus_state, seed_states
+            )
 
         # ── Evaluator ─────────────────────────────────────────────────────────
         def eval_actor_step(training_state, env, env_state, extra_fields=()):
@@ -794,8 +930,13 @@ class GoExploreSimple:
             t = time.time()
             key, epoch_key = jax.random.split(key)
 
-            training_state, env_state, buffer_state, goal_proposer_state, metrics, last_reward_viz = training_epoch(
-                training_state, env_state, buffer_state, epoch_key, goal_proposer_state
+            (
+                training_state, env_state, buffer_state,
+                goal_proposer_state, exploration_bonus_state,
+                metrics, last_reward_viz,
+            ) = training_epoch(
+                training_state, env_state, buffer_state, epoch_key,
+                goal_proposer_state, exploration_bonus_state,
             )
 
             metrics = jax.tree_util.tree_map(jnp.mean, metrics)
@@ -837,6 +978,10 @@ class GoExploreSimple:
                     goal_indices=tuple(train_env.goal_indices),
                     rng_key=viz_key,
                 )
+                _log_trajectory_reward(
+                    reward_viz=last_reward_viz,
+                    current_step=current_step,
+                )
                 _, phase_transitions = replay_buffer.sample(buffer_state)
                 visualize_go_explore_phases(
                     phase_transitions,
@@ -845,11 +990,16 @@ class GoExploreSimple:
                     state_size=state_size,
                     goal_indices=tuple(train_env.goal_indices),
                 )
-                if exploration_bonus_fn is not None:
+                if not exploration_bonuses.is_empty:
                     _log_reward_heatmap(
                         reward_viz=last_reward_viz,
                         x_bounds=unwrapped_env.x_bounds,
                         y_bounds=unwrapped_env.y_bounds,
+                        current_step=current_step,
+                    )
+                    _log_exploration_bonus_goal_heatmap(
+                        reward_viz=last_reward_viz,
+                        goal_indices=tuple(unwrapped_env.goal_indices),
                         current_step=current_step,
                     )
                 last_visualization_step = current_step
