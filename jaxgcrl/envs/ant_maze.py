@@ -40,7 +40,8 @@ U_MAZE_EVAL = [
     [1, 1, 1, 1, 1],
 ]
 
-# Transposed from OGBench arena so physical layout matches OGBench
+# OGBench arena, laid out in OGBench's native row/col orientation.
+# Symmetric across the diagonal, so the grid is identical to OGBench's.
 OGBENCH_ARENA = [
     [1, 1, 1, 1, 1, 1, 1, 1],
     [1, R, G, G, G, G, G, 1],
@@ -52,16 +53,18 @@ OGBENCH_ARENA = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
-# Transposed from OGBench medium maze so physical layout matches OGBench
-# (OGBench uses pos_x=j, pos_y=i; JaxGCRL uses pos_x=i, pos_y=j)
+# OGBench medium maze in OGBench's native row/col orientation.
+# Wall cells exactly mirror ogbench/locomaze/maze.py's medium maze_map;
+# R cells at (1,1) and (2,1) cover OGBench's init_ij=(1,1) and a second
+# start near the same corner.
 OGBENCH_MEDIUM_NAVIGATE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, R, 1, G, G, G, 1],
-    [1, G, G, G, G, 1, G, 1],
-    [1, 1, 1, G, 1, G, G, 1],
-    [1, 1, G, G, G, G, 1, 1],
-    [1, G, G, 1, G, 1, G, 1],
+    [1, R, G, 1, 1, G, G, 1],
+    [1, R, G, 1, G, G, G, 1],
+    [1, 1, G, G, G, 1, 1, 1],
     [1, G, G, 1, G, G, G, 1],
+    [1, G, 1, G, G, 1, G, 1],
+    [1, G, G, G, 1, G, G, 1],
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
@@ -114,24 +117,33 @@ HARDEST_MAZE = [
 MAZE_HEIGHT = 0.5
 
 
-def find_starts(structure, size_scaling):
+def _cell_xy(i, j, size_scaling, xy_offset, use_ogbench_convention):
+    # OGBench places wall geoms at (j*unit - offset_x, i*unit - offset_y), so
+    # the grid's column-axis becomes physical x and the row-axis becomes y.
+    # Legacy JaxGCRL mazes (u_maze, big_maze, etc.) use the opposite mapping.
+    if use_ogbench_convention:
+        return [j * size_scaling - xy_offset, i * size_scaling - xy_offset]
+    return [i * size_scaling - xy_offset, j * size_scaling - xy_offset]
+
+
+def find_starts(structure, size_scaling, use_ogbench_convention=False):
     xy_offset = float(size_scaling)  # one maze cell width
     starts = []
     for i in range(len(structure)):
         for j in range(len(structure[0])):
             if structure[i][j] == RESET:
-                starts.append([i * size_scaling - xy_offset, j * size_scaling - xy_offset])
+                starts.append(_cell_xy(i, j, size_scaling, xy_offset, use_ogbench_convention))
 
     return jnp.array(starts)
 
 
-def find_goals(structure, size_scaling):
+def find_goals(structure, size_scaling, use_ogbench_convention=False):
     xy_offset = float(size_scaling)  # one maze cell width
     goals = []
     for i in range(len(structure)):
         for j in range(len(structure[0])):
             if structure[i][j] == GOAL:
-                goals.append([i * size_scaling - xy_offset, j * size_scaling - xy_offset])
+                goals.append(_cell_xy(i, j, size_scaling, xy_offset, use_ogbench_convention))
 
     return jnp.array(goals)
 
@@ -174,12 +186,13 @@ def make_maze(maze_layout_name, maze_size_scaling):
     else:
         raise ValueError(f"Unknown maze layout: {maze_layout_name}")
 
-    xml_name = "ant_maze_ogbench.xml" if is_ogbench_maze(maze_layout_name) else "ant_maze.xml"
+    use_ogbench_convention = is_ogbench_maze(maze_layout_name)
+    xml_name = "ant_maze_ogbench.xml" if use_ogbench_convention else "ant_maze.xml"
     xml_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", xml_name)
     xy_offset = float(maze_size_scaling)  # one maze cell width
 
-    possible_starts = find_starts(maze_layout, maze_size_scaling)
-    possible_goals = find_goals(maze_layout, maze_size_scaling)
+    possible_starts = find_starts(maze_layout, maze_size_scaling, use_ogbench_convention)
+    possible_goals = find_goals(maze_layout, maze_size_scaling, use_ogbench_convention)
 
     tree = ET.parse(xml_path)
     worldbody = tree.find(".//worldbody")
@@ -188,14 +201,17 @@ def make_maze(maze_layout_name, maze_size_scaling):
         for j in range(len(maze_layout[0])):
             struct = maze_layout[i][j]
             if struct == 1:
+                wall_x, wall_y = _cell_xy(
+                    i, j, maze_size_scaling, xy_offset, use_ogbench_convention
+                )
                 ET.SubElement(
                     worldbody,
                     "geom",
                     name="block_%d_%d" % (i, j),
                     pos="%f %f %f"
                     % (
-                        i * maze_size_scaling - xy_offset,
-                        j * maze_size_scaling - xy_offset,
+                        wall_x,
+                        wall_y,
                         MAZE_HEIGHT / 2 * maze_size_scaling,
                     ),
                     size="%f %f %f"
@@ -259,18 +275,24 @@ class AntMaze(PipelineEnv):
         else:
             raise ValueError(f"Unknown maze layout: {maze_layout_name}")
 
-        # Calculate x and y bounds based on maze layout dimensions
+        # Calculate x and y bounds based on maze layout dimensions.
+        # Under the OGBench convention grid columns map to x and rows to y;
+        # legacy JaxGCRL mazes use the opposite mapping.
         num_rows = len(maze_layout)
         num_cols = len(maze_layout[0])
         half = 0.5 * maze_size_scaling
         xy_offset = float(maze_size_scaling)  # one maze cell width
+        if is_ogbench_maze(maze_layout_name):
+            x_cells, y_cells = num_cols, num_rows
+        else:
+            x_cells, y_cells = num_rows, num_cols
         self.x_bounds = jnp.array([
             -xy_offset - half,
-            (num_rows - 1) * maze_size_scaling - xy_offset + half,
+            (x_cells - 1) * maze_size_scaling - xy_offset + half,
         ])
         self.y_bounds = jnp.array([
             -xy_offset - half,
-            (num_cols - 1) * maze_size_scaling - xy_offset + half,
+            (y_cells - 1) * maze_size_scaling - xy_offset + half,
         ])
 
         sys = mjcf.loads(xml_string)

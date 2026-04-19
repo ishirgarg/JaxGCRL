@@ -30,15 +30,17 @@ BALL = B = "b"
 
 MAZE_HEIGHT = 0.5
 
-# OGBench arena: 8x8 open space
+# OGBench arena: 8x8 open space. Rows index y (OGBench convention), so the
+# grid is the transpose of the legacy JaxGCRL layout; physical R/B/G
+# positions are unchanged.
 ARENA = [
     [1, 1, 1, 1, 1, 1, 1, 1],
     [1, R, B, R, B, R, B, 1],
-    [1, B, B, B, B, B, B, 1],
-    [1, R, B, G, G, B, R, 1],
-    [1, B, B, G, G, B, B, 1],
-    [1, R, B, G, G, B, R, 1],
-    [1, B, R, B, R, B, R, 1],
+    [1, B, B, B, B, B, R, 1],
+    [1, R, B, G, G, B, B, 1],
+    [1, B, B, G, G, B, R, 1],
+    [1, R, B, B, B, B, B, 1],
+    [1, B, B, R, B, R, R, 1],
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
@@ -78,18 +80,25 @@ EASY_SQUARE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
-# OGBench medium: transposed so physical layout matches OGBench
-# (OGBench uses pos_x=j, pos_y=i; JaxGCRL uses pos_x=i, pos_y=j)
+# OGBench medium maze in OGBench's native row/col orientation.
+# Mirrors ogbench/locomaze/maze.py's medium maze_map exactly.
 MEDIUM = [
     [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 0, 0, 1, 1, 0, 0, 1],
     [1, 0, 0, 1, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 1, 0, 1],
-    [1, 1, 1, 0, 1, 0, 0, 1],
-    [1, 1, 0, 0, 0, 0, 1, 1],
-    [1, 0, 0, 1, 0, 1, 0, 1],
+    [1, 1, 0, 0, 0, 1, 1, 1],
     [1, 0, 0, 1, 0, 0, 0, 1],
+    [1, 0, 1, 0, 0, 1, 0, 1],
+    [1, 0, 0, 0, 1, 0, 0, 1],
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
+
+
+def _cell_xy(i, j, maze_size_scaling, xy_offset):
+    # OGBench convention: columns map to x, rows map to y. See
+    # ogbench/locomaze/maze.py `ij_to_xy` (x=j*unit-offset, y=i*unit-offset).
+    return [j * maze_size_scaling - xy_offset,
+            i * maze_size_scaling - xy_offset]
 
 
 def _find_cells(maze_layout, maze_size_scaling, obj):
@@ -99,8 +108,7 @@ def _find_cells(maze_layout, maze_size_scaling, obj):
     for i in range(len(maze_layout)):
         for j in range(len(maze_layout[0])):
             if maze_layout[i][j] == obj:
-                cells.append([i * maze_size_scaling - xy_offset,
-                              j * maze_size_scaling - xy_offset])
+                cells.append(_cell_xy(i, j, maze_size_scaling, xy_offset))
     return jnp.array(cells) if cells else jnp.zeros((0, 2))
 
 
@@ -111,8 +119,7 @@ def _open_cells(maze_layout, maze_size_scaling):
     for i in range(len(maze_layout)):
         for j in range(len(maze_layout[0])):
             if maze_layout[i][j] != 1:
-                cells.append([i * maze_size_scaling - xy_offset,
-                              j * maze_size_scaling - xy_offset])
+                cells.append(_cell_xy(i, j, maze_size_scaling, xy_offset))
     return jnp.array(cells) if cells else jnp.zeros((0, 2))
 
 
@@ -154,8 +161,9 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
     rows = len(maze_layout)
     cols = len(maze_layout[0])
     half = 0.5 * maze_size_scaling
-    x_bounds = (-xy_offset - half, (rows - 1) * maze_size_scaling - xy_offset + half)
-    y_bounds = (-xy_offset - half, (cols - 1) * maze_size_scaling - xy_offset + half)
+    # OGBench convention: columns index x, rows index y.
+    x_bounds = (-xy_offset - half, (cols - 1) * maze_size_scaling - xy_offset + half)
+    y_bounds = (-xy_offset - half, (rows - 1) * maze_size_scaling - xy_offset + half)
 
     tree = ET.parse(xml_path)
     worldbody = tree.find(".//worldbody")
@@ -163,13 +171,14 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
     for i in range(rows):
         for j in range(cols):
             if maze_layout[i][j] == 1:
+                wall_x, wall_y = _cell_xy(i, j, maze_size_scaling, xy_offset)
                 ET.SubElement(
                     worldbody,
                     "geom",
                     name="block_%d_%d" % (i, j),
                     pos="%f %f %f" % (
-                        i * maze_size_scaling - xy_offset,
-                        j * maze_size_scaling - xy_offset,
+                        wall_x,
+                        wall_y,
                         MAZE_HEIGHT / 2 * maze_size_scaling,
                     ),
                     size="%f %f %f" % (
