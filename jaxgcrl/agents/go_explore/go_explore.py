@@ -106,6 +106,7 @@ class GoExplore:
     tau: float = 0.005
     n_critics: int = 2
     use_her: bool = True
+    p_future_her_goal: float = 0.8
 
     goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega", "empowerment"] = "random_env_goals"
     ep_goal_proposer_name: Literal["nearest_env_goal_to_gcp_goal"] = "nearest_env_goal_to_gcp_goal"
@@ -697,6 +698,7 @@ class GoExplore:
                 transitions, process_key, self.batch_size, self.discounting,
                 state_size, tuple(train_env.goal_indices),
                 train_env.goal_reach_thresh, self.use_her,
+                p_future_her_goal=self.p_future_her_goal,
             )
             (training_state, _), gcp_metrics = jax.lax.scan(
                 update_networks, (training_state, train_key), transitions

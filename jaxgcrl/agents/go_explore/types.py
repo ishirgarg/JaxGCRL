@@ -20,7 +20,7 @@ class Actor:
     def update(self,  context, networks, transitions, training_state, actor_key):
         pass
 
-    def process_transitions(self, transitions, process_key, batch_size, discounting, state_size, goal_indices, goal_reach_thresh, use_her):
+    def process_transitions(self, transitions, process_key, batch_size, discounting, state_size, goal_indices, goal_reach_thresh, use_her, p_future_her_goal):
         pass
 
 class Critic:

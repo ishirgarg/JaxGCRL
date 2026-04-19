@@ -92,9 +92,10 @@ class CRLActor(Actor):
         """Update actor and alpha for CRL."""
         return crl_update_actor(context, networks, transitions, training_state, key)
     
-    def process_transitions(self, transitions: Transition, process_key: jnp.ndarray, 
+    def process_transitions(self, transitions: Transition, process_key: jnp.ndarray,
                            batch_size: int, discounting: float, state_size: int, goal_indices: tuple,
-                           goal_reach_thresh: float, use_her: bool):
+                           goal_reach_thresh: float, use_her: bool,
+                           p_future_her_goal: float = 0.8):
         """Process transitions using CRL's flatten_batch, then reshape and permute."""
         # CRL-specific: flatten_batch for future state sampling
         buffer_config = (
@@ -299,83 +300,79 @@ class SACActor(Actor):
     
     def process_transitions(self, transitions: Transition, process_key: jnp.ndarray,
                            batch_size: int, discounting: float, state_size: int, goal_indices: tuple,
-                           goal_reach_thresh: float, use_her: bool):
-        """Process transitions for SAC: optionally apply HER, then reshape and permute."""
-        # SAC: Apply HER if enabled (matching original SAC implementation)
-        if use_her:
-            def apply_her(transition: Transition) -> Transition:
-                """Apply HER: relabel goal to terminal state of the same trajectory.
+                           goal_reach_thresh: float, use_her: bool,
+                           p_future_her_goal: float = 0.8):
+        """Process transitions for SAC: optionally apply HER, then reshape and permute.
 
-                If no truncation point exists in the future of the same traj
-                within this window, fall back to the *last* same-traj state
-                in the window (not the original goal, which may be meaningless
-                for offline data).
-                """
+        When HER is enabled, each transition is independently relabeled with
+        probability ``p_future_her_goal``: its goal is replaced by a future
+        state from the same trajectory, sampled with probability
+        proportional to ``discounting ** (t_future - t)`` (same geometric
+        scheme as CRL's ``flatten_batch``). With probability
+        ``1 - p_future_her_goal`` the transition's original goal is kept.
+        """
+        if use_her:
+            her_key, process_key = jax.random.split(process_key)
+
+            def apply_her(transition: Transition, key: jnp.ndarray) -> Transition:
                 seq_len = transition.observation.shape[0]
                 arrangement = jnp.arange(seq_len)
-                is_future_or_self_mask = jnp.array(
-                    arrangement[:, None] <= arrangement[None], dtype=jnp.float32
+
+                is_future_mask = jnp.array(
+                    arrangement[:, None] < arrangement[None], dtype=jnp.float32
+                )
+                discount = discounting ** jnp.array(
+                    arrangement[None] - arrangement[:, None], dtype=jnp.float32
                 )
                 traj_ids = transition.extras["state_extras"]["traj_id"]
                 single_trajectories = jnp.concatenate(
                     [traj_ids[:, jnp.newaxis].T] * seq_len, axis=0,
                 )
-                same_traj = jnp.equal(single_trajectories, single_trajectories.T)
+                same_traj = jnp.equal(
+                    single_trajectories, single_trajectories.T
+                ).astype(jnp.float32)
+                # eye * 1e-5 is a numerical-stability fallback so categorical
+                # still has positive mass when a row has no valid future
+                # (e.g. the last step in a trajectory).
+                probs = is_future_mask * discount * same_traj + jnp.eye(seq_len) * 1e-5
 
-                # Primary: find truncation point in future of same traj
-                trunc_mask = (
-                    is_future_or_self_mask * same_traj
-                    * transition.extras["state_extras"]["truncation"][None, :]
-                )
+                sample_key, bern_key = jax.random.split(key)
+                future_idx = jax.random.categorical(sample_key, jnp.log(probs))
 
-                # Fallback: last same-traj state in the window (regardless of truncation).
-                # For each row i, we want the max column index j where same_traj[i,j]
-                # and j >= i.  We achieve this by masking with large negative values
-                # and taking argmax.
-                future_same_traj = is_future_or_self_mask * same_traj
-                # Use column indices weighted by the mask; argmax gives the last match
-                weighted = future_same_traj * arrangement[None, :]
-                # Where no match, set to -1 so argmax picks a real match
-                weighted = jnp.where(future_same_traj, weighted, -1)
-                last_same_traj_idx = jnp.argmax(weighted, axis=1)  # (seq_len,)
+                future_goals = transition.observation[future_idx][:, jnp.array(goal_indices)]
 
-                # Use truncation point if available, else last same-traj state
-                has_trunc = jnp.any(trunc_mask, axis=1)  # (seq_len,)
-                # For truncation: pick the first truncation point (smallest column)
-                # Set non-matches to seq_len so argmin picks a real match
-                trunc_weighted = jnp.where(trunc_mask, arrangement[None, :], seq_len)
-                trunc_idx = jnp.argmin(trunc_weighted, axis=1)  # (seq_len,)
-
-                new_goals_idx = jnp.where(has_trunc, trunc_idx, last_same_traj_idx)
-
-                # Extract goal from the selected state's goal_indices
-                selected_obs = transition.observation[new_goals_idx]
-                new_goals = selected_obs[:, jnp.array(goal_indices)]
-
-                # Transform observation: replace goal with new_goals
                 state = transition.observation[:, :state_size]
-                new_obs = jnp.concatenate([state, new_goals], axis=1)
-
-                # Recalculate reward
-                dist = jnp.linalg.norm(
-                    new_obs[:, state_size:] - new_obs[:, jnp.array(goal_indices)], axis=1
-                )
-                new_reward = jnp.array(dist < goal_reach_thresh, dtype=float)
-
-                # Transform next observation
                 next_state = transition.next_observation[:, :state_size]
-                new_next_obs = jnp.concatenate([next_state, new_goals], axis=1)
+                relabeled_obs = jnp.concatenate([state, future_goals], axis=1)
+                relabeled_next_obs = jnp.concatenate([next_state, future_goals], axis=1)
+
+                dist = jnp.linalg.norm(
+                    relabeled_obs[:, state_size:]
+                    - relabeled_obs[:, jnp.array(goal_indices)],
+                    axis=1,
+                )
+                relabeled_reward = jnp.array(dist < goal_reach_thresh, dtype=jnp.float32)
+
+                use_future = jax.random.bernoulli(
+                    bern_key, p=p_future_her_goal, shape=(seq_len,)
+                )
+                mask = use_future[:, None]
+
+                new_obs = jnp.where(mask, relabeled_obs, transition.observation)
+                new_next_obs = jnp.where(
+                    mask, relabeled_next_obs, transition.next_observation
+                )
+                new_reward = jnp.where(use_future, relabeled_reward, transition.reward)
 
                 return transition._replace(
                     observation=jnp.squeeze(new_obs),
                     next_observation=jnp.squeeze(new_next_obs),
                     reward=jnp.squeeze(new_reward),
                 )
-            
-            # Apply HER to each transition in the batch
-            transitions = jax.vmap(apply_her)(transitions)
-        
-        # Use shared reshape and permute logic
+
+            batch_keys = jax.random.split(her_key, transitions.observation.shape[0])
+            transitions = jax.vmap(apply_her)(transitions, batch_keys)
+
         return _reshape_and_permute_transitions(transitions, process_key, batch_size)
 
 
@@ -474,7 +471,7 @@ class ExploreActor(Actor):
         return update_actor_sac(context, networks, transitions, training_state, key)
 
     def process_transitions(self, transitions, process_key, batch_size, discounting, state_size,
-                            goal_indices, goal_reach_thresh, use_her):
+                            goal_indices, goal_reach_thresh, use_her, p_future_her_goal: float = 0.8):
         """Process explore phase transitions: just reshape and permute (no HER, no flatten_batch)."""
         return _reshape_and_permute_transitions(transitions, process_key, batch_size)
 

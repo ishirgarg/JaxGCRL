@@ -236,6 +236,7 @@ class GoExploreSimple:
     tau: float = 0.005
     n_critics: int = 2
     use_her: bool = True
+    p_future_her_goal: float = 0.8
     use_sac_critic_mean: bool = False  # SAC: average critic ensemble instead of min
 
     goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega", "empowerment", "empowerment_density_ratio"] = "random_env_goals"
@@ -778,6 +779,7 @@ class GoExploreSimple:
                 transitions, process_key, self.batch_size, self.discounting,
                 state_size, tuple(train_env.goal_indices),
                 train_env.goal_reach_thresh, self.use_her,
+                p_future_her_goal=self.p_future_her_goal,
             )
 
             if self.use_rlpd:
