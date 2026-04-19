@@ -54,6 +54,17 @@ SMALL_SQUARE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
+SMALL_EASY_SQUARE = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, 0, G, 0, 0, 0, 1],
+    [1, 0, B, 0, 0, 0, 0, 1],
+    [1, G, 0, G, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
 # Easy square: ball spawn fixed near center, goals along right/bottom edges
 # (ported from ant_ball_maze.py EASY_SQUARE_MAZE)
 EASY_SQUARE = [
@@ -115,6 +126,8 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
         maze_layout = SMALL_SQUARE
     elif maze_layout_name == "easy_square":
         maze_layout = EASY_SQUARE
+    elif maze_layout_name == "small_easy_square":
+        maze_layout = SMALL_EASY_SQUARE
     else:
         raise ValueError(f"Unknown OGBench ball maze layout: {maze_layout_name}")
 

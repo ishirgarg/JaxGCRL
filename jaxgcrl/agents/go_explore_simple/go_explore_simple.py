@@ -115,22 +115,24 @@ def _log_trajectory_reward(
     reward_viz,
     current_step: int,
 ):
-    """Plot the actual reward SAC saw in the final training_step of the epoch.
+    """Plot the post-override reward for a single training batch.
 
-    ``reward_viz[2]`` is ``transitions.reward`` captured right after
-    ``transitions._replace(reward=env_reward + total_bonus)`` — i.e. exactly
-    the scalar fed into the SAC critic. Shape is ``(num_batches, batch_size)``;
-    we flatten to a 1-D sequence of samples."""
+    Uses ``reward_viz[2]`` — this is ``transitions.reward`` after the
+    ``reward=total_bonus`` replace inside ``training_step``, i.e. the exact
+    values the critic trains on. No recomputation here; the values come
+    straight from the training-step snapshot passed in as ``reward_viz``.
+    Note: the batch is the post-HER, post-permute shuffle, so the x axis
+    is sample index within the batch, not chronological time."""
     if _plt is None or _wandb is None:
         return
 
-    reward = np.asarray(reward_viz[2]).reshape(-1)
+    single = np.asarray(reward_viz[2]).reshape(-1)
 
     fig, ax = _plt.subplots(figsize=(6, 3))
-    ax.plot(np.arange(reward.shape[0]), reward, lw=0.5)
-    ax.set_xlabel("training sample index")
-    ax.set_ylabel("SAC training reward")
-    ax.set_title(f"Reward fed to SAC (env + bonus)  step={current_step}")
+    ax.plot(np.arange(single.shape[0]), single, lw=1.0)
+    ax.set_xlabel("sample index (shuffled)")
+    ax.set_ylabel("reward (post-bonus override)")
+    ax.set_title(f"training-batch reward  step={current_step}")
     fig.tight_layout()
     _wandb.log({"viz/trajectory_reward": _wandb.Image(fig)}, step=current_step)
     _plt.close(fig)
@@ -241,7 +243,7 @@ class GoExploreSimple:
     goal_proposer_temperature: float = 0.0
     empowerment_run_dir: Optional[str] = None
     empowerment_epoch: Optional[int] = None
-    empowerment_num_splus_samples: int = 128
+    empowerment_num_splus_samples: int = 32
     empowerment_score_chunk_size: int = 32
 
     # ── RLPD (offline data mixing) ─────────────────────────────────────────
@@ -252,8 +254,8 @@ class GoExploreSimple:
     exploration_bonus_weight: Tuple[float, ...] = (0.1,)
 
     # Empowerment global normalization: emitted bonus is (raw_emp - mean) / scale.
-    empowerment_bonus_mean: float = 1.0
-    empowerment_bonus_scale: float = 1.0
+    empowerment_bonus_mean: float = 1.3
+    empowerment_bonus_scale: float = 0.2
 
     # RND predictor/target network shape.
     rnd_feature_dim: int = 64
@@ -362,7 +364,7 @@ class GoExploreSimple:
         )
         gcp_critic_states = gcp_critic.create_critic_states(gcp_critic_params, self.critic_lr)
 
-        target_entropy = -1 * action_size
+        target_entropy = -0.5 * action_size
         log_alpha      = jnp.asarray(0.0, dtype=jnp.float32)
         alpha_state    = TrainState.create(
             apply_fn=None,
@@ -978,10 +980,6 @@ class GoExploreSimple:
                     goal_indices=tuple(train_env.goal_indices),
                     rng_key=viz_key,
                 )
-                _log_trajectory_reward(
-                    reward_viz=last_reward_viz,
-                    current_step=current_step,
-                )
                 _, phase_transitions = replay_buffer.sample(buffer_state)
                 visualize_go_explore_phases(
                     phase_transitions,
@@ -991,6 +989,10 @@ class GoExploreSimple:
                     goal_indices=tuple(train_env.goal_indices),
                 )
                 if not exploration_bonuses.is_empty:
+                    _log_trajectory_reward(
+                        reward_viz=last_reward_viz,
+                        current_step=current_step,
+                    )
                     _log_reward_heatmap(
                         reward_viz=last_reward_viz,
                         x_bounds=unwrapped_env.x_bounds,

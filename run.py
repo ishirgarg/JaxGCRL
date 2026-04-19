@@ -85,6 +85,7 @@ def main(config: Config):
         "training/alpha_loss",
         "training/critic_loss",
         "training/entropy",
+        "training/reward_mean",
         "training/sps",
         "training/go_phase_success_rate",
         "training/avg_go_phase_steps",
