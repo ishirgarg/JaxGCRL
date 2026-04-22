@@ -128,6 +128,49 @@ def plot_positions_with_heatmap(
     return ax
 
 
+_TRAJECTORY_COLORS = ['blue', 'green', 'red', 'purple']
+
+
+def _plot_one_trajectory(ax, states, goal, color, x_min, x_max, y_min, y_max, idx):
+    """Render a single trajectory (start, path, final, goal connector) into ax."""
+    ax.plot(states[:, 0], states[:, 1], 'o-', color=color,
+            linewidth=2, markersize=6, alpha=0.7)
+    ax.plot(states[0, 0], states[0, 1], 'o', color=color,
+            markersize=10, markeredgecolor='black', markeredgewidth=2, label='Start')
+    ax.plot(states[-1, 0], states[-1, 1], 's', color=color,
+            markersize=10, markeredgecolor='black', markeredgewidth=2, label='Final')
+    ax.plot([states[-1, 0], goal[0]], [states[-1, 1], goal[1]],
+            '--', color=color, linewidth=2, alpha=0.5, label='To Goal')
+    ax.plot(goal[0], goal[1], '*', color=color,
+            markersize=15, markeredgecolor='black', markeredgewidth=1, label='Goal')
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_xlabel('X Position', fontsize=10)
+    ax.set_ylabel('Y Position', fontsize=10)
+    ax.set_title(f'Trajectory {idx + 1}', fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal', adjustable='box')
+    ax.legend(loc='best', fontsize=8)
+
+
+def _draw_trajectory_grid(axes, trajectory_states, trajectory_goals, x_bounds, y_bounds):
+    """Fill a 2x2 ``axes`` grid with up to four trajectories; hide unused slots."""
+    if len(trajectory_states) == 0:
+        return
+    x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
+    y_min, y_max = float(y_bounds[0]), float(y_bounds[1])
+    num_trajectories = min(len(trajectory_states), 4)
+    for i in range(num_trajectories):
+        ax = axes[i // 2, i % 2]
+        color = _TRAJECTORY_COLORS[i % len(_TRAJECTORY_COLORS)]
+        _plot_one_trajectory(
+            ax, trajectory_states[i], trajectory_goals[i], color,
+            x_min, x_max, y_min, y_max, i,
+        )
+    for i in range(num_trajectories, 4):
+        axes[i // 2, i % 2].axis('off')
+
+
 def plot_trajectory_sequences(
     trajectory_states: np.ndarray,
     trajectory_goals: np.ndarray,
@@ -135,84 +178,12 @@ def plot_trajectory_sequences(
     y_bounds: jnp.ndarray,
     fig: plt.Figure = None,
 ) -> plt.Figure:
-    """
-    Plot trajectory sequences in a 2x2 grid, showing start, intermediate states, final state, and goal.
-    
-    Args:
-        trajectory_states: (num_trajectories, 8, 2) array of [x, y] positions
-                         [start, 6 intermediate states, final]
-        trajectory_goals: (num_trajectories, 2) array of [x, y] goal positions
-        x_bounds: [x_min, x_max] bounds for x-axis
-        y_bounds: [y_min, y_max] bounds for y-axis
-        fig: Matplotlib figure (creates new if None)
-        
-    Returns:
-        Matplotlib figure
-    """
+    """Plot trajectory sequences in a 2x2 grid (start → intermediate → final + goal)."""
     if fig is None:
         fig, axes = plt.subplots(2, 2, figsize=(16, 16))
     else:
-        # Extract axes from existing figure if it has a 2x2 grid
         axes = fig.subplots(2, 2) if len(fig.axes) == 0 else np.array(fig.axes).reshape(2, 2)
-    
-    if len(trajectory_states) == 0:
-        return fig
-    
-    # Colors for different trajectories
-    colors = ['blue', 'green', 'red', 'purple']
-    
-    # Set bounds
-    x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
-    y_min, y_max = float(y_bounds[0]), float(y_bounds[1])
-    
-    # Plot each trajectory in its own subplot
-    num_trajectories = min(len(trajectory_states), 4)
-    for i in range(num_trajectories):
-        row = i // 2
-        col = i % 2
-        ax = axes[row, col]
-        
-        states = trajectory_states[i]
-        goal = trajectory_goals[i]
-        color = colors[i % len(colors)]
-        
-        # Plot trajectory path: start -> intermediate -> final
-        # States shape: (8, 2) = [start, 6 intermediate, final]
-        ax.plot(states[:, 0], states[:, 1], 'o-', color=color, 
-                linewidth=2, markersize=6, alpha=0.7)
-        
-        # Mark start state
-        ax.plot(states[0, 0], states[0, 1], 'o', color=color, 
-                markersize=10, markeredgecolor='black', markeredgewidth=2, label='Start')
-        
-        # Mark final state
-        ax.plot(states[-1, 0], states[-1, 1], 's', color=color, 
-                markersize=10, markeredgecolor='black', markeredgewidth=2, label='Final')
-        
-        # Plot line from final state to goal (different style)
-        ax.plot([states[-1, 0], goal[0]], [states[-1, 1], goal[1]], 
-                '--', color=color, linewidth=2, alpha=0.5, label='To Goal')
-        
-        # Mark goal
-        ax.plot(goal[0], goal[1], '*', color=color, 
-                markersize=15, markeredgecolor='black', markeredgewidth=1, label='Goal')
-        
-        # Set bounds and labels for each subplot
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_min, y_max)
-        ax.set_xlabel('X Position', fontsize=10)
-        ax.set_ylabel('Y Position', fontsize=10)
-        ax.set_title(f'Trajectory {i+1}', fontsize=12, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.set_aspect('equal', adjustable='box')
-        ax.legend(loc='best', fontsize=8)
-    
-    # Hide unused subplots if we have fewer than 4 trajectories
-    for i in range(num_trajectories, 4):
-        row = i // 2
-        col = i % 2
-        axes[row, col].axis('off')
-    
+    _draw_trajectory_grid(axes, trajectory_states, trajectory_goals, x_bounds, y_bounds)
     return fig
 
 
@@ -293,67 +264,12 @@ def visualize_trajectories(
     
     # Second row: 2x2 grid for trajectory sequences (spans columns 0-1)
     traj_gs = gs[1, :2].subgridspec(2, 2, hspace=0.3, wspace=0.3)
-    traj_axes = []
-    for i in range(2):
-        row = []
-        for j in range(2):
-            row.append(fig.add_subplot(traj_gs[i, j]))
-        traj_axes.append(row)
-    traj_axes = np.array(traj_axes)
-    
-    # Plot trajectories in 2x2 grid
-    if len(trajectory_states) > 0:
-        x_min, x_max = float(x_bounds[0]), float(x_bounds[1])
-        y_min, y_max = float(y_bounds[0]), float(y_bounds[1])
-        
-        colors = ['blue', 'green', 'red', 'purple']
-        num_trajectories = min(len(trajectory_states), 4)
-        
-        for i in range(num_trajectories):
-            row = i // 2
-            col = i % 2
-            ax = traj_axes[row, col]
-            
-            states = trajectory_states[i]
-            goal = trajectory_goals[i]
-            color = colors[i % len(colors)]
-            
-            # Plot trajectory path: start -> intermediate -> final
-            ax.plot(states[:, 0], states[:, 1], 'o-', color=color, 
-                    linewidth=2, markersize=6, alpha=0.7)
-            
-            # Mark start state
-            ax.plot(states[0, 0], states[0, 1], 'o', color=color, 
-                    markersize=10, markeredgecolor='black', markeredgewidth=2, label='Start')
-            
-            # Mark final state
-            ax.plot(states[-1, 0], states[-1, 1], 's', color=color, 
-                    markersize=10, markeredgecolor='black', markeredgewidth=2, label='Final')
-            
-            # Plot line from final state to goal (different style)
-            ax.plot([states[-1, 0], goal[0]], [states[-1, 1], goal[1]], 
-                    '--', color=color, linewidth=2, alpha=0.5, label='To Goal')
-            
-            # Mark goal
-            ax.plot(goal[0], goal[1], '*', color=color, 
-                    markersize=15, markeredgecolor='black', markeredgewidth=1, label='Goal')
-            
-            # Set bounds and labels for each subplot
-            ax.set_xlim(x_min, x_max)
-            ax.set_ylim(y_min, y_max)
-            ax.set_xlabel('X Position', fontsize=10)
-            ax.set_ylabel('Y Position', fontsize=10)
-            ax.set_title(f'Trajectory {i+1}', fontsize=12, fontweight='bold')
-            ax.grid(True, alpha=0.3)
-            ax.set_aspect('equal', adjustable='box')
-            ax.legend(loc='best', fontsize=8)
-        
-        # Hide unused subplots if we have fewer than 4 trajectories
-        for i in range(num_trajectories, 4):
-            row = i // 2
-            col = i % 2
-            traj_axes[row, col].axis('off')
-    
+    traj_axes = np.array([
+        [fig.add_subplot(traj_gs[i, j]) for j in range(2)]
+        for i in range(2)
+    ])
+    _draw_trajectory_grid(traj_axes, trajectory_states, trajectory_goals, x_bounds, y_bounds)
+
     plt.tight_layout()
     
     if save_path:
@@ -708,6 +624,39 @@ def handle_goal_proposer_visualization(
             y_bounds=y_bounds,
         )
     # Add more goal proposer visualizations here as needed
+
+
+def visualize_exploration_q_xy(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    q_values: np.ndarray,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+    current_step: int,
+) -> None:
+    """Scatter min-over-ensemble Q_exp per buffer-sampled transition over xy.
+
+    ``xs``/``ys`` are the transitions' first two goal_indices columns, and
+    ``q_values`` is the corresponding min-over-ensemble ``Q_exp(obs, action)``;
+    all three arrays share shape ``(N,)``. Logged to wandb as
+    ``viz/exploration_q_xy`` keyed on ``current_step``.
+    """
+    xs = np.asarray(xs).reshape(-1)
+    ys = np.asarray(ys).reshape(-1)
+    q_values = np.asarray(q_values).reshape(-1)
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    sc = ax.scatter(xs, ys, c=q_values, cmap="viridis", s=8, linewidths=0)
+    ax.set_xlim(float(x_bounds[0]), float(x_bounds[1]))
+    ax.set_ylim(float(y_bounds[0]), float(y_bounds[1]))
+    ax.set_aspect("equal")
+    fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label="min Q_exp")
+    ax.set_xlabel("x (goal idx 0)")
+    ax.set_ylabel("y (goal idx 1)")
+    ax.set_title(f"Exploration Q over sampled states  step={current_step}")
+    fig.tight_layout()
+    wandb.log({"viz/exploration_q_xy": wandb.Image(fig)}, step=current_step)
+    plt.close(fig)
 
 
 def visualize_empowerment_candidates(

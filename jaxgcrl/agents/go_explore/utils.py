@@ -42,14 +42,13 @@ def flatten_batch(buffer_config, transition, sample_key):
     # assuming seq_len = 5
     # the same result can be obtained using probs = is_future_mask * (gamma ** jnp.cumsum(is_future_mask, axis=-1))
 
-    single_trajectories = jnp.concatenate(
-        [transition.extras["state_extras"]["traj_id"][:, jnp.newaxis].T] * seq_len,
-        axis=0,
-    )
-    # array of seq_len x seq_len where a row is an array of traj_ids that correspond to the episode index from which that time-step was collected
-    # timesteps collected from the same episode will have the same traj_id. All rows of the single_trajectories are same.
+    traj_ids = transition.extras["state_extras"]["traj_id"]
+    # (seq_len, seq_len) view: each row is traj_ids; transpose gives each column.
+    # broadcast_to avoids the copy that concatenate(...) * seq_len would make.
+    row_ids = jnp.broadcast_to(traj_ids[jnp.newaxis, :], (seq_len, seq_len))
+    col_ids = jnp.broadcast_to(traj_ids[:, jnp.newaxis], (seq_len, seq_len))
 
-    probs = probs * jnp.equal(single_trajectories, single_trajectories.T) + jnp.eye(seq_len) * 1e-5
+    probs = probs * jnp.equal(row_ids, col_ids) + jnp.eye(seq_len) * 1e-5
     # ith row of probs will be non zero only for time indices that
     # 1) are greater than i
     # 2) have the same traj_id as the ith time index
@@ -62,7 +61,11 @@ def flatten_batch(buffer_config, transition, sample_key):
     goal = future_state[:, goal_indices]
     future_state = future_state[:, :state_size]
     state = transition.observation[:-1, :state_size]  # all states are considered
+    next_state = transition.observation[1:, :state_size]
     new_obs = jnp.concatenate([state, goal], axis=1)
+    # Next obs keeps the same HER-sampled goal; discount already encodes episode
+    # boundaries, so when next_state is from a reset the bootstrap is zeroed out.
+    new_next_obs = jnp.concatenate([next_state, goal], axis=1)
 
     extras = {
         "policy_extras": {},
@@ -80,6 +83,7 @@ def flatten_batch(buffer_config, transition, sample_key):
         action=jnp.squeeze(transition.action[:-1]),
         reward=jnp.squeeze(transition.reward[:-1]),
         discount=jnp.squeeze(transition.discount[:-1]),
+        next_observation=jnp.squeeze(new_next_obs),
         extras=extras,
     )
 
@@ -179,6 +183,42 @@ def sample_trajectories_from_buffer(
 
 
 
+def _dummy_transition(
+    prefix: Tuple[int, ...],
+    obs_size: int,
+    action_size: int,
+    agent_type: str,
+    include_phase: bool,
+) -> Any:
+    """Build a zero-filled ``Transition`` with leading shape ``prefix``.
+
+    Scalar transition (empty ``prefix``) is used for buffer init; batched shapes
+    are used for inserts (``(unroll_length, num_envs)``) and for the goal-
+    proposer sample placeholder (``(num_envs, episode_length)``).
+    """
+    from .types import Transition
+
+    obs = jnp.zeros(prefix + (obs_size,))
+    action = jnp.zeros(prefix + (action_size,))
+    reward = jnp.zeros(prefix) if prefix else jnp.asarray(0.0)
+    discount = jnp.zeros(prefix) if prefix else jnp.asarray(0.0)
+    next_obs = obs if agent_type == "sac" else None
+    state_extras = {
+        "traj_id": jnp.zeros(prefix, dtype=jnp.float32) if prefix else jnp.asarray(0.0),
+        "truncation": jnp.zeros(prefix, dtype=jnp.float32) if prefix else jnp.asarray(0.0),
+    }
+    if include_phase:
+        state_extras["phase"] = jnp.zeros(prefix, dtype=jnp.int32)
+    return Transition(
+        observation=obs,
+        action=action,
+        reward=reward,
+        discount=discount,
+        next_observation=next_obs,
+        extras={"state_extras": state_extras},
+    )
+
+
 def create_dummy_transition_for_buffer(
     unroll_length: int,
     num_envs: int,
@@ -187,42 +227,9 @@ def create_dummy_transition_for_buffer(
     agent_type: str = "crl",
     include_phase: bool = False,
 ) -> Any:
-    """
-    Create a dummy transition object for replay buffer insertion.
-    Shape is (unroll_length, num_envs, ...) to match what's normally inserted.
-    
-    Args:
-        unroll_length: Length of unroll (first dimension)
-        num_envs: Number of parallel environments (second dimension)
-        obs_size: Size of observation dimension
-        action_size: Size of action dimension
-        agent_type: Type of agent ("crl" or "sac") - SAC needs next_observation
-        include_phase: If True, include "phase" in state_extras (for Go Explore)
-        
-    Returns:
-        A Transition object with zero-filled arrays of shape (unroll_length, num_envs, ...).
-    """
-    from .types import Transition
-    
-    dummy_obs = jnp.zeros((unroll_length, num_envs, obs_size))
-    dummy_action = jnp.zeros((unroll_length, num_envs, action_size))
-    dummy_reward = jnp.zeros((unroll_length, num_envs))
-    dummy_discount = jnp.zeros((unroll_length, num_envs))
-    dummy_next_obs = jnp.zeros((unroll_length, num_envs, obs_size)) if agent_type == "sac" else None
-    state_extras = {
-            "traj_id": jnp.zeros((unroll_length, num_envs), dtype=jnp.float32),
-            "truncation": jnp.zeros((unroll_length, num_envs), dtype=jnp.float32),
-        }
-    if include_phase:
-        state_extras["phase"] = jnp.zeros((unroll_length, num_envs), dtype=jnp.int32)
-    dummy_extras = {"state_extras": state_extras}
-    return Transition(
-        observation=dummy_obs,
-        action=dummy_action,
-        reward=dummy_reward,
-        discount=dummy_discount,
-        next_observation=dummy_next_obs,
-        extras=dummy_extras
+    """Dummy transition shaped ``(unroll_length, num_envs, ...)`` for buffer inserts."""
+    return _dummy_transition(
+        (unroll_length, num_envs), obs_size, action_size, agent_type, include_phase,
     )
 
 
@@ -234,42 +241,9 @@ def create_dummy_transition_for_goal_proposer(
     agent_type: str = "crl",
     include_phase: bool = False,
 ) -> Any:
-    """
-    Create a dummy transition object with shape (num_envs, episode_length, ...) for goal proposer state.
-    This matches the shape returned by the replay buffer's sample method.
-    
-    Args:
-        num_envs: Number of parallel environments
-        episode_length: Length of episode
-        obs_size: Size of observation dimension
-        action_size: Size of action dimension
-        agent_type: Type of agent ("crl" or "sac") - SAC needs next_observation
-        include_phase: If True, include "phase" in state_extras (for Go Explore)
-        
-    Returns:
-        A Transition object with zero-filled arrays of shape (num_envs, episode_length, ...).
-    """
-    from .types import Transition
-    
-    dummy_obs = jnp.zeros((num_envs, episode_length, obs_size))
-    dummy_action = jnp.zeros((num_envs, episode_length, action_size))
-    dummy_reward = jnp.zeros((num_envs, episode_length))
-    dummy_discount = jnp.zeros((num_envs, episode_length))
-    dummy_next_obs = jnp.zeros((num_envs, episode_length, obs_size)) if agent_type == "sac" else None
-    state_extras = {
-            "traj_id": jnp.zeros((num_envs, episode_length), dtype=jnp.float32),
-            "truncation": jnp.zeros((num_envs, episode_length), dtype=jnp.float32),
-        }
-    if include_phase:
-        state_extras["phase"] = jnp.zeros((num_envs, episode_length), dtype=jnp.int32)
-    dummy_extras = {"state_extras": state_extras}
-    return Transition(
-        observation=dummy_obs,
-        action=dummy_action,
-        reward=dummy_reward,
-        discount=dummy_discount,
-        next_observation=dummy_next_obs,
-        extras=dummy_extras
+    """Dummy transition shaped ``(num_envs, episode_length, ...)`` matching ``buffer.sample``."""
+    return _dummy_transition(
+        (num_envs, episode_length), obs_size, action_size, agent_type, include_phase,
     )
 
 
@@ -279,40 +253,8 @@ def create_single_dummy_transition(
     agent_type: str = "crl",
     include_phase: bool = False,
 ) -> Any:
-    """
-    Create a single dummy transition object (not batched) for replay buffer initialization.
-    
-    Args:
-        obs_size: Size of observation dimension
-        action_size: Size of action dimension
-        agent_type: Type of agent ("crl" or "sac") - SAC needs next_observation
-        include_phase: If True, include "phase" in state_extras (for Go Explore)
-        
-    Returns:
-        A Transition object with zero-filled arrays of shape (obs_size,) and (action_size,).
-    """
-    from .types import Transition
-    
-    dummy_obs = jnp.zeros((obs_size,))
-    dummy_action = jnp.zeros((action_size,))
-    dummy_reward = 0.0
-    dummy_discount = 0.0
-    dummy_next_obs = jnp.zeros((obs_size,)) if agent_type == "sac" else None
-    state_extras = {
-            "truncation": 0.0,
-            "traj_id": 0.0,
-        }
-    if include_phase:
-        state_extras["phase"] = jnp.zeros((), dtype=jnp.int32)
-    dummy_extras = {"state_extras": state_extras}
-    return Transition(
-        observation=dummy_obs,
-        action=dummy_action,
-        reward=dummy_reward,
-        discount=dummy_discount,
-        next_observation=dummy_next_obs,
-        extras=dummy_extras
-    )
+    """Scalar dummy transition for replay-buffer initialization."""
+    return _dummy_transition((), obs_size, action_size, agent_type, include_phase)
 
 
 def sample_trajectory_sequences(

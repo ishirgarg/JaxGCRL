@@ -74,15 +74,12 @@ class CRLActor(Actor):
     
     def sample_actions(self, params, obs, key, is_deterministic: bool = False):
         means, log_stds = self.apply(params, obs)
-        # Use JAX cond to select between deterministic and stochastic actions
-        is_det_jax = jnp.array(is_deterministic, dtype=bool)
-        actions = jax.lax.cond(
-            is_det_jax,
-            lambda: nn.tanh(means),  # Deterministic: just use mean
-            lambda: nn.tanh(means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)),  # Stochastic: add noise
+        if is_deterministic:
+            return nn.tanh(means)
+        return nn.tanh(
+            means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
         )
-        return actions
-    
+
     def apply(self, params, obs):
         """Apply actor network to get mean and log_std."""
         return self.network.apply(params, obs)
@@ -192,33 +189,7 @@ class CRLCritic(Critic):
             q_values.append(q_value[..., None])  # Shape: (..., 1)
         
         return jnp.concatenate(q_values, axis=-1)  # Shape: (..., n_critics)
-    
-    def __call__(self, obs, actions):
-        """Compute Q-value using encoders and energy function for all critics.
-        
-        Args:
-            obs: Observations with shape (..., obs_size) where obs = [state, goal]
-            actions: Actions with shape (..., action_size)
-            
-        Returns:
-            Q-values with shape (..., n_critics) - concatenated Q-values from all critics
-        """
-        # Extract state and goal from obs
-        state = obs[..., :self.state_size]
-        goal = obs[..., self.state_size:]
-        
-        # Compute representations using encoders (no params needed for __call__)
-        sa_input = jnp.concatenate([state, actions], axis=-1)
-        q_values = []
-        for sa_encoder, g_encoder in zip(self.sa_encoders, self.g_encoders):
-            sa_repr = sa_encoder(sa_input)
-            g_repr = g_encoder(goal)
-            # Compute energy (Q-value)
-            q_value = energy_fn(self.energy_fn, sa_repr, g_repr)
-            q_values.append(q_value[..., None])  # Shape: (..., 1)
-        
-        return jnp.concatenate(q_values, axis=-1)  # Shape: (..., n_critics)
-    
+
     def init(self, key, x):
         # x is dummy obs for shape (batch_size, obs_size)
         # For sa_encoder: input is (state + action)
@@ -284,15 +255,12 @@ class SACActor(Actor):
     
     def sample_actions(self, params, obs, key, is_deterministic: bool = False):
         means, log_stds = self.apply(params, obs)
-        # Use JAX cond to select between deterministic and stochastic actions
-        is_det_jax = jnp.array(is_deterministic, dtype=bool)
-        actions = jax.lax.cond(
-            is_det_jax,
-            lambda: nn.tanh(means),  # Deterministic: just use mean
-            lambda: nn.tanh(means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)),  # Stochastic: add noise
+        if is_deterministic:
+            return nn.tanh(means)
+        return nn.tanh(
+            means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
         )
-        return actions
-    
+
     def update(self, context: Dict[str, Any], networks: Dict[str, Any],
                transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
         """Update actor for SAC."""
@@ -325,12 +293,9 @@ class SACActor(Actor):
                     arrangement[None] - arrangement[:, None], dtype=jnp.float32
                 )
                 traj_ids = transition.extras["state_extras"]["traj_id"]
-                single_trajectories = jnp.concatenate(
-                    [traj_ids[:, jnp.newaxis].T] * seq_len, axis=0,
-                )
-                same_traj = jnp.equal(
-                    single_trajectories, single_trajectories.T
-                ).astype(jnp.float32)
+                row_ids = jnp.broadcast_to(traj_ids[jnp.newaxis, :], (seq_len, seq_len))
+                col_ids = jnp.broadcast_to(traj_ids[:, jnp.newaxis], (seq_len, seq_len))
+                same_traj = jnp.equal(row_ids, col_ids).astype(jnp.float32)
                 # eye * 1e-5 is a numerical-stability fallback so categorical
                 # still has positive mass when a row has no valid future
                 # (e.g. the last step in a trajectory).
@@ -458,13 +423,11 @@ class ExploreActor(Actor):
 
     def sample_actions(self, params, obs, key, is_deterministic: bool = False):
         means, log_stds = self.apply(params, obs)
-        is_det_jax = jnp.array(is_deterministic, dtype=bool)
-        actions = jax.lax.cond(
-            is_det_jax,
-            lambda: nn.tanh(means),
-            lambda: nn.tanh(means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)),
+        if is_deterministic:
+            return nn.tanh(means)
+        return nn.tanh(
+            means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
         )
-        return actions
 
     def update(self, context, networks, transitions, training_state, key):
         """Update explore actor using SAC actor update."""
@@ -508,6 +471,27 @@ def get_explore_policy(explore_policy_type: str, action_size: int, state_size: i
         return explore_actor, explore_critic
     else:
         raise ValueError(f"Unknown explore_policy_type: {explore_policy_type}")
+
+
+def get_exploration_q_critic(obs_size: int, action_size: int,
+                             h_dim: int = 256, n_hidden: int = 4,
+                             use_relu: bool = False, use_ln: bool = True,
+                             n_critics: int = 2) -> "SACCritic":
+    """Q-critic trained on the exploration bonus only.
+
+    Same shape as the main SAC critic (takes full [state, goal] obs) so
+    ``update_critic_sac`` can be reused verbatim; the exploration bonus does
+    not depend on the goal, so the critic learns to ignore the goal dims.
+    """
+    return SACCritic(
+        obs_size=obs_size,
+        action_size=action_size,
+        network_width=h_dim,
+        network_depth=n_hidden,
+        use_relu=use_relu,
+        use_ln=use_ln,
+        n_critics=n_critics,
+    )
 
 
 def get_algorithm(agent_type: str, **kwargs):

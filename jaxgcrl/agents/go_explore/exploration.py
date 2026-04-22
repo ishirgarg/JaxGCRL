@@ -77,6 +77,7 @@ def create_exploration_bonus(
     empowerment_score_chunk_size: int = 32,
     empowerment_mean: float = 0.0,
     empowerment_scale: float = 1.0,
+    empowerment_precomputed_scorer: Optional[Callable] = None,
     # RND-specific
     rnd_feature_dim: int = 64,
     rnd_hidden_dim: int = 256,
@@ -90,6 +91,9 @@ def create_exploration_bonus(
       - ``"empowerment"``: offline empowerment scorer. Emits
         ``(raw_emp - mean) / scale`` so the raw empowerment distribution can
         be globally recentered and rescaled before the per-bonus weight.
+        If ``empowerment_precomputed_scorer`` is provided (e.g. one already
+        built for a goal proposer), it is reused instead of loading a second
+        copy of the agent.
       - ``"rnd"``: Random Network Distillation — prediction-error of a
         trainable predictor against a fixed random target network, both
         operating on observation-normalized, ``[-rnd_obs_clip, rnd_obs_clip]``
@@ -107,6 +111,7 @@ def create_exploration_bonus(
             chunk_size=empowerment_score_chunk_size,
             mean=empowerment_mean,
             scale=empowerment_scale,
+            precomputed_scorer=empowerment_precomputed_scorer,
         )
     if bonus_type == "rnd":
         return _create_rnd_bonus(
@@ -132,48 +137,54 @@ def _create_empowerment_bonus(
     chunk_size: int,
     mean: float,
     scale: float,
+    precomputed_scorer: Optional[Callable] = None,
 ) -> Tuple[BonusFn, StatelessBonusState, None]:
     """Offline empowerment scorer wrapped as a bonus fn.
 
     Emits ``(raw_emp - mean) / scale``; ``mean`` recenters the raw empowerment
     and ``scale`` standard-deviation-style rescales, both as fixed globals.
-    The per-bonus weight applied by the agent multiplies this value.
+    The per-bonus weight applied by the agent multiplies this value. When
+    ``precomputed_scorer`` is supplied, the agent/obs-builder/scorer load is
+    skipped (used by callers that already loaded one for the goal proposer).
     """
-    if run_dir is None:
-        raise ValueError(
-            "empowerment_run_dir must be set when exploration_bonus_type='empowerment'."
+    if precomputed_scorer is not None:
+        scorer = precomputed_scorer
+    else:
+        if run_dir is None:
+            raise ValueError(
+                "empowerment_run_dir must be set when exploration_bonus_type='empowerment'."
+            )
+        from .empowerment import (
+            infer_empowerment_override_indices_from_env,
+            load_offline_empowerment_agent,
+            make_empowerment_obs_builder,
+            make_offline_empowerment_scorer,
         )
 
-    from .empowerment import (
-        infer_empowerment_override_indices_from_env,
-        load_offline_empowerment_agent,
-        make_empowerment_obs_builder,
-        make_offline_empowerment_scorer,
-    )
-
-    ogbench_idx, jax_idx = infer_empowerment_override_indices_from_env(env)
-    emp_agent, _ex_obs_dim, base_obs = load_offline_empowerment_agent(
-        run_dir=run_dir,
-        jax_env=env,
-        template_rng=key,
-        epoch=epoch,
-        num_splus_samples=num_splus_samples,
-    )
-    obs_builder = make_empowerment_obs_builder(
-        jnp.asarray(base_obs),
-        ogbench_idx,
-        jax_idx,
-        state_size=state_size,
-    )
-    scorer = make_offline_empowerment_scorer(
-        emp_agent, obs_builder, chunk_size=chunk_size
-    )
+        ogbench_idx, jax_idx = infer_empowerment_override_indices_from_env(env)
+        emp_agent, _ex_obs_dim, base_obs = load_offline_empowerment_agent(
+            run_dir=run_dir,
+            jax_env=env,
+            template_rng=key,
+            epoch=epoch,
+            num_splus_samples=num_splus_samples,
+        )
+        obs_builder = make_empowerment_obs_builder(
+            jnp.asarray(base_obs),
+            ogbench_idx,
+            jax_idx,
+            state_size=state_size,
+        )
+        scorer = make_offline_empowerment_scorer(
+            emp_agent, obs_builder, chunk_size=chunk_size
+        )
 
     mean_f = jnp.asarray(mean, dtype=jnp.float32)
     scale_f = jnp.asarray(scale, dtype=jnp.float32)
 
     def empowerment_bonus(state, transitions, bonus_key):
-        states = transitions.observation[..., :state_size]
+        # Score s_{t+1} to match EmpowermentSAC: reward(s,a,s') = emp(s').
+        states = transitions.next_observation[..., :state_size]
         shape = states.shape[:2]
         flat_states = states.reshape(-1, state_size)
         raw = scorer(flat_states, bonus_key).reshape(shape)
@@ -354,18 +365,21 @@ class ExplorationBonuses:
         state: Tuple,
         transitions,
         key: jax.Array,
-    ) -> Tuple[jnp.ndarray, Tuple, dict]:
-        """Return ``(weighted_total, new_state, metrics)`` across all bonuses.
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, Tuple, dict]:
+        """Return ``(weighted_total, raw_total, new_state, metrics)``.
 
-        ``weighted_total`` = ``sum_i weight_i * bonus_i`` with shape
-        ``transitions.reward.shape``. ``new_state`` is the per-bonus-state
-        tuple after each bonus's update. ``metrics`` is flat-keyed with each
-        inner metric prefixed by ``bonus_<i>_<type>_``.
+        ``weighted_total`` = ``sum_i weight_i * bonus_i`` is what gets added to
+        the reward (matching existing SAC reward shaping). ``raw_total`` =
+        ``sum_i bonus_i`` is the un-scaled sum of the raw bonuses; callers
+        that want to train a separate Q_exp *and* apply the weight at the
+        actor loss (rather than at the reward) should use this instead.
         """
         if self.is_empty:
-            return jnp.zeros_like(transitions.reward), state, {}
+            zeros = jnp.zeros_like(transitions.reward)
+            return zeros, zeros, state, {}
 
         total = jnp.zeros_like(transitions.reward)
+        raw_total = jnp.zeros_like(transitions.reward)
         new_states = []
         metrics: dict = {}
         keys = jax.random.split(key, len(self.fns))
@@ -374,11 +388,13 @@ class ExplorationBonuses:
         ):
             bonus, new_state_i, m = fn(state[i], transitions, sub_key)
             total = total + jnp.asarray(weight, dtype=total.dtype) * bonus
+            raw_total = raw_total + bonus
             new_states.append(new_state_i)
             for mk, mv in m.items():
                 metrics[f"bonus_{i}_{bt}_{mk}"] = mv
         metrics["bonus_total_mean"] = jnp.mean(total)
-        return total, tuple(new_states), metrics
+        metrics["bonus_raw_total_mean"] = jnp.mean(raw_total)
+        return total, raw_total, tuple(new_states), metrics
 
     def init_from_states(self, state: Tuple, states_batch: jnp.ndarray) -> Tuple:
         """Seed per-bonus state from a batch of observed states (post-prefill)."""
@@ -406,6 +422,7 @@ def create_exploration_bonuses(
     empowerment_score_chunk_size: int = 32,
     empowerment_mean: float = 0.0,
     empowerment_scale: float = 1.0,
+    empowerment_precomputed_scorer: Optional[Callable] = None,
     # RND-specific
     rnd_feature_dim: int = 64,
     rnd_hidden_dim: int = 256,
@@ -453,6 +470,7 @@ def create_exploration_bonuses(
             empowerment_score_chunk_size=empowerment_score_chunk_size,
             empowerment_mean=empowerment_mean,
             empowerment_scale=empowerment_scale,
+            empowerment_precomputed_scorer=empowerment_precomputed_scorer,
             rnd_feature_dim=rnd_feature_dim,
             rnd_hidden_dim=rnd_hidden_dim,
             rnd_num_hidden=rnd_num_hidden,

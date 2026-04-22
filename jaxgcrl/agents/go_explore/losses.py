@@ -8,6 +8,37 @@ from flax.training.train_state import TrainState
 from .types import TrainingState, Transition
 
 
+def flatten_sac_critic_params(critic_states) -> Dict[str, Any]:
+    """Flatten per-critic TrainStates into the ``critic_{i}_{layer}`` layout.
+
+    SAC-style critics (the main SAC Q, the exploration Q) hold one TrainState
+    per ensemble member with ``{layer: params}``; this is the shape the
+    ensemble network expects at ``apply`` time.
+    """
+    return {
+        f"critic_{i}_{lname}": lparams
+        for i, cs in enumerate(critic_states)
+        for lname, lparams in cs.params.items()
+    }
+
+
+def flatten_crl_critic_params(critic_states) -> Dict[str, Any]:
+    """Flatten per-critic TrainStates into the CRL ``sa_encoder_{i}``/``g_encoder_{i}`` layout."""
+    full = {}
+    for i, cs in enumerate(critic_states):
+        full[f"sa_encoder_{i}"] = cs.params["sa_encoder"]
+        full[f"g_encoder_{i}"] = cs.params["g_encoder"]
+    return full
+
+
+def soft_update_target_params(target_params, critic_states, tau: float):
+    """Polyak-average a target critic-params tree toward the current ensemble."""
+    live = flatten_sac_critic_params(critic_states)
+    return jax.tree_util.tree_map(
+        lambda x, y: x * (1 - tau) + y * tau, target_params, live,
+    )
+
+
 def energy_fn(name, x, y):
     if name == "norm":
         return -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1) + 1e-6)
@@ -37,10 +68,25 @@ def contrastive_loss_fn(name, logits):
     return critic_loss
 
 
-def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any], 
+def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
                            transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
-    """CRL actor and alpha update."""
-    def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
+    """CRL actor and alpha update.
+
+    If ``networks["exploration_q_critic"]`` is provided and the training state
+    has ``exploration_q_critic_states`` set, the actor loss also includes
+    ``- exploration_critic_weight * min_i Q_exp_i(state, action)`` so the policy
+    is biased toward actions with high exploration Q.
+    """
+    exploration_q_critic = networks.get("exploration_q_critic")
+    exploration_q_states = training_state.exploration_q_critic_states
+    exploration_weight = float(config.get("exploration_critic_weight", 0.0))
+    use_exploration_q = (
+        exploration_q_critic is not None
+        and exploration_q_states is not None
+        and exploration_weight != 0.0
+    )
+
+    def actor_loss(actor_params, critic_params, log_alpha, exp_q_params, transitions, key):
         obs = transitions.observation  # expected_shape = self.batch_size, obs_size + goal_size
         state = obs[:, : config["state_size"]]
         future_state = transitions.extras["future_state"]
@@ -66,39 +112,50 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
         # Use first critic's output for CRL
         qf_pi = q_values[:, 0]  # Shape: (batch_size,)
 
-        actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - qf_pi)
+        actor_loss_val = jnp.mean(jnp.exp(log_alpha) * log_prob - qf_pi)
 
-        return actor_loss, log_prob
+        # Optional: bias actor toward high exploration Q using a non-goal-
+        # conditioned Q_exp(state, action). The exploration Q is trained with a
+        # SAC-style Bellman backup on the exploration bonus only (no env reward).
+        if use_exploration_q:
+            exp_q_values = exploration_q_critic.apply(exp_q_params, obs_with_goal, action)
+            exp_q = jnp.min(exp_q_values, axis=-1)  # min over ensemble for stability
+            actor_loss_val = actor_loss_val - exploration_weight * jnp.mean(exp_q)
+
+        return actor_loss_val, log_prob
 
     def alpha_loss(alpha_params, log_prob):
         alpha = jnp.exp(alpha_params["log_alpha"])
         alpha_loss = alpha * jnp.mean(jax.lax.stop_gradient(-log_prob - config["target_entropy"]))
         return jnp.mean(alpha_loss)
 
-    # Reconstruct full critic params from separate critic states for actor loss (CRL uses sa_encoder_{i}/g_encoder_{i})
-    full_critic_params = {}
-    for i, critic_i_state in enumerate(training_state.critic_states):
-        full_critic_params[f"sa_encoder_{i}"] = critic_i_state.params["sa_encoder"]
-        full_critic_params[f"g_encoder_{i}"] = critic_i_state.params["g_encoder"]
-    
-    (actor_loss, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
+    full_critic_params = flatten_crl_critic_params(training_state.critic_states)
+
+    exp_q_full_params = None
+    if use_exploration_q:
+        exp_q_full_params = jax.lax.stop_gradient(
+            flatten_sac_critic_params(exploration_q_states)
+        )
+
+    (actor_loss_val, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
         training_state.actor_state.params,
         full_critic_params,
         training_state.alpha_state.params["log_alpha"],
+        exp_q_full_params,
         transitions,
         key,
     )
     new_actor_state = training_state.actor_state.apply_gradients(grads=actor_grad)
 
-    alpha_loss, alpha_grad = jax.value_and_grad(alpha_loss)(training_state.alpha_state.params, log_prob)
+    alpha_loss_val, alpha_grad = jax.value_and_grad(alpha_loss)(training_state.alpha_state.params, log_prob)
     new_alpha_state = training_state.alpha_state.apply_gradients(grads=alpha_grad)
 
     training_state = training_state.replace(actor_state=new_actor_state, alpha_state=new_alpha_state)
 
     metrics = {
         "entropy": -jnp.mean(log_prob),  # log_prob: (batch_size,), mean to scalar for consistency
-        "actor_loss": actor_loss,
-        "alpha_loss": alpha_loss,
+        "actor_loss": actor_loss_val,
+        "alpha_loss": alpha_loss_val,
         "log_alpha": training_state.alpha_state.params["log_alpha"],
     }
 
@@ -189,6 +246,42 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
     return training_state, metrics
 
 
+def update_exploration_q_critic(
+    config: Dict[str, Any],
+    networks: Dict[str, Any],
+    transitions: Transition,
+    training_state: TrainingState,
+    key: jnp.ndarray,
+):
+    """SAC-style Bellman backup on the exploration bonus only (no entropy term).
+
+    Reuses ``update_critic_sac`` with a shim training-state whose
+    ``critic_states`` / ``target_critic_params`` point at the exploration Q
+    fields and whose ``alpha_state`` is ``None`` so ``alpha = 0`` zeroes the
+    entropy term. ``transitions.reward`` must already hold the raw (unweighted,
+    but globally shifted/rescaled) per-transition exploration bonus — for CRL
+    this is safe because the contrastive critic/actor never read reward, so
+    the caller overwrites it with the bonus.
+    """
+    shim_ts = training_state.replace(
+        critic_states=training_state.exploration_q_critic_states,
+        target_critic_params=training_state.exploration_q_target_critic_params,
+        alpha_state=None,  # alpha=0 in update_critic_sac -> plain Bellman
+    )
+    shim_networks = {**networks, "critic": networks["exploration_q_critic"]}
+    # Use min over ensemble regardless of main critic's mean/min preference.
+    shim_config = {**config, "use_sac_critic_mean": False}
+
+    new_shim_ts, sac_metrics = update_critic_sac(
+        shim_config, shim_networks, transitions, shim_ts, key
+    )
+
+    training_state = training_state.replace(
+        exploration_q_critic_states=new_shim_ts.critic_states,
+    )
+    return training_state, {f"exploration_q_{k}": v for k, v in sac_metrics.items()}
+
+
 def update_alpha_sac(config: Dict[str, Any], networks: Dict[str, Any],
                      transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
     """SAC alpha update (matching original SAC - updates alpha first, before critic/actor).
@@ -274,14 +367,9 @@ def update_actor_sac(config: Dict[str, Any], networks: Dict[str, Any],
 
     # Use OLD alpha value (before alpha update) - matching original SAC
     alpha = jnp.exp(training_state.alpha_state.params["log_alpha"]) if training_state.alpha_state else 0.0
-    
-    # Reconstruct full critic params from separate critic states for SAC actor loss
-    # SAC uses critic_{i}_hidden_{j}/critic_{i}_output structure
-    full_critic_params = {}
-    for i, critic_i_state in enumerate(training_state.critic_states):
-        for layer_name, layer_params in critic_i_state.params.items():
-            full_critic_params[f"critic_{i}_{layer_name}"] = layer_params
-    
+
+    full_critic_params = flatten_sac_critic_params(training_state.critic_states)
+
     (actor_loss_val, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
         training_state.actor_state.params,
         full_critic_params,
@@ -302,9 +390,12 @@ def update_actor_sac(config: Dict[str, Any], networks: Dict[str, Any],
 
 def update_critic_sac(config: Dict[str, Any], networks: Dict[str, Any],
                       transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
-    """SAC critic update with support for multiple critics.
-    
-    Each critic is updated separately with its own TrainState, preserving optimizer state.
+    """SAC critic update for an ensemble of critics.
+
+    All critics are updated through a single ``critic.apply`` forward pass and
+    one ``value_and_grad`` over the per-critic params tuple, so the cost scales
+    O(n_critics) instead of the previous O(n_critics^2). Each critic still
+    keeps its own TrainState/optimizer state.
     """
     obs = transitions.observation
     next_obs = transitions.next_observation
@@ -314,15 +405,14 @@ def update_critic_sac(config: Dict[str, Any], networks: Dict[str, Any],
 
     critic = networks["critic"]
     n_critics = critic.n_critics
-    
+
     # Use OLD alpha value (before alpha update) - matching original SAC
     alpha = jnp.exp(training_state.alpha_state.params["log_alpha"]) if training_state.alpha_state else 0.0
-    
-    # target_critic_params is always set for SAC (initialized in baseline.py)
-    # It already has the full structure with critic_{i}_{layer_name} keys, so use it directly
+
+    # target_critic_params already has the full critic_{i}_{layer} layout.
     target_q_params = training_state.target_critic_params
-    
-    # Use actor API for next actions (shared across all critics)
+
+    # Sample next actions (shared across critics).
     actor = networks["actor"]
     next_means, next_log_stds = actor.apply(training_state.actor_state.params, next_obs)
     next_stds = jnp.exp(next_log_stds)
@@ -333,87 +423,44 @@ def update_critic_sac(config: Dict[str, Any], networks: Dict[str, Any],
     next_log_prob -= jnp.log((1 - jnp.square(next_actions)) + 1e-6)
     next_log_prob = next_log_prob.sum(-1, keepdims=True)
 
-    # Use critic API for target Q-values (min over all critics, or mean if flag set)
     target_q_values = critic.apply(target_q_params, next_obs, next_actions)
     if config.get("use_sac_critic_mean", False):
         target_q_value = jnp.mean(target_q_values, axis=-1, keepdims=True)
     else:
-        target_q_value = jnp.min(target_q_values, axis=-1, keepdims=True)  # (batch_size, 1)
+        target_q_value = jnp.min(target_q_values, axis=-1, keepdims=True)
     target = rewards[:, None] + config["discounting"] * discounts[:, None] * (
         target_q_value - alpha * next_log_prob
-    )  # target shape: (batch_size, 1)
-    
-    # Reconstruct full current critic params for computing Q-values
-    full_current_critic_params = {}
-    for i, critic_i_state in enumerate(training_state.critic_states):
-        for layer_name, layer_params in critic_i_state.params.items():
-            full_current_critic_params[f"critic_{i}_{layer_name}"] = layer_params
-    
-    # Update each critic separately using its own TrainState
-    new_critic_states = []
-    critic_losses = []
-    
-    for i in range(n_critics):
-        # Get current critic state and params
-        critic_i_state = training_state.critic_states[i]
-        critic_i_params = critic_i_state.params
-        
-        # Get other critics' params as a dict (for reconstructing full params structure)
-        # Use stop_gradient to prevent gradients from flowing to other critics
-        other_critics_params_dict = {}
-        for j in range(n_critics):
-            if j != i:
-                for layer_name, layer_params in training_state.critic_states[j].params.items():
-                    other_critics_params_dict[f"critic_{j}_{layer_name}"] = jax.lax.stop_gradient(layer_params)
-        
-        # Loss function for this specific critic
-        # Pass critic_idx as a parameter to avoid closure issues with JAX
-        def single_critic_loss(critic_i_params, other_params_dict, critic_idx, target_val, transitions, key):
-            # Reconstruct full params with this critic's params and other critics' params
-            full_params = {}
-            # Add this critic's params
-            for layer_name, layer_params in critic_i_params.items():
-                full_params[f"critic_{critic_idx}_{layer_name}"] = layer_params
-            # Add other critics' params (already stop_gradient'd)
-            full_params.update(other_params_dict)
-            
-            # Use critic API for current Q-value for this critic only
-            # critic.apply() expects inner dict and will wrap it internally
-            q_values = critic.apply(full_params, obs, actions)  # Shape: (batch_size, n_critics)
-            q_value = q_values[:, critic_idx:critic_idx+1]  # Shape: (batch_size, 1) - only this critic's Q-value
-            
-            # Bellman error for this critic
-            sample_weights = config.get("sample_weights", None)
-            if sample_weights is None:
-                critic_loss = jnp.mean((q_value - target_val) ** 2)
-            else:
-                w = sample_weights[:, None]
-                critic_loss = jnp.sum(w * (q_value - target_val) ** 2) / (jnp.sum(w) + 1e-8)
-            return critic_loss
+    )  # (batch_size, 1)
 
-        # Compute loss and gradient for this critic
-        loss, grad = jax.value_and_grad(single_critic_loss)(
-            critic_i_params,
-            other_critics_params_dict,
-            i,  # Pass i as a parameter
-            target,
-            transitions,
-            key,
-        )
-        
-        # Apply gradients using this critic's TrainState (preserves optimizer state automatically)
-        new_critic_i_state = critic_i_state.apply_gradients(grads=grad)
-        new_critic_states.append(new_critic_i_state)
-        
-        # Store metrics
-        critic_losses.append(loss)
-    
-    # Update training state with all updated critic states
-    training_state = training_state.replace(critic_states=tuple(new_critic_states))
+    sample_weights = config.get("sample_weights", None)
+    weight_vec = None if sample_weights is None else sample_weights[:, None]
 
-    # Average metrics for logging
-    metrics = {
-        "critic_loss": jnp.mean(jnp.array(critic_losses)),
-    }
+    # Tuple of per-critic params; gradient flows to each through the
+    # corresponding column of the stacked Q output.
+    critic_params_tuple = tuple(cs.params for cs in training_state.critic_states)
 
-    return training_state, metrics
+    def all_critics_loss(params_tuple):
+        full_params = {
+            f"critic_{i}_{lname}": lparams
+            for i, p in enumerate(params_tuple)
+            for lname, lparams in p.items()
+        }
+        q_values = critic.apply(full_params, obs, actions)  # (batch_size, n_critics)
+        sq_err = (q_values - target) ** 2  # broadcast target across critics
+        if weight_vec is None:
+            per_critic_loss = jnp.mean(sq_err, axis=0)  # (n_critics,)
+        else:
+            per_critic_loss = jnp.sum(weight_vec * sq_err, axis=0) / (jnp.sum(weight_vec) + 1e-8)
+        return jnp.sum(per_critic_loss), per_critic_loss
+
+    (_, per_critic_loss), grads_tuple = jax.value_and_grad(all_critics_loss, has_aux=True)(
+        critic_params_tuple
+    )
+
+    new_critic_states = tuple(
+        cs.apply_gradients(grads=g)
+        for cs, g in zip(training_state.critic_states, grads_tuple)
+    )
+    training_state = training_state.replace(critic_states=new_critic_states)
+
+    return training_state, {"critic_loss": jnp.mean(per_critic_loss)}

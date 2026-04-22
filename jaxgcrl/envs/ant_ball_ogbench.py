@@ -264,12 +264,12 @@ class AntBallOGBench(PipelineEnv):
             n_frames = 20
 
         if backend == "mjx":
+            # Keep Newton solver (MuJoCo default) to match OGBench; use MuJoCo
+            # default iterations/ls_iterations from the XML so the contact solve
+            # is as tight as OGBench's stock MuJoCo run.
             sys = sys.tree_replace(
                 {
                     "opt.solver": mujoco.mjtSolver.mjSOL_NEWTON,
-                    "opt.disableflags": mujoco.mjtDisableBit.mjDSBL_EULERDAMP,
-                    "opt.iterations": 1,
-                    "opt.ls_iterations": 4,
                 }
             )
 

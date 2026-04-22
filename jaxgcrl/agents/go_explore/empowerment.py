@@ -69,41 +69,23 @@ def build_empowerment_base_obs_template(
 ) -> np.ndarray:
     """One full OGBench-shaped template vector for offline empowerment scoring.
 
-    Detects env family from ``jax_env``:
+    Ball envs (``AntBallOGBench``, ``AntBall``, ``AntBallMaze``) use the fixed
+    head ``ant_xy=(0,0)``, ``ball_xy=(5,0)`` — matching ``EmpowermentSAC`` — so
+    the non-xy slots of the template (velocities, quaternions) are reproducible
+    across runs and independent of ``template_rng``. ``AntMaze`` has no ball;
+    its template is still seeded from one jax ``reset`` since there is no
+    corresponding fixed-head convention.
 
-    - ``AntMaze``: one jax ``reset``, use jax ``obs`` resized to ``ex_obs_dim`` (no ball; same idea as
-      ``plot_empowerment_ant_maze._build_heads``).
-    - ``AntBall`` / ``AntBallMaze``: one jax ``reset``, then OGBench ``get_ob`` after internal
-      ``set_agent_ball_xy`` when present (same idea as ``plot_empowerment_ant_soccer``).
-
-    Candidate-state positions are **not** baked in here; ``make_empowerment_obs_builder`` overwrites
-    the slots returned by ``infer_empowerment_override_indices_from_env``.
+    Candidate-state positions are **not** baked in here; ``make_empowerment_obs_builder``
+    overwrites the slots returned by ``infer_empowerment_override_indices_from_env``.
     """
-    if isinstance(jax_env, AntBallOGBench):
-        # OGBench-compatible layout: state[:42] already matches OGBench obs.
-        # Use state[0:2] for ant xy, state[15:17] for ball xy.
-        state = jax_env.reset(template_rng)
-        obs = np.asarray(state.obs, dtype=np.float64)
-        head_ant_xy = (float(obs[0]), float(obs[1]))
-        head_ball_xy = (float(obs[15]), float(obs[16]))
+    if isinstance(jax_env, (AntBallOGBench,) + _BALL_SOCCER_ENV_TYPES):
         return build_ogbench_empowerment_obs_template(
             ogbench_env,
             base_env,
             ex_obs_dim,
-            head_ant_xy=head_ant_xy,
-            head_ball_xy=head_ball_xy,
-        )
-    if isinstance(jax_env, _BALL_SOCCER_ENV_TYPES):
-        state = jax_env.reset(template_rng)
-        obs = np.asarray(state.obs, dtype=np.float64)
-        head_ant_xy = (float(obs[0]), float(obs[1]))
-        head_ball_xy = (float(obs[-4]), float(obs[-3]))
-        return build_ogbench_empowerment_obs_template(
-            ogbench_env,
-            base_env,
-            ex_obs_dim,
-            head_ant_xy=head_ant_xy,
-            head_ball_xy=head_ball_xy,
+            head_ant_xy=(0.0, 0.0),
+            head_ball_xy=(5.0, 0.0),
         )
     if isinstance(jax_env, AntMaze):
         state = jax_env.reset(template_rng)

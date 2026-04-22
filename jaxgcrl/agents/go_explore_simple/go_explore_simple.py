@@ -35,15 +35,25 @@ from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 from jaxgcrl.agents.go_explore.visualization import handle_goal_proposer_visualization
 
 from jaxgcrl.agents.go_explore.types import TrainingState, Transition, GoalProposerState
-from jaxgcrl.agents.go_explore.algorithms import get_algorithm
+from jaxgcrl.agents.go_explore.algorithms import get_algorithm, get_exploration_q_critic
 from jaxgcrl.agents.go_explore.utils import (
     save_params,
     create_single_dummy_transition,
     create_dummy_transition_for_buffer,
     create_dummy_transition_for_goal_proposer,
 )
-from jaxgcrl.agents.go_explore.losses import update_alpha_sac
-from jaxgcrl.agents.go_explore.visualization import all_visualizations, visualize_go_explore_phases
+from jaxgcrl.agents.go_explore.losses import (
+    flatten_crl_critic_params,
+    flatten_sac_critic_params,
+    soft_update_target_params,
+    update_alpha_sac,
+    update_exploration_q_critic,
+)
+from jaxgcrl.agents.go_explore.visualization import (
+    all_visualizations,
+    visualize_exploration_q_xy,
+    visualize_go_explore_phases,
+)
 from jaxgcrl.agents.go_explore.goal_proposers import (
     create_goal_proposer,
     create_random_env_goals_proposer,
@@ -66,15 +76,25 @@ except Exception:  # pragma: no cover
     _wandb = None
 
 
-def _log_reward_heatmap(
-    reward_viz,
-    x_bounds,
-    y_bounds,
-    current_step: int,
-):
+def _scatter_panel(ax, fig, xs, ys, values, title, xlabel, ylabel, cbar_label,
+                   x_bounds=None, y_bounds=None):
+    """One scatter + colorbar panel; shared body for the reward/bonus heatmaps."""
+    sc = ax.scatter(xs, ys, c=values, cmap="viridis", s=6, linewidths=0)
+    if x_bounds is not None:
+        ax.set_xlim(float(x_bounds[0]), float(x_bounds[1]))
+    if y_bounds is not None:
+        ax.set_ylim(float(y_bounds[0]), float(y_bounds[1]))
+    ax.set_aspect("equal")
+    fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label=cbar_label)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+
+
+def _log_reward_heatmap(reward_viz, x_bounds, y_bounds, current_step: int):
     """Log scatters of raw (ant x, ant y) transition samples colored by their
     post-bonus reward and (if present) the scaled exploration bonus alone.
-    ``reward_viz`` is the ``(xs, ys, rewards, scaled_bonus)`` snapshot taken
+    ``reward_viz`` is the ``(xs, ys, rewards, scaled_bonus, ...)`` snapshot taken
     inside ``training_step`` right after the exploration bonus is added."""
     if _plt is None or _wandb is None:
         return
@@ -83,27 +103,17 @@ def _log_reward_heatmap(
     ys = np.asarray(reward_viz[1]).reshape(-1)
     rs = np.asarray(reward_viz[2]).reshape(-1)
     bonus = np.asarray(reward_viz[3]).reshape(-1) if len(reward_viz) > 3 else None
-
-    x_low, x_high = float(x_bounds[0]), float(x_bounds[1])
-    y_low, y_high = float(y_bounds[0]), float(y_bounds[1])
-
     has_bonus = bonus is not None and np.any(bonus != 0)
+
     ncols = 2 if has_bonus else 1
     fig, axes = _plt.subplots(1, ncols, figsize=(5 * ncols, 5), squeeze=False)
-
-    def _draw(ax, values, label):
-        sc = ax.scatter(xs, ys, c=values, cmap="viridis", s=6, linewidths=0)
-        ax.set_xlim(x_low, x_high)
-        ax.set_ylim(y_low, y_high)
-        ax.set_aspect("equal")
-        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label=label)
-        ax.set_xlabel("Ant x")
-        ax.set_ylabel("Ant y")
-        ax.set_title(label)
-
-    _draw(axes[0, 0], rs, "reward (post-bonus)")
+    _scatter_panel(axes[0, 0], fig, xs, ys, rs,
+                   "reward (post-bonus)", "Ant x", "Ant y",
+                   "reward (post-bonus)", x_bounds, y_bounds)
     if has_bonus:
-        _draw(axes[0, 1], bonus, "scaled exploration bonus")
+        _scatter_panel(axes[0, 1], fig, xs, ys, bonus,
+                       "scaled exploration bonus", "Ant x", "Ant y",
+                       "scaled exploration bonus", x_bounds, y_bounds)
 
     fig.suptitle(f"step={current_step}")
     fig.tight_layout()
@@ -111,18 +121,14 @@ def _log_reward_heatmap(
     _plt.close(fig)
 
 
-def _log_trajectory_reward(
-    reward_viz,
-    current_step: int,
-):
+def _log_trajectory_reward(reward_viz, current_step: int):
     """Plot the post-override reward for a single training batch.
 
-    Uses ``reward_viz[2]`` — this is ``transitions.reward`` after the
-    ``reward=total_bonus`` replace inside ``training_step``, i.e. the exact
-    values the critic trains on. No recomputation here; the values come
-    straight from the training-step snapshot passed in as ``reward_viz``.
-    Note: the batch is the post-HER, post-permute shuffle, so the x axis
-    is sample index within the batch, not chronological time."""
+    ``reward_viz[2]`` is ``transitions.reward`` after the ``reward=total_bonus``
+    replace inside ``training_step`` — the exact values the critic trains on.
+    Batch is post-HER and post-permute, so the x axis is sample index within
+    the batch, not chronological time.
+    """
     if _plt is None or _wandb is None:
         return
 
@@ -138,16 +144,10 @@ def _log_trajectory_reward(
     _plt.close(fig)
 
 
-def _log_exploration_bonus_goal_heatmap(
-    reward_viz,
-    goal_indices,
-    current_step: int,
-):
+def _log_exploration_bonus_goal_heatmap(reward_viz, goal_indices, current_step: int):
     """Scatter the total exploration bonus (no env reward) over the first-two
     and last-two ``goal_indices`` columns of the sampled states. ``reward_viz``
-    must carry ``(..., goal_feat)`` at index 4, where ``goal_feat`` is
-    ``transitions.observation[..., goal_indices]``; the scatter is taken
-    from the final training step in an epoch."""
+    must carry ``(..., goal_feat)`` at index 4."""
     if _plt is None or _wandb is None:
         return
     if len(reward_viz) < 5 or len(goal_indices) < 2:
@@ -156,30 +156,18 @@ def _log_exploration_bonus_goal_heatmap(
     bonus = np.asarray(reward_viz[3]).reshape(-1)
     goal_feat = np.asarray(reward_viz[4]).reshape(-1, len(goal_indices))
 
-    first_x = goal_feat[:, 0]
-    first_y = goal_feat[:, 1]
-    last_x = goal_feat[:, -2]
-    last_y = goal_feat[:, -1]
-
     fig, axes = _plt.subplots(1, 2, figsize=(10, 5))
-
-    def _draw(ax, xs, ys, title, xlabel, ylabel):
-        sc = ax.scatter(xs, ys, c=bonus, cmap="viridis", s=6, linewidths=0)
-        ax.set_aspect("equal")
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label="exploration bonus")
-
-    _draw(
-        axes[0], first_x, first_y,
+    _scatter_panel(
+        axes[0], fig, goal_feat[:, 0], goal_feat[:, 1], bonus,
         "bonus vs first two goal idx",
         f"obs[{goal_indices[0]}]", f"obs[{goal_indices[1]}]",
+        "exploration bonus",
     )
-    _draw(
-        axes[1], last_x, last_y,
+    _scatter_panel(
+        axes[1], fig, goal_feat[:, -2], goal_feat[:, -1], bonus,
         "bonus vs last two goal idx",
         f"obs[{goal_indices[-2]}]", f"obs[{goal_indices[-1]}]",
+        "exploration bonus",
     )
 
     fig.suptitle(f"step={current_step}")
@@ -297,6 +285,7 @@ class GoExploreSimple:
         state_size  = train_env.state_dim
         goal_size   = len(train_env.goal_indices)
         obs_size    = state_size + goal_size
+        goal_indices_tuple = tuple(int(i) for i in np.asarray(train_env.goal_indices))
 
         # ── Eval env ──────────────────────────────────────────────────────────
         eval_env = TrajectoryIdWrapper(eval_env)
@@ -377,6 +366,35 @@ class GoExploreSimple:
         if self.agent_type == "sac":
             target_critic_params = gcp_critic_params
 
+        # ── Exploration Q-critic (CRL only, when exploration bonuses are set).
+        # Trained on the raw (unweighted, but globally shifted/rescaled) bonus
+        # via SAC Bellman backups; its Q is added to the CRL actor loss scaled
+        # by sum(exploration_bonus_weight).
+        exploration_q_critic = None
+        exploration_q_critic_states = None
+        exploration_q_target_critic_params = None
+        use_exploration_q_critic = (
+            self.agent_type == "crl" and self.exploration_bonus_type is not None
+        )
+        if use_exploration_q_critic:
+            key, exp_q_critic_key = jax.random.split(key)
+            exploration_q_critic = get_exploration_q_critic(
+                obs_size=obs_size,
+                action_size=action_size,
+                h_dim=self.h_dim,
+                n_hidden=self.n_hidden,
+                use_relu=self.use_relu,
+                use_ln=self.use_ln,
+                n_critics=self.n_critics,
+            )
+            exploration_q_critic_params = exploration_q_critic.init(
+                exp_q_critic_key, np.ones([1, obs_size])
+            )
+            exploration_q_critic_states = exploration_q_critic.create_critic_states(
+                exploration_q_critic_params, self.critic_lr
+            )
+            exploration_q_target_critic_params = exploration_q_critic_params
+
         # ── TrainingState ─────────────────────────────────────────────────────
         training_state = TrainingState(
             env_steps=jnp.zeros(()),
@@ -386,6 +404,8 @@ class GoExploreSimple:
             critic_states=gcp_critic_states,
             alpha_state=alpha_state,
             target_critic_params=target_critic_params,
+            exploration_q_critic_states=exploration_q_critic_states,
+            exploration_q_target_critic_params=exploration_q_target_critic_params,
         )
 
         # ── Optional offline-empowerment scorer for goal proposer ───────────
@@ -512,6 +532,8 @@ class GoExploreSimple:
         # ── Exploration bonus(es) ─────────────────────────────────────────────
         from jaxgcrl.agents.go_explore.exploration import create_exploration_bonuses
         key, bonus_init_key = jax.random.split(key)
+        # Reuse the goal-proposer's empowerment scorer if it's already loaded —
+        # config exposes only one set of empowerment_* knobs, so they're identical.
         exploration_bonuses = create_exploration_bonuses(
             self.exploration_bonus_type,
             self.exploration_bonus_weight,
@@ -524,6 +546,7 @@ class GoExploreSimple:
             empowerment_score_chunk_size=self.empowerment_score_chunk_size,
             empowerment_mean=self.empowerment_bonus_mean,
             empowerment_scale=self.empowerment_bonus_scale,
+            empowerment_precomputed_scorer=offline_empowerment_scorer,
             rnd_feature_dim=self.rnd_feature_dim,
             rnd_hidden_dim=self.rnd_hidden_dim,
             rnd_num_hidden=self.rnd_num_hidden,
@@ -552,29 +575,30 @@ class GoExploreSimple:
             # GCP always sees [state, go_goal] in both phases
             gcp_obs = jnp.concatenate([raw_state, go_goal], axis=-1)
 
-            # Go phase: deterministic if flag set, else stochastic
-            # Explore phase: always stochastic (sample from policy)
-            in_go = (phase == 0)  # (num_envs,)
-            is_deterministic = jnp.where(in_go, deterministic_go, False)
-
-            # Sample policy actions (per-env deterministic flag handled inside)
-            # We compute both deterministic and stochastic, then select per-env
-            det_actions = gcp_actor.sample_actions(
-                training_state.actor_state.params, gcp_obs, action_key, is_deterministic=True
-            )
+            # Stochastic everywhere by default; only branch when go phase is deterministic.
             stoch_actions = gcp_actor.sample_actions(
                 training_state.actor_state.params, gcp_obs, action_key, is_deterministic=False
             )
-            policy_actions = jnp.where(is_deterministic[:, None], det_actions, stoch_actions)
+            if deterministic_go:
+                det_actions = gcp_actor.sample_actions(
+                    training_state.actor_state.params, gcp_obs, action_key, is_deterministic=True
+                )
+                in_go = (phase == 0)
+                policy_actions = jnp.where(in_go[:, None], det_actions, stoch_actions)
+            else:
+                policy_actions = stoch_actions
 
-            # Explore phase: with probability eps_random_action, use uniform random action
-            in_explore = (phase == 1)  # (num_envs,)
-            random_actions = jax.random.uniform(
-                random_key, shape=policy_actions.shape, minval=-1.0, maxval=1.0
-            )
-            use_random = jax.random.uniform(eps_key, shape=(policy_actions.shape[0],)) < eps_random
-            use_random = jnp.logical_and(in_explore, use_random)
-            actions = jnp.where(use_random[:, None], random_actions, policy_actions)
+            # Explore phase: with probability eps_random_action, use uniform random action.
+            if eps_random > 0.0:
+                in_explore = (phase == 1)
+                random_actions = jax.random.uniform(
+                    random_key, shape=policy_actions.shape, minval=-1.0, maxval=1.0
+                )
+                use_random = jax.random.uniform(eps_key, shape=(policy_actions.shape[0],)) < eps_random
+                use_random = jnp.logical_and(in_explore, use_random)
+                actions = jnp.where(use_random[:, None], random_actions, policy_actions)
+            else:
+                actions = policy_actions
 
             nstate = env.step(env_state, actions, env_rng)
             state_extras = {x: nstate.info[x] for x in extra_fields}
@@ -597,14 +621,6 @@ class GoExploreSimple:
         # ── get_experience ────────────────────────────────────────────────────
         def get_experience(training_state, env_state, buffer_state, key,
                            experience_count, goal_proposer_state):
-            buffer_state, transitions_sample = replay_buffer.sample(buffer_state)
-
-            goal_proposer_state = goal_proposer_state.replace(
-                transitions_sample=transitions_sample,
-                actor_params=training_state.actor_state.params,
-                critic_params={i: cs.params for i, cs in enumerate(training_state.critic_states)},
-            )
-
             num_envs_     = config.num_envs
             episode_length = config.episode_length
             info           = dict(env_state.info)
@@ -612,7 +628,16 @@ class GoExploreSimple:
             reset_threshold    = jnp.array(episode_length // (self.unroll_length * 2), dtype=jnp.int32)
             new_experience_count = experience_count + 1
 
-            def propose_new_goals(env_state, key, info, experience_count, goal_proposer_state):
+            def propose_new_goals(env_state, key, info, buffer_state, goal_proposer_state):
+                # Sample + refresh proposer state only when we actually propose:
+                # both buffer.sample and the params snapshot are unused otherwise.
+                buffer_state, transitions_sample = replay_buffer.sample(buffer_state)
+                goal_proposer_state = goal_proposer_state.replace(
+                    transitions_sample=transitions_sample,
+                    actor_params=training_state.actor_state.params,
+                    critic_params={i: cs.params for i, cs in enumerate(training_state.critic_states)},
+                )
+
                 viz_key, goal_key = jax.random.split(key)
                 viz_env_idx = jax.random.randint(viz_key, (), 0, num_envs_)
                 goal_keys   = jax.random.split(goal_key, num_envs_)
@@ -641,18 +666,21 @@ class GoExploreSimple:
                     log_viz, jnp.array(0, dtype=jnp.int32),
                     log_data_tree, viz_env_idx, env_steps
                 )
-                return env_state, info, jnp.array(0, dtype=jnp.int32), goal_proposer_state
+                return env_state, info, jnp.array(0, dtype=jnp.int32), buffer_state, goal_proposer_state
 
-            def keep_existing_goals(env_state, key, info, new_experience_count, goal_proposer_state):
-                return env_state, info, new_experience_count, goal_proposer_state
+            def keep_existing_goals(env_state, key, info, buffer_state, goal_proposer_state):
+                return env_state, info, new_experience_count, buffer_state, goal_proposer_state
 
             # Split key so proposal and rollout use independent randomness.
             _, propose_key, rollout_key = jax.random.split(key, 3)
-            env_state, info, updated_experience_count, updated_goal_proposer_state = jax.lax.cond(
+            (
+                env_state, info, updated_experience_count,
+                buffer_state, updated_goal_proposer_state,
+            ) = jax.lax.cond(
                 new_experience_count >= reset_threshold,
                 propose_new_goals,
                 keep_existing_goals,
-                env_state, propose_key, info, new_experience_count, goal_proposer_state,
+                env_state, propose_key, info, buffer_state, goal_proposer_state,
             )
             env_state = env_state.replace(info=info)
 
@@ -697,49 +725,71 @@ class GoExploreSimple:
             )[0]
 
         # ── update_networks (GCP only) ────────────────────────────────────────
+        # For CRL+exploration: also train an extra SAC-style Q critic on the
+        # raw (unweighted, but globally shifted/rescaled) exploration bonus,
+        # and add -exploration_critic_weight * Q_exp to the CRL actor loss.
+        exploration_critic_weight = (
+            float(sum(self.exploration_bonus_weight))
+            if use_exploration_q_critic
+            else 0.0
+        )
+
         @jax.jit
-        def update_networks(carry, transitions):
+        def update_networks(carry, xs):
+            transitions, exploration_reward = xs
             training_state, key = carry
-            if self.agent_type == "sac":
-                key, alpha_key, critic_key, actor_key = jax.random.split(key, 4)
-            else:
-                key, critic_key, actor_key = jax.random.split(key, 3)
+            needs_exp_q = use_exploration_q_critic
+            n_splits = 3 + int(self.agent_type == "sac") + int(needs_exp_q)
+            keys = jax.random.split(key, n_splits)
+            key, sub_keys = keys[0], iter(keys[1:])
 
             context = dict(
-                **vars(self),
-                **vars(config),
-                state_size=state_size,
-                action_size=action_size,
-                goal_size=goal_size,
-                obs_size=obs_size,
-                goal_indices=train_env.goal_indices,
+                **vars(self), **vars(config),
+                state_size=state_size, action_size=action_size, goal_size=goal_size,
+                obs_size=obs_size, goal_indices=train_env.goal_indices,
                 target_entropy=target_entropy,
+                exploration_critic_weight=exploration_critic_weight,
             )
             networks = dict(actor=gcp_actor, critic=gcp_critic)
+            if needs_exp_q:
+                networks["exploration_q_critic"] = exploration_q_critic
 
             metrics = {}
             if self.agent_type == "crl":
-                training_state, actor_metrics  = gcp_actor.update(context, networks, transitions, training_state, actor_key)
-                training_state, critic_metrics = gcp_critic.update(context, networks, transitions, training_state, critic_key)
+                if needs_exp_q:
+                    exp_transitions = transitions._replace(reward=exploration_reward)
+                    training_state, m = update_exploration_q_critic(
+                        context, networks, exp_transitions, training_state, next(sub_keys),
+                    )
+                    metrics.update(m)
+                training_state, m = gcp_actor.update(context, networks, transitions, training_state, next(sub_keys))
+                metrics.update(m)
+                training_state, m = gcp_critic.update(context, networks, transitions, training_state, next(sub_keys))
+                metrics.update(m)
             else:  # sac
-                training_state, alpha_metrics  = update_alpha_sac(context, networks, transitions, training_state, alpha_key)
-                training_state, critic_metrics = gcp_critic.update(context, networks, transitions, training_state, critic_key)
-                training_state, actor_metrics  = gcp_actor.update(context, networks, transitions, training_state, actor_key)
-                metrics.update(alpha_metrics)
-            metrics.update(critic_metrics)
-            metrics.update(actor_metrics)
+                training_state, m = update_alpha_sac(context, networks, transitions, training_state, next(sub_keys))
+                metrics.update(m)
+                training_state, m = gcp_critic.update(context, networks, transitions, training_state, next(sub_keys))
+                metrics.update(m)
+                training_state, m = gcp_actor.update(context, networks, transitions, training_state, next(sub_keys))
+                metrics.update(m)
 
-            # Update SAC target network
             if self.agent_type == "sac" and training_state.target_critic_params is not None:
-                full_cp = {}
-                for i, cs in enumerate(training_state.critic_states):
-                    for lname, lparams in cs.params.items():
-                        full_cp[f"critic_{i}_{lname}"] = lparams
-                new_target = jax.tree_util.tree_map(
-                    lambda x, y: x * (1 - self.tau) + y * self.tau,
-                    training_state.target_critic_params, full_cp,
+                training_state = training_state.replace(
+                    target_critic_params=soft_update_target_params(
+                        training_state.target_critic_params,
+                        training_state.critic_states,
+                        self.tau,
+                    ),
                 )
-                training_state = training_state.replace(target_critic_params=new_target)
+            if needs_exp_q:
+                training_state = training_state.replace(
+                    exploration_q_target_critic_params=soft_update_target_params(
+                        training_state.exploration_q_target_critic_params,
+                        training_state.exploration_q_critic_states,
+                        self.tau,
+                    ),
+                )
 
             training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
             return (training_state, key), metrics
@@ -777,7 +827,7 @@ class GoExploreSimple:
 
             transitions, _ = gcp_actor.process_transitions(
                 transitions, process_key, self.batch_size, self.discounting,
-                state_size, tuple(train_env.goal_indices),
+                state_size, goal_indices_tuple,
                 train_env.goal_reach_thresh, self.use_her,
                 p_future_her_goal=self.p_future_her_goal,
             )
@@ -792,17 +842,23 @@ class GoExploreSimple:
                     lambda x: x[:num_batches], transitions
                 )
 
-            # Exploration bonus is summed across all configured bonuses and
-            # added to the post-HER, post-RLPD reward so it shapes both the
-            # online and (mixed-in) offline transitions that flow into the
-            # GCP update below.
+            # Exploration bonus is summed across all configured bonuses. For
+            # SAC we add the weighted total to the post-HER reward so it shapes
+            # the critic/actor via Q; for CRL we instead train a separate Q_exp
+            # on the *raw* (unweighted) per-transition bonus and add
+            # -weight * Q_exp to the CRL actor loss (see update_networks).
             bonus_key, train_key = jax.random.split(train_key)
-            total_bonus, exploration_bonus_state, bonus_metrics = exploration_bonuses.compute(
-                exploration_bonus_state, transitions, bonus_key
+            total_bonus, raw_total_bonus, exploration_bonus_state, bonus_metrics = (
+                exploration_bonuses.compute(exploration_bonus_state, transitions, bonus_key)
             )
-            transitions = transitions._replace(
-                reward=transitions.reward + total_bonus
-            )
+            if self.agent_type == "sac":
+                transitions = transitions._replace(
+                    reward=transitions.reward + total_bonus
+                )
+                exploration_reward_per_batch = jnp.zeros_like(transitions.reward)
+            else:
+                # CRL: leave env reward untouched; feed raw bonus to Q_exp.
+                exploration_reward_per_batch = raw_total_bonus
 
             reward_viz = (
                 transitions.observation[..., 0],
@@ -813,17 +869,56 @@ class GoExploreSimple:
             )
 
             (training_state, _), metrics = jax.lax.scan(
-                update_networks, (training_state, train_key), transitions
+                update_networks,
+                (training_state, train_key),
+                (transitions, exploration_reward_per_batch),
             )
             metrics.update(bonus_metrics)
             metrics["reward_mean"] = jnp.mean(transitions.reward)
 
+            # Snapshot Q_exp(obs, action) on the final batch of the scan so the
+            # training loop can log an xy scatter of the exploration Q values.
+            if use_exploration_q_critic:
+                last_batch = jax.tree_util.tree_map(lambda x: x[-1], transitions)
+                last_obs = last_batch.observation
+                last_action = last_batch.action
+                exp_q_vals = exploration_q_critic.apply(
+                    flatten_sac_critic_params(training_state.exploration_q_critic_states),
+                    last_obs, last_action,
+                )
+                exp_q_viz = (
+                    last_obs[..., goal_indices_arr[0]],
+                    last_obs[..., goal_indices_arr[1]],
+                    jnp.min(exp_q_vals, axis=-1),
+                )
+            else:
+                zero = jnp.zeros_like(transitions.reward[-1])
+                exp_q_viz = (zero, zero, zero)
+
             return (
-                (training_state, env_state, buffer_state, updated_gps, exploration_bonus_state),
-                (metrics, reward_viz),
-            )
+                training_state, env_state, buffer_state,
+                updated_gps, exploration_bonus_state,
+                reward_viz, exp_q_viz,
+            ), metrics
 
         # ── training_epoch ────────────────────────────────────────────────────
+        # Viz carries are sized once here so we don't pay the per-step memory
+        # cost of stacking them as scan outputs; only the final step's values
+        # survive the scan and feed the once-per-epoch visualization.
+        viz_num_batches = config.num_envs * (config.episode_length - 1) // self.batch_size
+        init_reward_viz = (
+            jnp.zeros((viz_num_batches, self.batch_size), dtype=jnp.float32),
+            jnp.zeros((viz_num_batches, self.batch_size), dtype=jnp.float32),
+            jnp.zeros((viz_num_batches, self.batch_size), dtype=jnp.float32),
+            jnp.zeros((viz_num_batches, self.batch_size), dtype=jnp.float32),
+            jnp.zeros((viz_num_batches, self.batch_size, len(goal_indices_arr)), dtype=jnp.float32),
+        )
+        init_exp_q_viz = (
+            jnp.zeros((self.batch_size,), dtype=jnp.float32),
+            jnp.zeros((self.batch_size,), dtype=jnp.float32),
+            jnp.zeros((self.batch_size,), dtype=jnp.float32),
+        )
+
         @jax.jit
         def training_epoch(
             training_state, env_state, buffer_state, key,
@@ -837,27 +932,26 @@ class GoExploreSimple:
 
             @jax.jit
             def f(carry, _):
-                ts, es, bs, k, gps, ebs = carry
+                ts, es, bs, k, gps, ebs, _rv, _qv = carry
                 k, train_key = jax.random.split(k)
-                (ts, es, bs, gps, ebs), (metrics, reward_viz) = training_step(
+                (ts, es, bs, gps, ebs, reward_viz, exp_q_viz), metrics = training_step(
                     ts, es, bs, train_key, gps, ebs
                 )
-                return (ts, es, bs, k, gps, ebs), (metrics, reward_viz)
+                return (ts, es, bs, k, gps, ebs, reward_viz, exp_q_viz), metrics
 
             (
                 (training_state, env_state, buffer_state, key,
-                 goal_proposer_state, exploration_bonus_state),
-                (metrics, reward_viz),
+                 goal_proposer_state, exploration_bonus_state,
+                 last_reward_viz, last_exp_q_viz),
+                metrics,
             ) = jax.lax.scan(
                 f,
                 (training_state, env_state, buffer_state, key,
-                 goal_proposer_state, exploration_bonus_state),
+                 goal_proposer_state, exploration_bonus_state,
+                 init_reward_viz, init_exp_q_viz),
                 (),
                 length=num_training_steps_per_epoch,
             )
-
-            # Keep only the final step's snapshot for visualization.
-            last_reward_viz = jax.tree_util.tree_map(lambda x: x[-1], reward_viz)
 
             # Go Explore phase metrics — epoch-level (current policy performance)
             epoch_completions   = jnp.sum(env_state.info['go_completions_total']) - pre_completions
@@ -879,7 +973,7 @@ class GoExploreSimple:
             return (
                 training_state, env_state, buffer_state,
                 goal_proposer_state, exploration_bonus_state,
-                metrics, last_reward_viz,
+                metrics, last_reward_viz, last_exp_q_viz,
             )
 
         # ── prefill ───────────────────────────────────────────────────────────
@@ -937,7 +1031,7 @@ class GoExploreSimple:
             (
                 training_state, env_state, buffer_state,
                 goal_proposer_state, exploration_bonus_state,
-                metrics, last_reward_viz,
+                metrics, last_reward_viz, last_exp_q_viz,
             ) = training_epoch(
                 training_state, env_state, buffer_state, epoch_key,
                 goal_proposer_state, exploration_bonus_state,
@@ -1006,6 +1100,15 @@ class GoExploreSimple:
                         goal_indices=tuple(unwrapped_env.goal_indices),
                         current_step=current_step,
                     )
+                if use_exploration_q_critic:
+                    visualize_exploration_q_xy(
+                        xs=last_exp_q_viz[0],
+                        ys=last_exp_q_viz[1],
+                        q_values=last_exp_q_viz[2],
+                        x_bounds=unwrapped_env.x_bounds,
+                        y_bounds=unwrapped_env.y_bounds,
+                        current_step=current_step,
+                    )
                 last_visualization_step = current_step
 
             do_render = ne % config.visualization_interval == 0
@@ -1017,13 +1120,10 @@ class GoExploreSimple:
                 )
 
             # Build full GCP critic params for checkpointing
-            full_critic_params = {}
-            for i, cs in enumerate(training_state.critic_states):
-                for lname, lparams in cs.params.items():
-                    if lname in ["sa_encoder", "g_encoder"]:
-                        full_critic_params[f"{lname}_{i}"] = lparams
-                    else:
-                        full_critic_params[f"critic_{i}_{lname}"] = lparams
+            if self.agent_type == "crl":
+                full_critic_params = flatten_crl_critic_params(training_state.critic_states)
+            else:
+                full_critic_params = flatten_sac_critic_params(training_state.critic_states)
 
             params = (
                 training_state.alpha_state.params,
