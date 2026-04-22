@@ -109,14 +109,14 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         # ant and ball must reach the same G cell for default goals.
         layout = env_name[len("ant_ball_4d_ogbench_"):]
         env = AntBallOGBench(
-            backend=backend or "mjx",
+            backend=backend or "spring",
             maze_layout_name=layout,
             add_ant_to_goal=True,
         )
     elif env_name.startswith("ant_ball_ogbench_"):
         # ant_ball_ogbench_arena, ant_ball_ogbench_medium
         layout = env_name[len("ant_ball_ogbench_"):]
-        env = AntBallOGBench(backend=backend or "mjx", maze_layout_name=layout)
+        env = AntBallOGBench(backend=backend or "spring", maze_layout_name=layout)
     elif env_name == "ant_push":
         # This is stable only in mjx backend
         assert backend == "mjx" or backend is None

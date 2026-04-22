@@ -902,23 +902,6 @@ class GoExploreSimple:
             ), metrics
 
         # ── training_epoch ────────────────────────────────────────────────────
-        # Viz carries are sized once here so we don't pay the per-step memory
-        # cost of stacking them as scan outputs; only the final step's values
-        # survive the scan and feed the once-per-epoch visualization.
-        viz_num_batches = config.num_envs * (config.episode_length - 1) // self.batch_size
-        init_reward_viz = (
-            jnp.zeros((viz_num_batches, self.batch_size), dtype=jnp.float32),
-            jnp.zeros((viz_num_batches, self.batch_size), dtype=jnp.float32),
-            jnp.zeros((viz_num_batches, self.batch_size), dtype=jnp.float32),
-            jnp.zeros((viz_num_batches, self.batch_size), dtype=jnp.float32),
-            jnp.zeros((viz_num_batches, self.batch_size, len(goal_indices_arr)), dtype=jnp.float32),
-        )
-        init_exp_q_viz = (
-            jnp.zeros((self.batch_size,), dtype=jnp.float32),
-            jnp.zeros((self.batch_size,), dtype=jnp.float32),
-            jnp.zeros((self.batch_size,), dtype=jnp.float32),
-        )
-
         @jax.jit
         def training_epoch(
             training_state, env_state, buffer_state, key,
@@ -932,26 +915,28 @@ class GoExploreSimple:
 
             @jax.jit
             def f(carry, _):
-                ts, es, bs, k, gps, ebs, _rv, _qv = carry
+                ts, es, bs, k, gps, ebs = carry
                 k, train_key = jax.random.split(k)
                 (ts, es, bs, gps, ebs, reward_viz, exp_q_viz), metrics = training_step(
                     ts, es, bs, train_key, gps, ebs
                 )
-                return (ts, es, bs, k, gps, ebs, reward_viz, exp_q_viz), metrics
+                return (ts, es, bs, k, gps, ebs), (metrics, reward_viz, exp_q_viz)
 
             (
                 (training_state, env_state, buffer_state, key,
-                 goal_proposer_state, exploration_bonus_state,
-                 last_reward_viz, last_exp_q_viz),
-                metrics,
+                 goal_proposer_state, exploration_bonus_state),
+                (metrics, reward_viz, exp_q_viz),
             ) = jax.lax.scan(
                 f,
                 (training_state, env_state, buffer_state, key,
-                 goal_proposer_state, exploration_bonus_state,
-                 init_reward_viz, init_exp_q_viz),
+                 goal_proposer_state, exploration_bonus_state),
                 (),
                 length=num_training_steps_per_epoch,
             )
+
+            # Keep only the final step's snapshots for the once-per-epoch viz.
+            last_reward_viz = jax.tree_util.tree_map(lambda x: x[-1], reward_viz)
+            last_exp_q_viz  = jax.tree_util.tree_map(lambda x: x[-1], exp_q_viz)
 
             # Go Explore phase metrics — epoch-level (current policy performance)
             epoch_completions   = jnp.sum(env_state.info['go_completions_total']) - pre_completions

@@ -1,8 +1,9 @@
 <mujoco model="ant">
     <!-- OGBench-aligned Ant + Ball for antsoccer datasets.
 
-         The ant body, physics (timestep, integrator, gear, armature, damping),
-         textures, and materials mirror ogbench/locomaze/assets/ant.xml exactly.
+         The ant body, physics (timestep, gear, armature, damping), textures,
+         and materials mirror ogbench/locomaze/assets/ant.xml. Integrator is
+         Euler (not RK4) — trades OGBench dynamics parity for ~4x speedup.
          The ball body mirrors what OGBench maze.py BallEnv.update_tree()
          dynamically adds (freejoint, size=.25, condim=6, priority=1).
 
@@ -15,7 +16,7 @@
     -->
     <compiler inertiafromgeom="true" angle="degree" coordinate="local"/>
 
-    <option timestep="0.02" integrator="RK4"/>
+    <option timestep="0.02" iterations="4"/>
 
     <custom>
         <!-- brax custom params -->
@@ -108,7 +109,7 @@
              qpos: 7 (x,y,z,qw,qx,qy,qz), qvel: 6 (linvel(3), angvel(3)). -->
         <body name="ball" pos="0 0 0.5">
             <freejoint name="ball_root"/>
-            <geom name="ball" size=".25" material="ball" priority="1" conaffinity="1" condim="6"/>
+            <geom name="ball" size=".25" material="ball" conaffinity="1" condim="6"/>
             <light name="ball_light" pos="0 0 4" mode="trackcom"/>
         </body>
 

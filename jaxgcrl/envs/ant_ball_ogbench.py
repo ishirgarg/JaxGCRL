@@ -229,7 +229,7 @@ class AntBallOGBench(PipelineEnv):
         contact_force_range=(-1.0, 1.0),
         reset_noise_scale=0.1,
         exclude_current_positions_from_observation=False,
-        backend="mjx",
+        backend="spring",
         maze_layout_name="arena",
         maze_size_scaling=4.0,
         dense_reward: bool = False,
@@ -253,8 +253,8 @@ class AntBallOGBench(PipelineEnv):
         self.y_bounds = tuple(float(v) for v in y_bounds)
 
         # OGBench antsoccer runs mujoco at timestep=0.02 with frame_skip=5
-        # (10 Hz control). The XML already specifies timestep=0.02 + RK4, so
-        # mjx inherits the correct physics directly.
+        # (10 Hz control). The XML specifies timestep=0.02 with Euler (RK4
+        # dropped for speed — diverges slightly from OGBench's dynamics).
         n_frames = 5
 
         if backend in ["spring", "positional"]:
@@ -264,12 +264,12 @@ class AntBallOGBench(PipelineEnv):
             n_frames = 20
 
         if backend == "mjx":
-            # Keep Newton solver (MuJoCo default) to match OGBench; use MuJoCo
-            # default iterations/ls_iterations from the XML so the contact solve
-            # is as tight as OGBench's stock MuJoCo run.
             sys = sys.tree_replace(
                 {
                     "opt.solver": mujoco.mjtSolver.mjSOL_NEWTON,
+                    "opt.disableflags": mujoco.mjtDisableBit.mjDSBL_EULERDAMP,
+                    "opt.iterations": 1,
+                    "opt.ls_iterations": 4,
                 }
             )
 
