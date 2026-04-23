@@ -1,10 +1,10 @@
 <mujoco model="ant_maze_ogbench">
     <!-- OGBench-aligned Ant for antmaze datasets.
 
-         Physics (timestep, integrator, gear, armature, damping) mirror
-         ogbench/locomaze/assets/ant.xml exactly so that (s, a, s') tuples
-         from OGBench antmaze-*-navigate-v0 are consistent with this env
-         when simulated under brax mjx.
+         Physics (timestep, gear, armature, damping) mirror
+         ogbench/locomaze/assets/ant.xml. Integrator is Euler (not RK4) to
+         match ant_ball_ogbench.xml — trades OGBench dynamics parity for
+         ~4x speedup.
 
          Extras compared to ogbench ant.xml:
            - A non-physical "target" body with 2 slide joints at the end of
@@ -15,7 +15,7 @@
     -->
     <compiler inertiafromgeom="true" angle="degree" coordinate="local"/>
 
-    <option timestep="0.02" integrator="RK4" iterations="4"/>
+    <option timestep="0.02" iterations="4"/>
 
     <custom>
         <!-- brax custom params -->

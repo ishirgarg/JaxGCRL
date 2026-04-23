@@ -151,8 +151,9 @@ def find_goals(structure, size_scaling, use_ogbench_convention=False):
 # Maze layouts whose walls and physical constants are aligned to OGBench so
 # that RLPD with antmaze-*-navigate-v0 offline datasets sees consistent
 # (s, a, s') transitions. These layouts use `ant_maze_ogbench.xml`, which
-# mirrors ogbench/locomaze/assets/ant.xml (timestep=0.02, integrator=RK4,
-# gear=30) instead of the legacy `ant_maze.xml` (timestep=0.01, gear=150).
+# mirrors ogbench/locomaze/assets/ant.xml (timestep=0.02, gear=30) with
+# Euler integration (matching ant_ball_ogbench.xml for speed) instead of
+# the legacy `ant_maze.xml` (timestep=0.01, gear=150).
 OGBENCH_MAZE_LAYOUTS = {
     "maze_ogbench_arena",
     "maze_ogbench_medium_navigate",
@@ -302,8 +303,9 @@ class AntMaze(PipelineEnv):
 
         if self._is_ogbench_layout:
             # OGBench antmaze control: mujoco timestep=0.02 with frame_skip=5
-            # -> dt=0.1 s (10 Hz). The ogbench XML already carries timestep=0.02
-            # + integrator=RK4, so mjx inherits the right physics directly.
+            # -> dt=0.1 s (10 Hz). The ogbench XML carries timestep=0.02 with
+            # Euler (RK4 dropped for speed, matching ant_ball_ogbench.xml —
+            # diverges slightly from OGBench's RK4 dynamics).
             n_frames = 5
             if backend in ["spring", "positional"]:
                 # Brax approximate backends: sub-step more aggressively so the

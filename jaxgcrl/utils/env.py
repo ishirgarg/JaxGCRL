@@ -130,7 +130,7 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
             # (timestep=0.02, RK4, gear=30). Legacy layouts stay on spring.
             layout = env_name[4:]
             if "ogbench" in layout:
-                env = AntMaze(backend=backend or "mjx", maze_layout_name=layout)
+                env = AntMaze(backend=backend or "spring", maze_layout_name=layout)
             else:
                 env = AntMaze(backend=backend or "spring", maze_layout_name=layout)
         elif "humanoid" in env_name:
