@@ -78,12 +78,15 @@ def create_exploration_bonus(
     empowerment_mean: float = 0.0,
     empowerment_scale: float = 1.0,
     empowerment_precomputed_scorer: Optional[Callable] = None,
+    empowerment_use_full_obs: bool = False,
     # RND-specific
     rnd_feature_dim: int = 64,
     rnd_hidden_dim: int = 256,
     rnd_num_hidden: int = 2,
     rnd_learning_rate: float = 1e-4,
     rnd_obs_clip: float = 5.0,
+    rnd_use_goal: bool = False,
+    goal_indices: Optional[Sequence[int]] = None,
 ) -> Tuple[BonusFn, Any, InitFromStatesFn]:
     """Factory: returns ``(bonus_fn, initial_state, init_from_states_fn)``.
 
@@ -98,7 +101,9 @@ def create_exploration_bonus(
         trainable predictor against a fixed random target network, both
         operating on observation-normalized, ``[-rnd_obs_clip, rnd_obs_clip]``
         clipped states. Normalization stats are seeded post-prefill via
-        ``init_from_states_fn``.
+        ``init_from_states_fn``. When ``rnd_use_goal`` is true, the state
+        passed to RND is sliced to ``goal_indices`` so novelty is measured
+        only over the goal-relevant dimensions.
     """
     if bonus_type == "empowerment":
         return _create_empowerment_bonus(
@@ -112,6 +117,7 @@ def create_exploration_bonus(
             mean=empowerment_mean,
             scale=empowerment_scale,
             precomputed_scorer=empowerment_precomputed_scorer,
+            use_full_obs=empowerment_use_full_obs,
         )
     if bonus_type == "rnd":
         return _create_rnd_bonus(
@@ -122,6 +128,8 @@ def create_exploration_bonus(
             num_hidden=rnd_num_hidden,
             learning_rate=rnd_learning_rate,
             obs_clip=rnd_obs_clip,
+            use_goal=rnd_use_goal,
+            goal_indices=goal_indices,
         )
     raise ValueError(f"Unknown exploration bonus type: {bonus_type!r}")
 
@@ -138,6 +146,7 @@ def _create_empowerment_bonus(
     mean: float,
     scale: float,
     precomputed_scorer: Optional[Callable] = None,
+    use_full_obs: bool = False,
 ) -> Tuple[BonusFn, StatelessBonusState, None]:
     """Offline empowerment scorer wrapped as a bonus fn.
 
@@ -146,6 +155,9 @@ def _create_empowerment_bonus(
     The per-bonus weight applied by the agent multiplies this value. When
     ``precomputed_scorer`` is supplied, the agent/obs-builder/scorer load is
     skipped (used by callers that already loaded one for the goal proposer).
+    When ``use_full_obs`` is true, the state vector (obs with the goal sliced
+    off) is fed directly to the empowerment network instead of overwriting
+    specific indices of a cached OGBench template.
     """
     if precomputed_scorer is not None:
         scorer = precomputed_scorer
@@ -157,11 +169,11 @@ def _create_empowerment_bonus(
         from .empowerment import (
             infer_empowerment_override_indices_from_env,
             load_offline_empowerment_agent,
+            make_empowerment_full_obs_builder,
             make_empowerment_obs_builder,
             make_offline_empowerment_scorer,
         )
 
-        ogbench_idx, jax_idx = infer_empowerment_override_indices_from_env(env)
         emp_agent, _ex_obs_dim, base_obs = load_offline_empowerment_agent(
             run_dir=run_dir,
             jax_env=env,
@@ -169,12 +181,21 @@ def _create_empowerment_bonus(
             epoch=epoch,
             num_splus_samples=num_splus_samples,
         )
-        obs_builder = make_empowerment_obs_builder(
-            jnp.asarray(base_obs),
-            ogbench_idx,
-            jax_idx,
-            state_size=state_size,
-        )
+        if use_full_obs:
+            if state_size != int(_ex_obs_dim):
+                raise ValueError(
+                    "empowerment_use_full_obs=True requires state_size == "
+                    f"ex_obs_dim; got state_size={state_size}, ex_obs_dim={_ex_obs_dim}."
+                )
+            obs_builder = make_empowerment_full_obs_builder()
+        else:
+            ogbench_idx, jax_idx = infer_empowerment_override_indices_from_env(env)
+            obs_builder = make_empowerment_obs_builder(
+                jnp.asarray(base_obs),
+                ogbench_idx,
+                jax_idx,
+                state_size=state_size,
+            )
         scorer = make_offline_empowerment_scorer(
             emp_agent, obs_builder, chunk_size=chunk_size
         )
@@ -207,6 +228,8 @@ def _create_rnd_bonus(
     num_hidden: int,
     learning_rate: float,
     obs_clip: float,
+    use_goal: bool = False,
+    goal_indices: Optional[Sequence[int]] = None,
 ) -> Tuple[BonusFn, RNDBonusState, InitFromStatesFn]:
     """Random Network Distillation with observation normalization.
 
@@ -215,8 +238,23 @@ def _create_rnd_bonus(
     Both nets operate on ``clip((s - mean) / std, -obs_clip, obs_clip)``,
     with ``mean``/``std`` seeded from the post-prefill state distribution
     via the returned ``init_from_states_fn``.
+
+    When ``use_goal`` is true, states are first sliced to ``goal_indices`` so
+    RND's prediction error (and normalization stats) are over only the
+    goal-relevant state dimensions.
     """
     from .networks import Encoder
+
+    if use_goal:
+        if goal_indices is None or len(goal_indices) == 0:
+            raise ValueError(
+                "rnd_use_goal=True requires non-empty goal_indices."
+            )
+        goal_idx_arr = jnp.asarray(tuple(int(i) for i in goal_indices), dtype=jnp.int32)
+        input_dim = int(goal_idx_arr.shape[0])
+    else:
+        goal_idx_arr = None
+        input_dim = state_size
 
     target_net = Encoder(
         repr_dim=feature_dim,
@@ -236,7 +274,7 @@ def _create_rnd_bonus(
     )
 
     tkey, pkey = jax.random.split(key)
-    dummy = jnp.zeros((1, state_size), dtype=jnp.float32)
+    dummy = jnp.zeros((1, input_dim), dtype=jnp.float32)
     target_params = target_net.init(tkey, dummy)
     predictor_params0 = predictor_net.init(pkey, dummy)
 
@@ -264,8 +302,8 @@ def _create_rnd_bonus(
     initial_state = RNDBonusState(
         predictor_params=predictor_params0,
         opt_state=opt_state0,
-        obs_mean=jnp.zeros((state_size,), dtype=jnp.float32),
-        obs_std=jnp.ones((state_size,), dtype=jnp.float32),
+        obs_mean=jnp.zeros((input_dim,), dtype=jnp.float32),
+        obs_std=jnp.ones((input_dim,), dtype=jnp.float32),
         reward_mean=jnp.asarray(0.0, dtype=jnp.float32),
         reward_m2=jnp.asarray(0.0, dtype=jnp.float32),
         reward_count=jnp.asarray(0.0, dtype=jnp.float32),
@@ -287,6 +325,8 @@ def _create_rnd_bonus(
         states = transitions.observation[..., :state_size]
         shape = states.shape[:2]
         flat = states.reshape(-1, state_size)
+        if goal_idx_arr is not None:
+            flat = flat[:, goal_idx_arr]
         normalized = _normalize(flat, state.obs_mean, state.obs_std)
 
         per_err = _per_state_error(state.predictor_params, normalized)
@@ -329,6 +369,8 @@ def _create_rnd_bonus(
         use the prefill (uniform-random buffer warmup) rollouts for that.
         """
         flat = states.reshape(-1, state_size)
+        if goal_idx_arr is not None:
+            flat = flat[:, goal_idx_arr]
         new_mean = jnp.mean(flat, axis=0)
         new_std = jnp.std(flat, axis=0)
         return state.replace(obs_mean=new_mean, obs_std=new_std)
@@ -423,12 +465,15 @@ def create_exploration_bonuses(
     empowerment_mean: float = 0.0,
     empowerment_scale: float = 1.0,
     empowerment_precomputed_scorer: Optional[Callable] = None,
+    empowerment_use_full_obs: bool = False,
     # RND-specific
     rnd_feature_dim: int = 64,
     rnd_hidden_dim: int = 256,
     rnd_num_hidden: int = 2,
     rnd_learning_rate: float = 1e-4,
     rnd_obs_clip: float = 5.0,
+    rnd_use_goal: bool = False,
+    goal_indices: Optional[Sequence[int]] = None,
 ) -> ExplorationBonuses:
     """Build an :class:`ExplorationBonuses` bundle from user-facing config.
 
@@ -471,11 +516,14 @@ def create_exploration_bonuses(
             empowerment_mean=empowerment_mean,
             empowerment_scale=empowerment_scale,
             empowerment_precomputed_scorer=empowerment_precomputed_scorer,
+            empowerment_use_full_obs=empowerment_use_full_obs,
             rnd_feature_dim=rnd_feature_dim,
             rnd_hidden_dim=rnd_hidden_dim,
             rnd_num_hidden=rnd_num_hidden,
             rnd_learning_rate=rnd_learning_rate,
             rnd_obs_clip=rnd_obs_clip,
+            rnd_use_goal=rnd_use_goal,
+            goal_indices=goal_indices,
         )
         fns.append(fn)
         states.append(st)

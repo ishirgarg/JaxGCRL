@@ -57,6 +57,7 @@ from .goal_proposers import (
 from .empowerment import (
     infer_empowerment_override_indices_from_env,
     load_offline_empowerment_agent,
+    make_empowerment_full_obs_builder,
     make_empowerment_obs_builder,
     make_offline_empowerment_scorer,
 )
@@ -116,6 +117,10 @@ class GoExplore:
     empowerment_epoch: Optional[int] = None
     empowerment_num_splus_samples: int = 128
     empowerment_score_chunk_size: int = 32
+    # If True, feed the full state (obs with goal sliced off) to the
+    # empowerment network instead of overwriting a few indices of a cached
+    # OGBench template. Requires state_size == checkpoint ex_obs_dim.
+    use_full_empowerment: bool = False
 
     # ── Go Explore specific parameters ──────────────────────────────────────
     num_gcp_steps: int = 100      # max steps in go phase before forcing explore
@@ -281,9 +286,6 @@ class GoExplore:
             if self.empowerment_run_dir is None:
                 raise ValueError("empowerment_run_dir must be set when goal_proposer_name='empowerment'.")
             key, empowerment_template_key = jax.random.split(key)
-            ogbench_obs_indices, jaxgcrl_state_indices = infer_empowerment_override_indices_from_env(
-                unwrapped_env
-            )
             emp_agent, _ex_obs_dim, base_obs_template = load_offline_empowerment_agent(
                 run_dir=self.empowerment_run_dir,
                 jax_env=unwrapped_env,
@@ -291,12 +293,23 @@ class GoExplore:
                 epoch=self.empowerment_epoch,
                 num_splus_samples=self.empowerment_num_splus_samples,
             )
-            obs_builder = make_empowerment_obs_builder(
-                jnp.asarray(base_obs_template),
-                ogbench_obs_indices,
-                jaxgcrl_state_indices,
-                state_size=state_size,
-            )
+            if self.use_full_empowerment:
+                if state_size != int(_ex_obs_dim):
+                    raise ValueError(
+                        "use_full_empowerment=True requires state_size == ex_obs_dim; "
+                        f"got state_size={state_size}, ex_obs_dim={_ex_obs_dim}."
+                    )
+                obs_builder = make_empowerment_full_obs_builder()
+            else:
+                ogbench_obs_indices, jaxgcrl_state_indices = infer_empowerment_override_indices_from_env(
+                    unwrapped_env
+                )
+                obs_builder = make_empowerment_obs_builder(
+                    jnp.asarray(base_obs_template),
+                    ogbench_obs_indices,
+                    jaxgcrl_state_indices,
+                    state_size=state_size,
+                )
             offline_empowerment_scorer = make_offline_empowerment_scorer(
                 emp_agent,
                 obs_builder,

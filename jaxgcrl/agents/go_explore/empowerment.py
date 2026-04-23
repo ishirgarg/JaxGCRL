@@ -282,6 +282,22 @@ def make_empowerment_obs_builder(
     return _builder
 
 
+def make_empowerment_full_obs_builder() -> Callable[[jnp.ndarray], jnp.ndarray]:
+    """Pass the full state row through as the empowerment observation.
+
+    Used when ``use_full_empowerment`` is enabled: instead of overwriting a few
+    slots of a cached OGBench template (per ``infer_empowerment_override_indices_from_env``),
+    the whole ``state`` row (obs with the goal sliced off) is fed to the
+    empowerment network. Assumes ``state_size`` equals the checkpoint's
+    ``ex_obs_dim`` — the empowerment agent must have been trained with a
+    matching observation layout.
+    """
+    def _builder(states: jnp.ndarray) -> jnp.ndarray:
+        return states
+
+    return _builder
+
+
 def make_offline_empowerment_scorer(
     emp_agent,
     obs_builder: Callable[[jnp.ndarray], jnp.ndarray],

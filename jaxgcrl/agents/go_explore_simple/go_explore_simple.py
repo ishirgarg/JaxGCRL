@@ -61,6 +61,7 @@ from jaxgcrl.agents.go_explore.goal_proposers import (
 from jaxgcrl.agents.go_explore.empowerment import (
     infer_empowerment_override_indices_from_env,
     load_offline_empowerment_agent,
+    make_empowerment_full_obs_builder,
     make_empowerment_obs_builder,
     make_offline_empowerment_scorer,
 )
@@ -234,6 +235,10 @@ class GoExploreSimple:
     empowerment_epoch: Optional[int] = None
     empowerment_num_splus_samples: int = 32
     empowerment_score_chunk_size: int = 32
+    # If True, feed the full state (obs with goal sliced off) to the
+    # empowerment network instead of overwriting a few indices of a cached
+    # OGBench template. Requires state_size == checkpoint ex_obs_dim.
+    use_full_empowerment: bool = False
 
     # ── RLPD (offline data mixing) ─────────────────────────────────────────
     use_rlpd: bool = True  # Mix 50% offline OGBench data into each training batch
@@ -252,6 +257,8 @@ class GoExploreSimple:
     rnd_num_hidden: int = 2
     rnd_learning_rate: float = 1e-4
     rnd_obs_clip: float = 5.0
+    # If True, RND operates on state[goal_indices] only (novelty over goal dims).
+    use_goal_for_rnd: bool = False
 
     # ── Go Explore specific parameters ──────────────────────────────────────
     num_gcp_steps: int = 250      # max steps in go phase before forcing explore
@@ -414,9 +421,6 @@ class GoExploreSimple:
             if self.empowerment_run_dir is None:
                 raise ValueError(f"empowerment_run_dir must be set when goal_proposer_name='{self.goal_proposer_name}'.")
             key, empowerment_template_key = jax.random.split(key)
-            ogbench_obs_indices, jaxgcrl_state_indices = infer_empowerment_override_indices_from_env(
-                unwrapped_env
-            )
             emp_agent, _ex_obs_dim, base_obs_template = load_offline_empowerment_agent(
                 run_dir=self.empowerment_run_dir,
                 jax_env=unwrapped_env,
@@ -424,12 +428,23 @@ class GoExploreSimple:
                 epoch=self.empowerment_epoch,
                 num_splus_samples=self.empowerment_num_splus_samples,
             )
-            obs_builder = make_empowerment_obs_builder(
-                jnp.asarray(base_obs_template),
-                ogbench_obs_indices,
-                jaxgcrl_state_indices,
-                state_size=state_size,
-            )
+            if self.use_full_empowerment:
+                if state_size != int(_ex_obs_dim):
+                    raise ValueError(
+                        "use_full_empowerment=True requires state_size == ex_obs_dim; "
+                        f"got state_size={state_size}, ex_obs_dim={_ex_obs_dim}."
+                    )
+                obs_builder = make_empowerment_full_obs_builder()
+            else:
+                ogbench_obs_indices, jaxgcrl_state_indices = infer_empowerment_override_indices_from_env(
+                    unwrapped_env
+                )
+                obs_builder = make_empowerment_obs_builder(
+                    jnp.asarray(base_obs_template),
+                    ogbench_obs_indices,
+                    jaxgcrl_state_indices,
+                    state_size=state_size,
+                )
             offline_empowerment_scorer = make_offline_empowerment_scorer(
                 emp_agent,
                 obs_builder,
@@ -547,11 +562,14 @@ class GoExploreSimple:
             empowerment_mean=self.empowerment_bonus_mean,
             empowerment_scale=self.empowerment_bonus_scale,
             empowerment_precomputed_scorer=offline_empowerment_scorer,
+            empowerment_use_full_obs=self.use_full_empowerment,
             rnd_feature_dim=self.rnd_feature_dim,
             rnd_hidden_dim=self.rnd_hidden_dim,
             rnd_num_hidden=self.rnd_num_hidden,
             rnd_learning_rate=self.rnd_learning_rate,
             rnd_obs_clip=self.rnd_obs_clip,
+            rnd_use_goal=self.use_goal_for_rnd,
+            goal_indices=goal_indices_tuple,
         )
         exploration_bonus_state = exploration_bonuses.initial_state
 
@@ -726,13 +744,8 @@ class GoExploreSimple:
 
         # ── update_networks (GCP only) ────────────────────────────────────────
         # For CRL+exploration: also train an extra SAC-style Q critic on the
-        # raw (unweighted, but globally shifted/rescaled) exploration bonus,
-        # and add -exploration_critic_weight * Q_exp to the CRL actor loss.
-        exploration_critic_weight = (
-            float(sum(self.exploration_bonus_weight))
-            if use_exploration_q_critic
-            else 0.0
-        )
+        # weighted exploration bonus (per-bonus weight baked into the Bellman
+        # target), and add -Q_exp to the CRL actor loss.
 
         @jax.jit
         def update_networks(carry, xs):
@@ -748,7 +761,6 @@ class GoExploreSimple:
                 state_size=state_size, action_size=action_size, goal_size=goal_size,
                 obs_size=obs_size, goal_indices=train_env.goal_indices,
                 target_entropy=target_entropy,
-                exploration_critic_weight=exploration_critic_weight,
             )
             networks = dict(actor=gcp_actor, critic=gcp_critic)
             if needs_exp_q:
@@ -845,8 +857,8 @@ class GoExploreSimple:
             # Exploration bonus is summed across all configured bonuses. For
             # SAC we add the weighted total to the post-HER reward so it shapes
             # the critic/actor via Q; for CRL we instead train a separate Q_exp
-            # on the *raw* (unweighted) per-transition bonus and add
-            # -weight * Q_exp to the CRL actor loss (see update_networks).
+            # on the weighted per-transition bonus and add -Q_exp to the CRL
+            # actor loss (see update_networks).
             bonus_key, train_key = jax.random.split(train_key)
             total_bonus, raw_total_bonus, exploration_bonus_state, bonus_metrics = (
                 exploration_bonuses.compute(exploration_bonus_state, transitions, bonus_key)
@@ -857,8 +869,8 @@ class GoExploreSimple:
                 )
                 exploration_reward_per_batch = jnp.zeros_like(transitions.reward)
             else:
-                # CRL: leave env reward untouched; feed raw bonus to Q_exp.
-                exploration_reward_per_batch = raw_total_bonus
+                # CRL: leave env reward untouched; feed weighted bonus to Q_exp.
+                exploration_reward_per_batch = total_bonus
 
             reward_viz = (
                 transitions.observation[..., 0],

@@ -74,16 +74,16 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
 
     If ``networks["exploration_q_critic"]`` is provided and the training state
     has ``exploration_q_critic_states`` set, the actor loss also includes
-    ``- exploration_critic_weight * min_i Q_exp_i(state, action)`` so the policy
-    is biased toward actions with high exploration Q.
+    ``- min_i Q_exp_i(state, action)`` so the policy is biased toward actions
+    with high exploration Q. Q_exp is trained on the *weighted* exploration
+    bonus, so the per-bonus weight is already baked in and no additional
+    scaling is applied here.
     """
     exploration_q_critic = networks.get("exploration_q_critic")
     exploration_q_states = training_state.exploration_q_critic_states
-    exploration_weight = float(config.get("exploration_critic_weight", 0.0))
     use_exploration_q = (
         exploration_q_critic is not None
         and exploration_q_states is not None
-        and exploration_weight != 0.0
     )
 
     def actor_loss(actor_params, critic_params, log_alpha, exp_q_params, transitions, key):
@@ -120,7 +120,7 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
         if use_exploration_q:
             exp_q_values = exploration_q_critic.apply(exp_q_params, obs_with_goal, action)
             exp_q = jnp.min(exp_q_values, axis=-1)  # min over ensemble for stability
-            actor_loss_val = actor_loss_val - exploration_weight * jnp.mean(exp_q)
+            actor_loss_val = actor_loss_val - jnp.mean(exp_q)
 
         return actor_loss_val, log_prob
 
@@ -258,8 +258,8 @@ def update_exploration_q_critic(
     Reuses ``update_critic_sac`` with a shim training-state whose
     ``critic_states`` / ``target_critic_params`` point at the exploration Q
     fields and whose ``alpha_state`` is ``None`` so ``alpha = 0`` zeroes the
-    entropy term. ``transitions.reward`` must already hold the raw (unweighted,
-    but globally shifted/rescaled) per-transition exploration bonus — for CRL
+    entropy term. ``transitions.reward`` must already hold the weighted
+    per-transition exploration bonus (per-bonus weight baked in) — for CRL
     this is safe because the contrastive critic/actor never read reward, so
     the caller overwrites it with the bonus.
     """
