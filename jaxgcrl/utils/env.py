@@ -29,6 +29,7 @@ from jaxgcrl.envs.manipulation.arm_grasp import ArmGrasp
 from jaxgcrl.envs.manipulation.arm_push_easy import ArmPushEasy
 from jaxgcrl.envs.manipulation.arm_push_hard import ArmPushHard
 from jaxgcrl.envs.manipulation.arm_reach import ArmReach
+from jaxgcrl.envs.manipulation.cube_single import CubeSingle
 from jaxgcrl.envs.pusher import Pusher, PusherReacher
 from jaxgcrl.envs.pusher2 import Pusher2
 from jaxgcrl.envs.reacher import Reacher
@@ -52,6 +53,7 @@ legal_envs = (
     "arm_push_hard",
     "arm_binpick_easy",
     "arm_binpick_hard",
+    "cube_single",
     "ant_ball_maze",
     "ant_ball_square_maze",
     "ant_ball_easy_square_maze",
@@ -166,6 +168,8 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         env = ArmBinpickEasy(backend=backend or "mjx")
     elif env_name == "arm_binpick_hard":
         env = ArmBinpickHard(backend=backend or "mjx")
+    elif env_name == "cube_single":
+        env = CubeSingle(backend=backend or "mjx")
     else:
         raise ValueError(f"Unknown environment: {env_name}")
     return env
