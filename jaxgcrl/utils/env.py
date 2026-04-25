@@ -65,6 +65,7 @@ legal_envs = (
     "ant_ball_4d_ogbench_small_easy_square",
     "ant_ball_4d_ogbench_small_easy_square_stitch",
     "ant_ball_4d_ogbench_arena",
+    "ant_ball_ogbench_arena_stitch",
     "ant_ball_4d_ogbench_medium",
     "ant_ball_4d_ogbench_small_square",
     "ant_ball_4d_ogbench_easy_square",
@@ -119,7 +120,10 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
             add_ant_to_goal=True,
         )
     elif env_name.startswith("ant_ball_ogbench_"):
-        # ant_ball_ogbench_arena, ant_ball_ogbench_medium
+        # 2D-goal variant (ball-only goal). Includes ant_ball_ogbench_arena,
+        # ant_ball_ogbench_medium, and ant_ball_ogbench_arena_stitch (which
+        # mirrors OGBench's antsoccer-arena tasks: 5 paired (agent, ball,
+        # goal) tuples and ball-only success).
         layout = env_name[len("ant_ball_ogbench_"):]
         env = AntBallOGBench(backend=backend or "spring", maze_layout_name=layout)
     elif env_name == "ant_push":

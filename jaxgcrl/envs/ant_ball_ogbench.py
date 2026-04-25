@@ -27,6 +27,7 @@ from jax import numpy as jnp
 RESET = R = "r"
 GOAL = G = "g"
 BALL = B = "b"
+RESET_GOAL = M = "m"  # cell that is both an agent reset AND a goal candidate
 
 MAZE_HEIGHT = 0.5
 
@@ -80,6 +81,36 @@ EASY_SQUARE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
+# OGBench arena task layout: open 8x8 with R/B/G/M cells placed at the
+# (agent_init, ball_init, goal) ij positions of the 5 antsoccer-arena tasks
+# defined in ogbench/locomaze/maze.py:592 (set_tasks for ball envs):
+#   [(1,6),(2,3),(5,2)], [(2,2),(5,5),(2,2)], [(6,1),(2,3),(6,6)],
+#   [(6,6),(1,1),(6,1)], [(4,6),(6,2),(1,6)].
+# M marks cells that appear as both an agent init AND a goal across tasks.
+ARENA_STITCH = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, B, 0, 0, 0, 0, M, 1],
+    [1, 0, M, B, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, R, 1],
+    [1, 0, G, 0, 0, B, 0, 1],
+    [1, M, B, 0, 0, 0, M, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+# Paired (agent_init_ij, ball_init_ij, goal_ij) tuples for the 5 OGBench
+# antsoccer-arena tasks (set_tasks in ogbench/locomaze/maze.py:592). Used by
+# the arena_stitch env to reset all three positions jointly — independent
+# sampling from R/G/B/M markers would produce combinations OGBench never
+# evaluates on.
+ARENA_STITCH_TASKS = [
+    [(1, 6), (2, 3), (5, 2)],
+    [(2, 2), (5, 5), (2, 2)],
+    [(6, 1), (2, 3), (6, 6)],
+    [(6, 6), (1, 1), (6, 1)],
+    [(4, 6), (6, 2), (1, 6)],
+]
+
 # OGBench medium maze in OGBench's native row/col orientation.
 # Mirrors ogbench/locomaze/maze.py's medium maze_map exactly.
 MEDIUM = [
@@ -102,12 +133,16 @@ def _cell_xy(i, j, maze_size_scaling, xy_offset):
 
 
 def _find_cells(maze_layout, maze_size_scaling, obj):
-    """Return (x,y) positions of cells matching obj."""
+    """Return (x,y) positions of cells matching obj (or any marker if obj is a tuple/list)."""
     xy_offset = float(maze_size_scaling)
+    if isinstance(obj, (tuple, list, set)):
+        markers = set(obj)
+    else:
+        markers = {obj}
     cells = []
     for i in range(len(maze_layout)):
         for j in range(len(maze_layout[0])):
-            if maze_layout[i][j] == obj:
+            if maze_layout[i][j] in markers:
                 cells.append(_cell_xy(i, j, maze_size_scaling, xy_offset))
     return jnp.array(cells) if cells else jnp.zeros((0, 2))
 
@@ -127,6 +162,8 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
     """Build XML string with maze walls from the OGBench-compatible ball XML template."""
     if maze_layout_name == "arena":
         maze_layout = ARENA
+    elif maze_layout_name == "arena_stitch":
+        maze_layout = ARENA_STITCH
     elif maze_layout_name == "medium":
         maze_layout = MEDIUM
     elif maze_layout_name == "small_square":
@@ -142,21 +179,33 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
                             "assets", "ant_ball_ogbench.xml")
     xy_offset = float(maze_size_scaling)
 
-    # Check if the layout uses R/G/B markers for separate spawn regions
+    # Check if the layout uses R/G/B/M markers for separate spawn regions.
+    # M cells count as both an agent reset and a goal (used by arena_stitch
+    # where several OGBench arena tasks share an init/goal cell).
     has_markers = any(
-        cell in (R, G, B)
+        cell in (R, G, B, M)
         for row in maze_layout
         for cell in row
     )
     if has_markers:
-        starts = _find_cells(maze_layout, maze_size_scaling, R)
-        goals = _find_cells(maze_layout, maze_size_scaling, G)
+        starts = _find_cells(maze_layout, maze_size_scaling, (R, M))
+        goals = _find_cells(maze_layout, maze_size_scaling, (G, M))
         balls = _find_cells(maze_layout, maze_size_scaling, B)
     else:
         open_cells = _open_cells(maze_layout, maze_size_scaling)
         starts = open_cells
         goals = open_cells
         balls = open_cells
+
+    # Paired (agent_xy, ball_xy, goal_xy) tuples — only set for layouts that
+    # define a fixed task list (e.g. arena_stitch). Otherwise None and the env
+    # samples R/G/B independently at reset.
+    paired_tasks = None
+    if maze_layout_name == "arena_stitch":
+        paired_tasks = jnp.array([
+            [_cell_xy(ij[0], ij[1], maze_size_scaling, xy_offset) for ij in task]
+            for task in ARENA_STITCH_TASKS
+        ])  # shape (5, 3, 2): (num_tasks, [agent, ball, goal], xy)
 
     rows = len(maze_layout)
     cols = len(maze_layout[0])
@@ -195,7 +244,7 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
 
     tree = tree.getroot()
     xml_string = ET.tostring(tree)
-    return xml_string, starts, goals, balls, x_bounds, y_bounds
+    return xml_string, starts, goals, balls, x_bounds, y_bounds, paired_tasks
 
 
 class AntBallOGBench(PipelineEnv):
@@ -236,7 +285,7 @@ class AntBallOGBench(PipelineEnv):
         add_ant_to_goal: bool = False,
         **kwargs,
     ):
-        xml_string, starts, goals, balls, x_bounds, y_bounds = make_ball_maze(
+        xml_string, starts, goals, balls, x_bounds, y_bounds, paired_tasks = make_ball_maze(
             maze_layout_name, maze_size_scaling
         )
 
@@ -249,6 +298,10 @@ class AntBallOGBench(PipelineEnv):
         self.possible_goals = goals
         self.possible_starts = starts
         self.possible_balls = balls
+        # Paired (agent, ball, goal) tuples for layouts with a fixed task list.
+        # When set, default reset samples one tuple jointly instead of drawing
+        # the three positions independently from possible_*.
+        self.paired_tasks = paired_tasks
         self.x_bounds = tuple(float(v) for v in x_bounds)
         self.y_bounds = tuple(float(v) for v in y_bounds)
 
@@ -314,19 +367,42 @@ class AntBallOGBench(PipelineEnv):
 
     def reset(self, rng: jax.Array, goal=None, start=None) -> State:
         """Resets the environment to an initial state."""
-        rng, rng1, rng2, rng_ant, rng_ball, rng_goal = jax.random.split(rng, 6)
+        rng, rng1, rng2, rng_ant, rng_ball, rng_goal, rng_task = jax.random.split(rng, 7)
 
         low, hi = -self._reset_noise_scale, self._reset_noise_scale
         q = self.sys.init_q + jax.random.uniform(rng1, (self.sys.q_size(),), minval=low, maxval=hi)
         qd = hi * jax.random.normal(rng2, (self.sys.qd_size(),))
+
+        # Default sampling: when paired_tasks is set, draw one of the
+        # predefined (agent, ball, goal) tuples jointly so the env only ever
+        # resets into one of OGBench's evaluation tasks. Otherwise fall back
+        # to independent R/G/B sampling.
+        if self.paired_tasks is not None:
+            idx = jax.random.randint(rng_task, (), 0, self.paired_tasks.shape[0])
+            paired = self.paired_tasks[idx]            # (3, 2)
+            paired_start_xy = paired[0]
+            paired_ball_xy = paired[1]
+            paired_target_xy = paired[2]
+            if self.add_ant_to_goal:
+                paired_goal_arr = jnp.concatenate([paired_target_xy, paired_target_xy])
+            else:
+                paired_goal_arr = paired_target_xy
+        else:
+            paired_start_xy = None
+            paired_ball_xy = None
+            paired_goal_arr = None
 
         # Start position. `start` can be either length-2 (ant xy only) or
         # length-4 (ant xy + ball xy); the latter is used by GoExploreWrapper to
         # restore the full ant+ball pose at the start of each go phase in the
         # 4D-goal variant.
         if start is None:
-            start_xy = self._random_start(rng_ant)
-            ball_xy = self._random_ball(rng_ball)
+            if paired_start_xy is not None:
+                start_xy = paired_start_xy
+                ball_xy = paired_ball_xy
+            else:
+                start_xy = self._random_start(rng_ant)
+                ball_xy = self._random_ball(rng_ball)
         else:
             start_arr = jnp.asarray(start, dtype=q.dtype)
             if start_arr.shape[-1] == 4:
@@ -362,7 +438,10 @@ class AntBallOGBench(PipelineEnv):
         # is [ant_goal_xy, ball_goal_xy]; we bake the ball-target xy into the
         # marker and rely on _get_obs duplicating it for the ant-target slot.
         if goal is None:
-            goal_arr = self._random_goal(rng_goal)
+            if paired_goal_arr is not None:
+                goal_arr = paired_goal_arr
+            else:
+                goal_arr = self._random_goal(rng_goal)
         else:
             goal_arr = jnp.asarray(goal, dtype=q.dtype)
         target_xy = goal_arr[-2:]
