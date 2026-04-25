@@ -493,6 +493,9 @@ class CubeSingle(PipelineEnv):
         self._task_init_xyzs = jnp.asarray(_TASK_INIT_XYZS)
         self._task_goal_xyzs = jnp.asarray(_TASK_GOAL_XYZS)
         self._num_tasks = _TASK_INIT_XYZS.shape[0]
+        # Exposed for goal proposers (e.g. random_env_goals): the 5 task target
+        # cube positions, in the same scaled space as obs[19:22].
+        self.possible_goals = self._task_goal_xyzs_scaled
 
         # Constants exposed to JIT.
         self._home_qpos = jnp.asarray(_HOME_QPOS)
@@ -549,13 +552,31 @@ class CubeSingle(PipelineEnv):
 
     # -- Reset / Step -----------------------------------------------------
 
-    def reset(self, rng: jax.Array) -> State:
+    def reset(self, rng: jax.Array, goal=None, start=None) -> State:
         rng, rng_q, rng_post = jax.random.split(rng, 3)
-        q, qd, goal_xyz = self._initial_q(rng_q)
+        q, qd, default_goal_xyz = self._initial_q(rng_q)
+
+        # `start` is the cube's initial position in the SCALED space (i.e. the
+        # values stored at obs[goal_indices] = obs[19:22]). GoExploreWrapper
+        # passes this in to restore the cube to its episode-start position at
+        # the beginning of each go phase.
+        if start is not None:
+            start_arr = jnp.asarray(start, dtype=q.dtype)
+            cube_xyz = start_arr / _XYZ_SCALER + self._xyz_center
+            q = q.at[14:17].set(cube_xyz)
+
+        # `goal` is the desired cube target in the same SCALED space. When the
+        # proposer/wrapper supplies a goal, override the per-task default.
+        if goal is None:
+            goal_xyz = default_goal_xyz
+            goal_scaled = (goal_xyz - self._xyz_center) * _XYZ_SCALER
+        else:
+            goal_scaled = jnp.asarray(goal, dtype=q.dtype)
+            goal_xyz = goal_scaled / _XYZ_SCALER + self._xyz_center
+
         pipeline_state = self.pipeline_init(q, qd)
         pipeline_state = self._set_mocap(pipeline_state, goal_xyz)
 
-        goal_scaled = (goal_xyz - self._xyz_center) * _XYZ_SCALER
         info = {
             'goal': goal_scaled,
             'goal_xyz': goal_xyz,
