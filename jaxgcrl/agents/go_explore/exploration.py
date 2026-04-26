@@ -206,7 +206,7 @@ def create_exploration_bonus(
             rnd_use_goal=rnd_use_goal,
             goal_indices=goal_indices,
         )
-        return bonus_fn, st, init_fn, None, None, ucb_train_fn, ucb_relabel_fn
+        return bonus_fn, st, init_fn, None, None, ucb_train_fn, ucb_relabel_fn, ucb_online_bonus_fn
     raise ValueError(f"Unknown exploration bonus type: {bonus_type!r}")
 
 
