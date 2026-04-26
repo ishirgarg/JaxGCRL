@@ -286,6 +286,7 @@ def all_visualizations(
     state_size: int,
     goal_indices: Tuple[int, ...],
     rng_key: jax.Array,
+    current_step: int = None,
 ) -> Any:
     """
     Create all trajectory visualizations from the replay buffer.
@@ -347,7 +348,8 @@ def all_visualizations(
         save_path=None,
     )
     
-    wandb.log({"trajectory_visualization": wandb.Image(fig)})
+    log_kwargs = {"step": int(current_step)} if current_step is not None else {}
+    wandb.log({"trajectory_visualization": wandb.Image(fig)}, **log_kwargs)
     plt.close(fig)
 
     return buffer_state
@@ -360,6 +362,7 @@ def visualize_go_explore_phases(
     state_size: int,
     goal_indices: Tuple[int, ...],
     num_pairs: int = 4,
+    current_step: int = None,
 ) -> None:
     # ── 1. Flatten buffer sample ──────────────────────────────────────────────
     obs_flat      = np.array(jnp.reshape(transitions.observation,
@@ -504,7 +507,8 @@ def visualize_go_explore_phases(
             pass
 
     plt.suptitle("Go Explore — Phase Breakdown", fontsize=13, fontweight="bold", y=1.01)
-    wandb.log({"go_explore_phase_viz": wandb.Image(fig)})
+    log_kwargs = {"step": int(current_step)} if current_step is not None else {}
+    wandb.log({"go_explore_phase_viz": wandb.Image(fig)}, **log_kwargs)
     plt.close(fig)
 
 

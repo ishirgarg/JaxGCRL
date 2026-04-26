@@ -664,6 +664,7 @@ class Baseline:
                     state_size=state_size,
                     goal_indices=tuple(train_env.goal_indices),
                     rng_key=viz_key,
+                    current_step=current_step,
                 )
                 last_visualization_step = current_step
 

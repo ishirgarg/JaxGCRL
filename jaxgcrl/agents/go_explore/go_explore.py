@@ -866,6 +866,7 @@ class GoExplore:
                     state_size=state_size,
                     goal_indices=tuple(train_env.goal_indices),
                     rng_key=viz_key,
+                    current_step=current_step,
                 )
                 # Separate Go Explore phase breakdown plot
                 _, phase_transitions = replay_buffer.sample(buffer_state)
@@ -875,6 +876,7 @@ class GoExplore:
                     unwrapped_env.y_bounds,
                     state_size=state_size,
                     goal_indices=tuple(train_env.goal_indices),
+                    current_step=current_step,
                 )
                 last_visualization_step = current_step
 

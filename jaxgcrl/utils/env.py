@@ -382,7 +382,7 @@ def render(make_policy, params, env, exp_dir, exp_name, num_steps):
     url = html.render(env.sys.tree_replace({"opt.timestep": env.dt}), rollout, height=1024)
     with open(os.path.join(exp_dir, f"{exp_name}_{num_steps}.html"), "w") as file:
         file.write(url)
-    wandb.log({"render": wandb.Html(url)})
+    wandb.log({"render": wandb.Html(url)}, step=int(num_steps))
 
 
 def render_policy(params, save_path, env, actor, eval_env, vis_length):

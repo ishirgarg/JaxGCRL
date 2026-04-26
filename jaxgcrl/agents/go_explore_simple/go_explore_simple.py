@@ -1072,6 +1072,7 @@ class GoExploreSimple:
                     state_size=state_size,
                     goal_indices=tuple(train_env.goal_indices),
                     rng_key=viz_key,
+                    current_step=current_step,
                 )
                 _, phase_transitions = replay_buffer.sample(buffer_state)
                 visualize_go_explore_phases(
@@ -1080,6 +1081,7 @@ class GoExploreSimple:
                     unwrapped_env.y_bounds,
                     state_size=state_size,
                     goal_indices=tuple(train_env.goal_indices),
+                    current_step=current_step,
                 )
                 if not exploration_bonuses.is_empty:
                     _log_trajectory_reward(

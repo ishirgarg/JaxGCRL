@@ -93,7 +93,7 @@ _SUCCESS_THRESHOLD = 0.04
 # is below the precision floor for typical (J Jᵀ) eigenvalues, so we bump it up
 # to keep the linear solve well-conditioned. The functional behaviour is the
 # same — damping only matters near singularities.
-_IK_MAX_ITERS = 20
+_IK_MAX_ITERS = 5
 _IK_DAMPING = 1e-6
 _IK_MAX_ANGLE_CHANGE = np.radians(45.0)
 
@@ -284,13 +284,19 @@ def _yaw_from_quat(q: jnp.ndarray) -> jnp.ndarray:
 class _JaxDiffIK:
     """Damped-least-squares differential IK on a UR5e-only mjx model."""
 
-    def __init__(self, ik_mj: mujoco.MjModel, site_name: str = 'attachment_site'):
+    def __init__(
+        self,
+        ik_mj: mujoco.MjModel,
+        site_name: str = 'attachment_site',
+        max_iters: int = _IK_MAX_ITERS,
+    ):
         self._mjx_model = mjx.put_model(ik_mj)
         self._mjx_data_template = mjx.make_data(self._mjx_model)
         self._site_id = ik_mj.site(site_name).id
         self._site_bodyid = int(ik_mj.site_bodyid[self._site_id])
         # 6 hinge joints; nv == nq == 6.
         self._nv = ik_mj.nv
+        self._max_iters = int(max_iters)
 
     def solve(
         self,
@@ -339,7 +345,7 @@ class _JaxDiffIK:
 
             return qpos + update
 
-        return jax.lax.fori_loop(0, _IK_MAX_ITERS, iter_step, curr_qpos)
+        return jax.lax.fori_loop(0, self._max_iters, iter_step, curr_qpos)
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +388,7 @@ class CubeSingle(PipelineEnv):
         episode_length: int = 200,
         cube_init_noise: float = 0.01,
         permute_blocks: bool = False,  # kept for API parity with OGBench
+        ik_max_iters: int = _IK_MAX_ITERS,
         **kwargs,
     ):
         del permute_blocks  # single cube, no permutation possible
@@ -479,7 +486,7 @@ class CubeSingle(PipelineEnv):
         self._cube_target_mocap_id = int(mj.body('object_target_0').mocapid[0])
 
         # IK solver (lazy compilation).
-        self._ik = _JaxDiffIK(ik_mj, site_name='attachment_site')
+        self._ik = _JaxDiffIK(ik_mj, site_name='attachment_site', max_iters=ik_max_iters)
 
         # Action limits.
         self._action_low = jnp.asarray(-_ACTION_RANGE)
@@ -496,6 +503,15 @@ class CubeSingle(PipelineEnv):
         # Exposed for goal proposers (e.g. random_env_goals): the 5 task target
         # cube positions, in the same scaled space as obs[19:22].
         self.possible_goals = self._task_goal_xyzs_scaled
+
+        # Visualization bounds — go_explore_simple plots cube xy at obs[19], obs[20]
+        # which live in the scaled space (raw - center) * 10. Take the
+        # object-sampling rectangle, transform it the same way, and expose the
+        # result as x_bounds / y_bounds.
+        _obj_low_scaled = (_OBJECT_SAMPLING_BOUNDS[0] - _XYZ_CENTER[:2]) * _XYZ_SCALER
+        _obj_high_scaled = (_OBJECT_SAMPLING_BOUNDS[1] - _XYZ_CENTER[:2]) * _XYZ_SCALER
+        self.x_bounds = (float(_obj_low_scaled[0]), float(_obj_high_scaled[0]))
+        self.y_bounds = (float(_obj_low_scaled[1]), float(_obj_high_scaled[1]))
 
         # Constants exposed to JIT.
         self._home_qpos = jnp.asarray(_HOME_QPOS)
