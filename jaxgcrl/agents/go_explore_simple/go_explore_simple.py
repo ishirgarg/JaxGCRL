@@ -599,12 +599,11 @@ class GoExploreSimple:
         if exploration_bonuses.has_ucb:
             if not self.use_rlpd:
                 raise ValueError("'ucb' bonus requires use_rlpd=True (no offline data otherwise).")
-            if not exploration_bonuses.has_rnd_novelty:
-                raise ValueError(
-                    "'ucb' bonus requires a co-listed 'rnd' bonus to source the "
-                    "novelty term. The RND weight can be 0.0 if you only want "
-                    "EXPLORE labeling without additive RND reward shaping."
-                )
+            # 'ucb' owns its internal RND novelty source, so no co-listed
+            # 'rnd' bonus is required (and listing one would also additively
+            # shape ONLINE rewards, defeating EXPLORE's "online uses true
+            # reward only" design).
+            #
             # CRL also supported: the exploration_q_critic (auto-enabled when
             # exploration_bonus_type is non-None) is reward-based, so UCB-
             # relabeled offline rewards flow into it via
@@ -873,17 +872,15 @@ class GoExploreSimple:
                 offline_transitions = offline_buffer.sample(offline_key, config.num_envs)
 
                 if has_ucb:
-                    # EXPLORE: read RND novelty without updating predictor
-                    # params (so RND keeps focusing on *online* novelty even
-                    # though we evaluate it on offline (s, a)) and relabel
-                    # offline transitions with optimistic UCB. Gated by
-                    # warmup: the reward/term predictors are noise until
-                    # enough online data has trained them.
-                    offline_novelty = exploration_bonuses.compute_first_rnd_novelty(
-                        exploration_bonus_state, offline_transitions
-                    )
+                    # EXPLORE: relabel offline transitions with optimistic
+                    # UCB. UCB owns its internal RND novelty source, so we
+                    # just pass the offline batch — the relabel reads novelty
+                    # from UCB's predictor (read-only) and adds r_θ + ucb_coeff
+                    # * novelty for the reward, plus 1 - sigmoid(T̂) for the
+                    # discount. Gated by warmup: the reward/term predictors
+                    # are noise until enough online data has trained them.
                     relabeled_offline = exploration_bonuses.relabel_offline_with_ucb(
-                        exploration_bonus_state, offline_transitions, offline_novelty,
+                        exploration_bonus_state, offline_transitions,
                     )
                     past_warmup = training_state.env_steps >= ucb_warmup
                     new_reward = jnp.where(

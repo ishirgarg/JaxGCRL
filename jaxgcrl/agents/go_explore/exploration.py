@@ -42,6 +42,21 @@ class StatelessBonusState:
 
 
 @fdataclass
+class UCBBonusState:
+    """Combined state for the UCB (EXPLORE) bonus.
+
+    Wraps two trainable substates:
+      * ``explore`` — reward and termination predictors (see explore.py).
+      * ``rnd`` — UCB's INTERNAL RND target/predictor for the novelty term.
+        Separate from any standalone ``"rnd"`` bonus the user might co-list,
+        so listing ``"ucb"`` alone gives full EXPLORE without polluting
+        online rewards with an additive RND shaping.
+    """
+    explore: Any
+    rnd: Any
+
+
+@fdataclass
 class RNDBonusState:
     """Mutable state for Random Network Distillation.
 
@@ -171,7 +186,7 @@ def create_exploration_bonus(
     if bonus_type == "ucb":
         if ucb_action_size is None:
             raise ValueError("'ucb' bonus requires ucb_action_size to be set.")
-        bonus_fn, st, ucb_train_fn, ucb_relabel_fn = _create_ucb_bonus(
+        bonus_fn, st, init_fn, ucb_train_fn, ucb_relabel_fn = _create_ucb_bonus(
             state_size=state_size,
             action_size=ucb_action_size,
             key=key,
@@ -179,8 +194,15 @@ def create_exploration_bonus(
             hidden_dim=ucb_hidden_dim,
             num_hidden=ucb_num_hidden,
             learning_rate=ucb_learning_rate,
+            rnd_feature_dim=rnd_feature_dim,
+            rnd_hidden_dim=rnd_hidden_dim,
+            rnd_num_hidden=rnd_num_hidden,
+            rnd_learning_rate=rnd_learning_rate,
+            rnd_obs_clip=rnd_obs_clip,
+            rnd_use_goal=rnd_use_goal,
+            goal_indices=goal_indices,
         )
-        return bonus_fn, st, None, None, None, ucb_train_fn, ucb_relabel_fn
+        return bonus_fn, st, init_fn, None, None, ucb_train_fn, ucb_relabel_fn
     raise ValueError(f"Unknown exploration bonus type: {bonus_type!r}")
 
 
@@ -482,31 +504,62 @@ def _create_ucb_bonus(
     hidden_dim: int = 256,
     num_hidden: int = 2,
     learning_rate: float = 3e-4,
-) -> Tuple[BonusFn, Any, UCBTrainFn, UCBRelabelFn]:
+    # Internal-RND knobs (separate from any standalone "rnd" bonus). Defaults
+    # mirror _create_rnd_bonus so the novelty source behaves identically.
+    rnd_feature_dim: int = 64,
+    rnd_hidden_dim: int = 256,
+    rnd_num_hidden: int = 2,
+    rnd_learning_rate: float = 1e-4,
+    rnd_obs_clip: float = 5.0,
+    rnd_use_goal: bool = False,
+    goal_indices: Optional[Sequence[int]] = None,
+) -> Tuple[BonusFn, UCBBonusState, InitFromStatesFn, UCBTrainFn, UCBRelabelFn]:
     """EXPLORE: optimistic UCB reward labeling for offline data.
 
-    The reward predictor r_θ(s,a) and termination predictor T̂_θ(s,a) live in
-    the bonus state; the actual UCB labeling and predictor training are
-    invoked by the agent through ``ExplorationBonuses.relabel_offline_with_ucb``
-    and ``train_ucb`` (NOT through the additive ``compute()`` pipeline, which
-    would touch online transitions too). This bonus's ``compute()`` therefore
-    returns zeros — UCB doesn't shape the reward additively, it relabels the
-    offline batch in place.
+    Owns its own RND target/predictor for the novelty term so listing ``"ucb"``
+    alone gives full EXPLORE — no need to co-list a standalone ``"rnd"`` bonus
+    (which would also additively shape *online* rewards, defeating the
+    EXPLORE design where online uses true env rewards untouched).
 
-    Source the novelty term from a co-listed ``"rnd"`` bonus via
-    ``ExplorationBonuses.compute_first_rnd_novelty``; the agent passes that
-    novelty into ``relabel_fn``. The ``ucb_coeff`` is baked into the relabel
-    closure so callers don't have to thread it.
+    The reward predictor r_θ(s,a), termination predictor T̂_θ(s,a), and
+    internal RND networks live in :class:`UCBBonusState`. UCB doesn't shape
+    rewards additively, so its ``bonus_fn`` returns zeros — the actual work
+    happens via separate ``relabel_fn`` and ``train_fn`` invoked by the agent
+    through :class:`ExplorationBonuses`.
     """
     from .explore import create_explore_ucb_models
 
-    initial_state, train_fn, raw_relabel_fn = create_explore_ucb_models(
+    explore_key, rnd_key = jax.random.split(key)
+
+    explore_initial_state, explore_train_fn, explore_relabel_fn = create_explore_ucb_models(
         state_size=state_size,
         action_size=action_size,
         hidden_dim=hidden_dim,
         num_hidden=num_hidden,
         learning_rate=learning_rate,
-        key=key,
+        key=explore_key,
+    )
+
+    # Internal RND novelty source. We use the bonus_fn's read-only side
+    # (novelty_fn) for relabeling and the train_fn for keeping the predictor
+    # focused on online transitions only.
+    _rnd_bonus_fn, rnd_initial_state, rnd_init_from_states_fn, rnd_novelty_fn, rnd_train_fn = (
+        _create_rnd_bonus(
+            state_size=state_size,
+            key=rnd_key,
+            feature_dim=rnd_feature_dim,
+            hidden_dim=rnd_hidden_dim,
+            num_hidden=rnd_num_hidden,
+            learning_rate=rnd_learning_rate,
+            obs_clip=rnd_obs_clip,
+            use_goal=rnd_use_goal,
+            goal_indices=goal_indices,
+        )
+    )
+
+    initial_state = UCBBonusState(
+        explore=explore_initial_state,
+        rnd=rnd_initial_state,
     )
 
     def ucb_bonus(state, transitions, bonus_key):
@@ -515,12 +568,38 @@ def _create_ucb_bonus(
         zeros = jnp.zeros_like(transitions.reward)
         return zeros, state, {}
 
+    def ucb_init_from_states(state: UCBBonusState, states: jnp.ndarray) -> UCBBonusState:
+        """Seed UCB's internal RND obs-norm stats from a batch of observed states."""
+        return state.replace(rnd=rnd_init_from_states_fn(state.rnd, states))
+
     coeff = float(ucb_coeff)
 
-    def relabel_with_baked_coeff(state, transitions, novelty):
-        return raw_relabel_fn(state, transitions, novelty, coeff)
+    def ucb_relabel(state: UCBBonusState, transitions):
+        """Relabel ``transitions`` (intended: offline) with UCBR + predicted-discount.
 
-    return ucb_bonus, initial_state, train_fn, relabel_with_baked_coeff
+        Reads the novelty term from UCB's internal RND in a read-only way —
+        UCB's RND predictor is updated separately on online transitions via
+        :meth:`ExplorationBonuses.train_ucb`, so evaluating it on offline (s, a)
+        does not contaminate the predictor.
+        """
+        novelty = rnd_novelty_fn(state.rnd, transitions)
+        relabeled = explore_relabel_fn(state.explore, transitions, novelty, coeff)
+        return relabeled
+
+    def ucb_train(state: UCBBonusState, online_transitions, num_grad_steps: int = 1):
+        """Train all UCB-internal trainables on an online batch.
+
+        Updates: reward predictor (MSE on r), termination predictor (BCE on
+        T from discount), and the internal RND predictor (MSE on frozen
+        target features).
+        """
+        new_explore, m_explore = explore_train_fn(state.explore, online_transitions, num_grad_steps)
+        new_rnd, m_rnd = rnd_train_fn(state.rnd, online_transitions, num_grad_steps)
+        new_state = state.replace(explore=new_explore, rnd=new_rnd)
+        metrics = {**m_explore, **{f"ucb_internal_{k}": v for k, v in m_rnd.items()}}
+        return new_state, metrics
+
+    return ucb_bonus, initial_state, ucb_init_from_states, ucb_train, ucb_relabel
 
 
 class ExplorationBonuses:
@@ -638,20 +717,19 @@ class ExplorationBonuses:
         """True iff a ``"ucb"`` bonus is configured (EXPLORE algorithm enabled)."""
         return self._ucb_index is not None
 
-    def relabel_offline_with_ucb(self, state: Tuple, offline_transitions, novelty: jnp.ndarray):
+    def relabel_offline_with_ucb(self, state: Tuple, offline_transitions):
         """Relabel offline transitions in place: reward → UCBR, discount → 1 - sigmoid(T̂).
 
-        ``novelty`` is the per-transition RND novelty term (typically obtained
-        via :meth:`compute_first_rnd_novelty`). Reads the UCB predictor params
-        from ``state`` at the UCB bonus's slot — does NOT modify state, since
-        UCB predictors are trained separately via :meth:`train_ucb`.
+        UCB owns its internal RND novelty source — no external novelty needs
+        to be supplied. Read-only over the UCB bonus state; predictor updates
+        happen separately via :meth:`train_ucb`.
         """
         if self._ucb_index is None:
             raise RuntimeError(
                 "relabel_offline_with_ucb called but no 'ucb' bonus configured."
             )
         i = self._ucb_index
-        return self._ucb_relabel_fns[i](state[i], offline_transitions, novelty)
+        return self._ucb_relabel_fns[i](state[i], offline_transitions)
 
     def train_ucb(self, state: Tuple, online_transitions, num_grad_steps: int = 1):
         """Train reward + termination predictors on online transitions.
