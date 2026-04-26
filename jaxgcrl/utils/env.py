@@ -71,6 +71,7 @@ legal_envs = (
     "ant_ball_4d_ogbench_easy_square",
     "ant_maze_ogbench_arena",
     "ant_maze_ogbench_medium_navigate",
+    "ant_maze_ogbench_medium_explore",
     "ant_u_maze",
     "ant_u_maze_hard",
     "ant_big_maze",
@@ -138,6 +139,10 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
             # defaults to mjx so physics match the OGBench offline dataset
             # (timestep=0.02, RK4, gear=30). Legacy layouts stay on spring.
             layout = env_name[4:]
+            # The "_explore" variant reuses the medium maze layout; only the
+            # offline dataset differs (antmaze-medium-explore-v0).
+            if layout == "maze_ogbench_medium_explore":
+                layout = "maze_ogbench_medium_navigate"
             if "ogbench" in layout:
                 env = AntMaze(backend=backend or "spring", maze_layout_name=layout)
             else:
