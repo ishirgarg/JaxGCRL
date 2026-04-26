@@ -260,6 +260,21 @@ class GoExploreSimple:
     # If True, RND operates on state[goal_indices] only (novelty over goal dims).
     use_goal_for_rnd: bool = False
 
+    # ── EXPLORE (UCB labeling of offline data) ─────────────────────────────
+    # Enabled by listing "ucb" alongside "rnd" in `exploration_bonus_type`.
+    # When present, trains a reward predictor r_θ(s,a) and termination
+    # predictor T̂_θ(s,a) on online transitions; relabels each sampled offline
+    # transition with UCBR = r_θ + ucb_coeff * (1/L)||f_φ - f̄||² (RND novelty)
+    # and discount = 1 - sigmoid(T̂). Requires use_rlpd=True, agent_type='sac',
+    # and a co-listed "rnd" bonus to source novelty (its weight may be 0.0 if
+    # you only want EXPLORE labeling without additive RND reward shaping).
+    ucb_coeff: float = 1.0
+    ucb_lr: float = 3e-4
+    ucb_hidden_dim: int = 256
+    ucb_num_hidden: int = 2
+    ucb_grad_steps_per_train_step: int = 1
+    ucb_warmup_env_steps: int = 10000  # state-based default from the paper
+
     # ── Go Explore specific parameters ──────────────────────────────────────
     num_gcp_steps: int = 250      # max steps in go phase before forcing explore
     num_ep_steps: int = 250        # steps in explore phase before reset to go
@@ -570,8 +585,30 @@ class GoExploreSimple:
             rnd_obs_clip=self.rnd_obs_clip,
             rnd_use_goal=self.use_goal_for_rnd,
             goal_indices=goal_indices_tuple,
+            ucb_action_size=action_size,
+            ucb_coeff=self.ucb_coeff,
+            ucb_hidden_dim=self.ucb_hidden_dim,
+            ucb_num_hidden=self.ucb_num_hidden,
+            ucb_learning_rate=self.ucb_lr,
         )
         exploration_bonus_state = exploration_bonuses.initial_state
+
+        # ── EXPLORE preconditions ───────────────────────────────────────────
+        # "ucb" in the bonus list switches on offline UCB labeling. Validate
+        # the algorithm preconditions here so a misconfiguration fails fast.
+        if exploration_bonuses.has_ucb:
+            if not self.use_rlpd:
+                raise ValueError("'ucb' bonus requires use_rlpd=True (no offline data otherwise).")
+            if not exploration_bonuses.has_rnd_novelty:
+                raise ValueError(
+                    "'ucb' bonus requires a co-listed 'rnd' bonus to source the "
+                    "novelty term. The RND weight can be 0.0 if you only want "
+                    "EXPLORE labeling without additive RND reward shaping."
+                )
+            # CRL also supported: the exploration_q_critic (auto-enabled when
+            # exploration_bonus_type is non-None) is reward-based, so UCB-
+            # relabeled offline rewards flow into it via
+            # exploration_reward_per_batch below.
 
         # Goal-index columns captured for the exploration-bonus heatmap viz.
         goal_indices_arr = jnp.asarray(
@@ -807,6 +844,10 @@ class GoExploreSimple:
             return (training_state, key), metrics
 
         # ── training_step ─────────────────────────────────────────────────────
+        has_ucb = exploration_bonuses.has_ucb
+        ucb_warmup = jnp.asarray(self.ucb_warmup_env_steps, dtype=jnp.float32)
+        ucb_grad_steps = int(self.ucb_grad_steps_per_train_step)
+
         @jax.jit
         def training_step(
             training_state, env_state, buffer_state, key,
@@ -830,6 +871,31 @@ class GoExploreSimple:
                 # Mix 50% offline data: concatenate along num_envs axis
                 offline_key, process_key = jax.random.split(process_key)
                 offline_transitions = offline_buffer.sample(offline_key, config.num_envs)
+
+                if has_ucb:
+                    # EXPLORE: read RND novelty without updating predictor
+                    # params (so RND keeps focusing on *online* novelty even
+                    # though we evaluate it on offline (s, a)) and relabel
+                    # offline transitions with optimistic UCB. Gated by
+                    # warmup: the reward/term predictors are noise until
+                    # enough online data has trained them.
+                    offline_novelty = exploration_bonuses.compute_first_rnd_novelty(
+                        exploration_bonus_state, offline_transitions
+                    )
+                    relabeled_offline = exploration_bonuses.relabel_offline_with_ucb(
+                        exploration_bonus_state, offline_transitions, offline_novelty,
+                    )
+                    past_warmup = training_state.env_steps >= ucb_warmup
+                    new_reward = jnp.where(
+                        past_warmup, relabeled_offline.reward, offline_transitions.reward,
+                    )
+                    new_discount = jnp.where(
+                        past_warmup, relabeled_offline.discount, offline_transitions.discount,
+                    )
+                    offline_transitions = offline_transitions._replace(
+                        reward=new_reward, discount=new_discount,
+                    )
+
                 transitions = jax.tree_util.tree_map(
                     lambda a, b: jnp.concatenate([a, b], axis=0),
                     online_transitions, offline_transitions,
@@ -869,8 +935,16 @@ class GoExploreSimple:
                 )
                 exploration_reward_per_batch = jnp.zeros_like(transitions.reward)
             else:
-                # CRL: leave env reward untouched; feed weighted bonus to Q_exp.
-                exploration_reward_per_batch = total_bonus
+                # CRL: feed weighted bonus to Q_exp. With UCB enabled, also
+                # add transitions.reward — which now carries true env reward
+                # on online rows AND UCBR(s,a) on offline rows (set in
+                # relabel_offline_with_ucb above) — so the exploration_q_critic
+                # learns the EXPLORE-shaped signal in CRL mode the same way
+                # the SAC critic does.
+                if has_ucb:
+                    exploration_reward_per_batch = total_bonus + transitions.reward
+                else:
+                    exploration_reward_per_batch = total_bonus
 
             reward_viz = (
                 transitions.observation[..., 0],
@@ -887,6 +961,27 @@ class GoExploreSimple:
             )
             metrics.update(bonus_metrics)
             metrics["reward_mean"] = jnp.mean(transitions.reward)
+
+            # Train all bonus-side trainables (RND predictor, etc.) on the
+            # *online* batch only. compute() above is read-only over predictor
+            # params, so RND novelty stays meaningful for offline rows: it
+            # reflects "novel relative to what's been seen ONLINE". The reward-
+            # stats normalizer inside compute() still tracks the full batch.
+            if exploration_bonuses.has_trainables:
+                exploration_bonus_state, online_train_metrics = exploration_bonuses.train(
+                    exploration_bonus_state, online_transitions, 1,
+                )
+                metrics.update(online_train_metrics)
+
+            if has_ucb:
+                # Train reward + termination predictors on the *online* batch
+                # (true r and termination flags). Always train; UCB labeling
+                # is the part gated by warmup, so the predictors keep learning
+                # from step 0 and are usable as soon as warmup ends.
+                exploration_bonus_state, ucb_metrics = exploration_bonuses.train_ucb(
+                    exploration_bonus_state, online_transitions, ucb_grad_steps,
+                )
+                metrics.update(ucb_metrics)
 
             # Snapshot Q_exp(obs, action) on the final batch of the scan so the
             # training loop can log an xy scatter of the exploration Q values.
