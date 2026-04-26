@@ -69,9 +69,13 @@ def flatten_batch(buffer_config, transition, sample_key):
 
     extras = {
         "policy_extras": {},
+        # Carry every per-step state_extras key through with the same [:-1]
+        # slice. This lets callers stash auxiliary per-row tensors (e.g. an
+        # `is_online` mask used to gate exploration bonuses to online rows
+        # only) without touching this function.
         "state_extras": {
-            "truncation": jnp.squeeze(transition.extras["state_extras"]["truncation"][:-1]),
-            "traj_id": jnp.squeeze(transition.extras["state_extras"]["traj_id"][:-1]),
+            k: jnp.squeeze(v[:-1])
+            for k, v in transition.extras["state_extras"].items()
         },
         "state": state,
         "future_state": future_state,

@@ -247,6 +247,9 @@ class GoExploreSimple:
     exploration_bonus_type: Optional[Tuple[str, ...]] = None
     exploration_bonus_weight: Tuple[float, ...] = (0.1,)
 
+    # Global-norm clip on the exploration Q critic gradients. None disables.
+    exploration_q_grad_clip_norm: Optional[float] = 5.0
+
     # Empowerment global normalization: emitted bonus is (raw_emp - mean) / scale.
     empowerment_bonus_mean: float = 1.3
     empowerment_bonus_scale: float = 0.2
@@ -413,7 +416,8 @@ class GoExploreSimple:
                 exp_q_critic_key, np.ones([1, obs_size])
             )
             exploration_q_critic_states = exploration_q_critic.create_critic_states(
-                exploration_q_critic_params, self.critic_lr
+                exploration_q_critic_params, self.critic_lr,
+                grad_clip_norm=self.exploration_q_grad_clip_norm,
             )
             exploration_q_target_critic_params = exploration_q_critic_params
 
@@ -866,10 +870,50 @@ class GoExploreSimple:
             # GCP update on all transitions
             buffer_state, online_transitions = replay_buffer.sample(buffer_state)
 
+            # Tag online rows so the exploration bonus can be masked to apply
+            # only to online data after the concat+permute below. Also add
+            # UCB's RND novelty to online rewards directly (the offline path
+            # gets full UCBR via relabel_offline_with_ucb instead).
+            online_is_online = jnp.ones_like(online_transitions.reward)
+            online_extras = {
+                **online_transitions.extras,
+                "state_extras": {
+                    **online_transitions.extras["state_extras"],
+                    "is_online": online_is_online,
+                },
+            }
+            if has_ucb:
+                ucb_novelty_online = exploration_bonuses.compute_ucb_online_novelty_bonus(
+                    exploration_bonus_state, online_transitions,
+                )
+                # Gate by UCB warmup the same way offline relabeling is.
+                past_warmup = training_state.env_steps >= ucb_warmup
+                ucb_novelty_online = jnp.where(
+                    past_warmup, ucb_novelty_online, jnp.zeros_like(ucb_novelty_online),
+                )
+                online_transitions = online_transitions._replace(
+                    reward=online_transitions.reward + ucb_novelty_online,
+                    extras=online_extras,
+                )
+            else:
+                online_transitions = online_transitions._replace(extras=online_extras)
+
             if self.use_rlpd:
                 # Mix 50% offline data: concatenate along num_envs axis
                 offline_key, process_key = jax.random.split(process_key)
                 offline_transitions = offline_buffer.sample(offline_key, config.num_envs)
+
+                # Tag offline rows with 0s so the bonus mask zeroes them out.
+                offline_is_online = jnp.zeros_like(offline_transitions.reward)
+                offline_transitions = offline_transitions._replace(
+                    extras={
+                        **offline_transitions.extras,
+                        "state_extras": {
+                            **offline_transitions.extras["state_extras"],
+                            "is_online": offline_is_online,
+                        },
+                    }
+                )
 
                 if has_ucb:
                     # EXPLORE: relabel offline transitions with optimistic
@@ -921,10 +965,15 @@ class GoExploreSimple:
             # SAC we add the weighted total to the post-HER reward so it shapes
             # the critic/actor via Q; for CRL we instead train a separate Q_exp
             # on the weighted per-transition bonus and add -Q_exp to the CRL
-            # actor loss (see update_networks).
+            # actor loss (see update_networks). The is_online mask routes
+            # online-only bonuses (RND) to online rows only inside compute().
             bonus_key, train_key = jax.random.split(train_key)
+            is_online = transitions.extras["state_extras"]["is_online"]
             total_bonus, raw_total_bonus, exploration_bonus_state, bonus_metrics = (
-                exploration_bonuses.compute(exploration_bonus_state, transitions, bonus_key)
+                exploration_bonuses.compute(
+                    exploration_bonus_state, transitions, bonus_key,
+                    is_online=is_online,
+                )
             )
             if self.agent_type == "sac":
                 transitions = transitions._replace(

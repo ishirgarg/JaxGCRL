@@ -95,6 +95,10 @@ NoveltyFn = Optional[Callable[[Any, Any], jnp.ndarray]]
 # RND novelty term to ``relabel_fn`` (sourced via compute_first_rnd_novelty).
 UCBTrainFn = Optional[Callable[[Any, Any, int], Tuple[Any, dict]]]
 UCBRelabelFn = Optional[Callable[[Any, Any, jnp.ndarray], Any]]
+# Per-bonus online-bonus hook (only set on the "ucb" bonus): returns
+# ``ucb_coeff * RND_novelty`` for the given transitions, used by the agent to
+# add UCB's RND novelty term to ONLINE rewards without overwriting them.
+UCBOnlineBonusFn = Optional[Callable[[Any, Any], jnp.ndarray]]
 
 
 def create_exploration_bonus(
@@ -126,8 +130,8 @@ def create_exploration_bonus(
     ucb_hidden_dim: int = 256,
     ucb_num_hidden: int = 2,
     ucb_learning_rate: float = 3e-4,
-) -> Tuple[BonusFn, Any, InitFromStatesFn, NoveltyFn, TrainFn, UCBTrainFn, UCBRelabelFn]:
-    """Factory: returns ``(bonus_fn, initial_state, init_from_states_fn, novelty_fn, train_fn, ucb_train_fn, ucb_relabel_fn)``.
+) -> Tuple[BonusFn, Any, InitFromStatesFn, NoveltyFn, TrainFn, UCBTrainFn, UCBRelabelFn, UCBOnlineBonusFn]:
+    """Factory: returns ``(bonus_fn, initial_state, init_from_states_fn, novelty_fn, train_fn, ucb_train_fn, ucb_relabel_fn, ucb_online_bonus_fn)``.
 
     ``novelty_fn`` is non-None only for RND bonuses; it returns the per-transition
     ``(1/L) * ||f_phi - f_bar||²`` raw novelty without updating predictor params,
@@ -169,7 +173,7 @@ def create_exploration_bonus(
             precomputed_scorer=empowerment_precomputed_scorer,
             use_full_obs=empowerment_use_full_obs,
         )
-        return bonus_fn, st, init_fn, None, None, None, None
+        return bonus_fn, st, init_fn, None, None, None, None, None
     if bonus_type == "rnd":
         bonus_fn, st, init_fn, novelty_fn, train_fn = _create_rnd_bonus(
             state_size=state_size,
@@ -182,11 +186,11 @@ def create_exploration_bonus(
             use_goal=rnd_use_goal,
             goal_indices=goal_indices,
         )
-        return bonus_fn, st, init_fn, novelty_fn, train_fn, None, None
+        return bonus_fn, st, init_fn, novelty_fn, train_fn, None, None, None
     if bonus_type == "ucb":
         if ucb_action_size is None:
             raise ValueError("'ucb' bonus requires ucb_action_size to be set.")
-        bonus_fn, st, init_fn, ucb_train_fn, ucb_relabel_fn = _create_ucb_bonus(
+        bonus_fn, st, init_fn, ucb_train_fn, ucb_relabel_fn, ucb_online_bonus_fn = _create_ucb_bonus(
             state_size=state_size,
             action_size=ucb_action_size,
             key=key,
@@ -586,6 +590,16 @@ def _create_ucb_bonus(
         relabeled = explore_relabel_fn(state.explore, transitions, novelty, coeff)
         return relabeled
 
+    def ucb_online_bonus(state: UCBBonusState, transitions):
+        """Per-transition ``ucb_coeff * RND_novelty`` for online transitions.
+
+        Read-only over the RND state. Lets the agent add UCB's RND novelty to
+        online rewards (without overwriting them with the reward predictor
+        ``r_θ``, which is the offline-relabel path).
+        """
+        novelty = rnd_novelty_fn(state.rnd, transitions)
+        return jnp.asarray(coeff, dtype=novelty.dtype) * novelty
+
     def ucb_train(state: UCBBonusState, online_transitions, num_grad_steps: int = 1):
         """Train all UCB-internal trainables on an online batch.
 
@@ -599,7 +613,7 @@ def _create_ucb_bonus(
         metrics = {**m_explore, **{f"ucb_internal_{k}": v for k, v in m_rnd.items()}}
         return new_state, metrics
 
-    return ucb_bonus, initial_state, ucb_init_from_states, ucb_train, ucb_relabel
+    return ucb_bonus, initial_state, ucb_init_from_states, ucb_train, ucb_relabel, ucb_online_bonus
 
 
 class ExplorationBonuses:
@@ -622,6 +636,7 @@ class ExplorationBonuses:
         train_fns: Tuple[TrainFn, ...] = (),
         ucb_train_fns: Tuple[UCBTrainFn, ...] = (),
         ucb_relabel_fns: Tuple[UCBRelabelFn, ...] = (),
+        ucb_online_bonus_fns: Tuple[UCBOnlineBonusFn, ...] = (),
     ):
         self.bonus_types = bonus_types
         self.weights = weights
@@ -632,6 +647,7 @@ class ExplorationBonuses:
         self._train_fns = train_fns or tuple(None for _ in fns)
         self._ucb_train_fns = ucb_train_fns or tuple(None for _ in fns)
         self._ucb_relabel_fns = ucb_relabel_fns or tuple(None for _ in fns)
+        self._ucb_online_bonus_fns = ucb_online_bonus_fns or tuple(None for _ in fns)
         self.is_empty = len(fns) == 0
         self.has_trainables = any(fn is not None for fn in self._train_fns)
         # Cache the index of the first "ucb" bonus for fast access.
@@ -639,11 +655,21 @@ class ExplorationBonuses:
             (i for i, bt in enumerate(bonus_types) if bt == "ucb"), None
         )
 
+    # Bonus types whose additive contribution is restricted to ONLINE rows.
+    # RND alone qualifies: it's a novelty signal trained on online states, so
+    # firing it on offline rows would just reward "different from online" not
+    # "novel to the agent". Empowerment is an offline scorer that gives a
+    # meaningful reading on offline rows too. UCB's bonus_fn returns zeros
+    # (it shapes rewards via separate offline-relabel and online-novelty paths),
+    # so masking it would be a no-op either way.
+    _ONLINE_ONLY_BONUS_TYPES = frozenset({"rnd"})
+
     def compute(
         self,
         state: Tuple,
         transitions,
         key: jax.Array,
+        is_online: Optional[jnp.ndarray] = None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, Tuple, dict]:
         """Return ``(weighted_total, raw_total, new_state, metrics)``.
 
@@ -652,6 +678,11 @@ class ExplorationBonuses:
         ``sum_i bonus_i`` is the un-scaled sum of the raw bonuses; callers
         that want to train a separate Q_exp *and* apply the weight at the
         actor loss (rather than at the reward) should use this instead.
+
+        When ``is_online`` is provided (per-row 0/1 mask shaped like
+        ``transitions.reward``), bonuses whose type is in
+        ``_ONLINE_ONLY_BONUS_TYPES`` (currently just ``"rnd"``) are multiplied
+        by it so offline rows get no contribution from those bonuses.
         """
         if self.is_empty:
             zeros = jnp.zeros_like(transitions.reward)
@@ -666,6 +697,8 @@ class ExplorationBonuses:
             zip(self.fns, self.weights, self.bonus_types, keys)
         ):
             bonus, new_state_i, m = fn(state[i], transitions, sub_key)
+            if is_online is not None and bt in self._ONLINE_ONLY_BONUS_TYPES:
+                bonus = bonus * is_online
             total = total + jnp.asarray(weight, dtype=total.dtype) * bonus
             raw_total = raw_total + bonus
             new_states.append(new_state_i)
@@ -716,6 +749,20 @@ class ExplorationBonuses:
     def has_ucb(self) -> bool:
         """True iff a ``"ucb"`` bonus is configured (EXPLORE algorithm enabled)."""
         return self._ucb_index is not None
+
+    def compute_ucb_online_novelty_bonus(self, state: Tuple, transitions) -> jnp.ndarray:
+        """Per-transition ``ucb_coeff * RND_novelty`` from UCB's internal RND.
+
+        Returns zeros (shaped like ``transitions.reward``) when no UCB bonus is
+        configured. Read-only over UCB's internal RND state. Intended for
+        adding UCB's RND novelty term to ONLINE rewards (the offline path uses
+        :meth:`relabel_offline_with_ucb` which overwrites the reward with
+        ``r_θ + ucb_coeff * novelty`` instead).
+        """
+        if self._ucb_index is None:
+            return jnp.zeros_like(transitions.reward)
+        i = self._ucb_index
+        return self._ucb_online_bonus_fns[i](state[i], transitions)
 
     def relabel_offline_with_ucb(self, state: Tuple, offline_transitions):
         """Relabel offline transitions in place: reward → UCBR, discount → 1 - sigmoid(T̂).
@@ -820,10 +867,10 @@ def create_exploration_bonuses(
 
     fns, states, init_fns, novelty_fns = [], [], [], []
     train_fns: list = []
-    ucb_train_fns, ucb_relabel_fns = [], []
+    ucb_train_fns, ucb_relabel_fns, ucb_online_bonus_fns = [], [], []
     for bt in types_tuple:
         key, sub_key = jax.random.split(key)
-        fn, st, init_fn, novelty_fn, train_fn, ucb_train_fn, ucb_relabel_fn = create_exploration_bonus(
+        fn, st, init_fn, novelty_fn, train_fn, ucb_train_fn, ucb_relabel_fn, ucb_online_bonus_fn = create_exploration_bonus(
             bt,
             env=env,
             state_size=state_size,
@@ -856,6 +903,7 @@ def create_exploration_bonuses(
         train_fns.append(train_fn)
         ucb_train_fns.append(ucb_train_fn)
         ucb_relabel_fns.append(ucb_relabel_fn)
+        ucb_online_bonus_fns.append(ucb_online_bonus_fn)
 
     return ExplorationBonuses(
         bonus_types=types_tuple,
@@ -867,4 +915,5 @@ def create_exploration_bonuses(
         train_fns=tuple(train_fns),
         ucb_train_fns=tuple(ucb_train_fns),
         ucb_relabel_fns=tuple(ucb_relabel_fns),
+        ucb_online_bonus_fns=tuple(ucb_online_bonus_fns),
     )
