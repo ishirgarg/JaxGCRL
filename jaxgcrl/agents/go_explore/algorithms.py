@@ -373,16 +373,8 @@ class SACCritic(Critic):
         # params is the inner dict (unwrapped), need to wrap it for Flax network.apply()
         return self.network.apply({"params": params}, obs, actions)
     
-    def create_critic_states(self, critic_params: dict, learning_rate: float,
-                             grad_clip_norm: float | None = None) -> Tuple[TrainState, ...]:
+    def create_critic_states(self, critic_params: dict, learning_rate: float) -> Tuple[TrainState, ...]:
         """Create separate TrainState for each critic from full critic params (SAC structure)."""
-        if grad_clip_norm is not None:
-            tx = optax.chain(
-                optax.clip_by_global_norm(grad_clip_norm),
-                optax.adam(learning_rate=learning_rate),
-            )
-        else:
-            tx = optax.adam(learning_rate=learning_rate)
         critic_states = []
         for i in range(self.n_critics):
             # SAC structure: critic_{i}_hidden_{j} and critic_{i}_output
@@ -395,7 +387,7 @@ class SACCritic(Critic):
             critic_i_state = TrainState.create(
                 apply_fn=None,  # Not needed for individual critic updates
                 params=critic_i_params,
-                tx=tx,
+                tx=optax.adam(learning_rate=learning_rate),
             )
             critic_states.append(critic_i_state)
         return tuple(critic_states)

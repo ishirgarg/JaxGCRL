@@ -247,9 +247,6 @@ class GoExploreSimple:
     exploration_bonus_type: Optional[Tuple[str, ...]] = None
     exploration_bonus_weight: Tuple[float, ...] = (0.1,)
 
-    # Global-norm clip on the exploration Q critic gradients. None disables.
-    exploration_q_grad_clip_norm: Optional[float] = 5.0
-
     # Empowerment global normalization: emitted bonus is (raw_emp - mean) / scale.
     empowerment_bonus_mean: float = 1.3
     empowerment_bonus_scale: float = 0.2
@@ -417,7 +414,6 @@ class GoExploreSimple:
             )
             exploration_q_critic_states = exploration_q_critic.create_critic_states(
                 exploration_q_critic_params, self.critic_lr,
-                grad_clip_norm=self.exploration_q_grad_clip_norm,
             )
             exploration_q_target_critic_params = exploration_q_critic_params
 
