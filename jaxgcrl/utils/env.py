@@ -81,6 +81,7 @@ legal_envs = (
     "humanoid_u_maze",
     "humanoid_big_maze",
     "humanoid_hardest_maze",
+    "humanoidmaze_ogbench_giant_stitch",
     "simple_u_maze",
     "simple_big_maze",
     "simple_hardest_maze",
@@ -133,8 +134,30 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         assert backend == "mjx" or backend is None
         env = AntPush(backend=backend or "mjx")
     elif "maze" in env_name:
+        # Order matters: "humanoid" must be matched before "ant" because the
+        # humanoidmaze layout names contain "giant" (which contains "ant").
         if "ant_ball" in env_name:
             env = AntBallMaze(backend=backend or "spring", maze_layout_name=env_name[9:])
+        elif "humanoid" in env_name:
+            # Possible env_name:
+            #   'humanoid_u_maze', 'humanoid_big_maze', 'humanoid_hardest_maze'
+            #     -> legacy Brax humanoid + humanoid_maze.xml (spring backend)
+            #   'humanoidmaze_ogbench_giant_stitch'
+            #     -> OGBench-aligned DMC humanoid + humanoid_maze_ogbench.xml,
+            #        69-dim obs that matches the humanoidmaze-giant-stitch
+            #        dataset. Defaults to `generalized` because the DMC
+            #        humanoid has stacked ankle joints at distinct local
+            #        positions which the spring/positional backends reject.
+            if env_name.startswith("humanoidmaze_"):
+                layout = env_name[len("humanoidmaze_"):]
+                env = HumanoidMaze(
+                    backend=backend or "generalized", maze_layout_name=layout
+                )
+            else:
+                layout = env_name[len("humanoid_"):]
+                env = HumanoidMaze(
+                    backend=backend or "spring", maze_layout_name=layout
+                )
         elif "ant" in env_name:
             # Any "ogbench"-tagged layout loads the ogbench-aligned XML and
             # defaults to mjx so physics match the OGBench offline dataset
@@ -148,9 +171,6 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
                 env = AntMaze(backend=backend or "spring", maze_layout_name=layout)
             else:
                 env = AntMaze(backend=backend or "spring", maze_layout_name=layout)
-        elif "humanoid" in env_name:
-            # Possible env_name = {'humanoid_u_maze', 'humanoid_big_maze', 'humanoid_hardest_maze'}
-            env = HumanoidMaze(backend=backend or "spring", maze_layout_name=env_name[9:])
         else:
             # Possible env_name = {'simple_u_maze', 'simple_big_maze', 'simple_hardest_maze'}
             env = SimpleMaze(backend=backend or "spring", maze_layout_name=env_name[7:])
