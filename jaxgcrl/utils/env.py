@@ -145,13 +145,13 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
             #   'humanoidmaze_ogbench_giant_stitch'
             #     -> OGBench-aligned DMC humanoid + humanoid_maze_ogbench.xml,
             #        69-dim obs that matches the humanoidmaze-giant-stitch
-            #        dataset. Defaults to `generalized` because the DMC
-            #        humanoid has stacked ankle joints at distinct local
-            #        positions which the spring/positional backends reject.
+            #        dataset. Defaults to `spring` for memory; pass
+            #        `--backend mjx` for tighter parity with the OGBench
+            #        offline dataset (mujoco-based) at higher cost.
             if env_name.startswith("humanoidmaze_"):
                 layout = env_name[len("humanoidmaze_"):]
                 env = HumanoidMaze(
-                    backend=backend or "generalized", maze_layout_name=layout
+                    backend=backend or "spring", maze_layout_name=layout
                 )
             else:
                 layout = env_name[len("humanoid_"):]

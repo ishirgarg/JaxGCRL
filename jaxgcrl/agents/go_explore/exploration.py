@@ -298,6 +298,7 @@ def _create_empowerment_bonus(
             template_rng=key,
             epoch=epoch,
             num_splus_samples=num_splus_samples,
+            use_full_obs=use_full_obs,
         )
         if use_full_obs:
             if state_size != int(_ex_obs_dim):

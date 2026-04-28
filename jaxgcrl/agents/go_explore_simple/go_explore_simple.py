@@ -454,6 +454,7 @@ class GoExploreSimple:
                 template_rng=empowerment_template_key,
                 epoch=self.empowerment_epoch,
                 num_splus_samples=self.empowerment_num_splus_samples,
+                use_full_obs=self.use_full_empowerment,
             )
             if self.use_full_empowerment:
                 if state_size != int(_ex_obs_dim):

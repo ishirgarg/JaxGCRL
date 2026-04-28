@@ -14,6 +14,7 @@ from jaxgcrl.envs.ant_ball import AntBall
 from jaxgcrl.envs.ant_ball_maze import AntBallMaze
 from jaxgcrl.envs.ant_ball_ogbench import AntBallOGBench
 from jaxgcrl.envs.ant_maze import AntMaze
+from jaxgcrl.envs.humanoid_maze import HumanoidMaze
 
 # Same override layout as ``plot_empowerment_ant_soccer`` (AntBall / AntBallMaze) and
 # ``plot_empowerment_ant_maze`` (AntMaze only overwrites ant x,y at obs[0:2]).
@@ -39,9 +40,17 @@ def infer_empowerment_override_indices_from_env(
         return (0, 1, 15, 16), (0, 1, -4, -3)
     if isinstance(jax_env, AntMaze):
         return (0, 1), (0, 1)
+    if isinstance(jax_env, HumanoidMaze):
+        if not getattr(jax_env, "_is_ogbench_layout", False):
+            raise ValueError(
+                "Empowerment mapping for HumanoidMaze requires the OGBench obs "
+                "layout (state[0:2] = root xy)."
+            )
+        return (0, 1), (0, 1)
     raise ValueError(
         "Offline empowerment mapping is only defined for AntMaze, AntBall, AntBallMaze, "
-        f"and AntBallOGBench; got env type {type(jax_env).__name__!r}."
+        "AntBallOGBench, and HumanoidMaze (OGBench layout); "
+        f"got env type {type(jax_env).__name__!r}."
     )
 
 
@@ -90,9 +99,17 @@ def build_empowerment_base_obs_template(
     if isinstance(jax_env, AntMaze):
         state = jax_env.reset(template_rng)
         return _jax_obs_resize_to_ex_dim(state.obs, ex_obs_dim)
+    if isinstance(jax_env, HumanoidMaze):
+        if not getattr(jax_env, "_is_ogbench_layout", False):
+            raise ValueError(
+                "Empowerment template for HumanoidMaze requires the OGBench obs layout."
+            )
+        state = jax_env.reset(template_rng)
+        return _jax_obs_resize_to_ex_dim(state.obs, ex_obs_dim)
     raise ValueError(
         "Empowerment base template is only defined for AntMaze, AntBall, AntBallMaze, "
-        f"and AntBallOGBench; got env type {type(jax_env).__name__!r}."
+        "AntBallOGBench, and HumanoidMaze (OGBench layout); "
+        f"got env type {type(jax_env).__name__!r}."
     )
 
 
@@ -202,6 +219,8 @@ def load_offline_empowerment_agent(
     template_rng: jax.Array,
     epoch: Optional[int] = None,
     num_splus_samples: int = 128,
+    *,
+    use_full_obs: bool = False,
 ):
     """Loads an OGBench empowerment agent checkpoint for offline scoring.
 
@@ -209,8 +228,17 @@ def load_offline_empowerment_agent(
     The observation template is built from ``jax_env`` and ``template_rng`` via
     ``build_empowerment_base_obs_template`` (no separate ant/ball arguments).
 
+    When ``use_full_obs`` is True the empowerment net is fed the full state row
+    directly, so the OGBench-shaped template is unused; we skip both the
+    ``make_env_and_datasets`` call (which loads the multi-GB offline dataset)
+    and the template construction. ``ex_obs_dim`` is derived from
+    ``jax_env.state_dim`` (must equal the checkpoint's obs dim, or the
+    agent restore will fail downstream) and the example batch is built from
+    zero arrays.
+
     Returns:
-        ``emp_agent``, ``ex_obs_dim``, ``base_obs_template`` (numpy, shape (ex_obs_dim,)).
+        ``emp_agent``, ``ex_obs_dim``, ``base_obs_template`` (numpy, shape
+        (ex_obs_dim,), or ``None`` when ``use_full_obs`` is True).
     """
     ogbench_root = infer_ogbench_root_from_run_dir(run_dir)
     agent_registry, make_env_and_datasets, restore_agent = _setup_external_imports(ogbench_root)
@@ -221,11 +249,34 @@ def load_offline_empowerment_agent(
     agent_cfg = dict(flags["agent"])
     agent_cfg["num_splus_samples"] = int(num_splus_samples)
     env_name_og = flags["env_name"]
-    env_og, train_dataset, _ = make_env_and_datasets(env_name_og, frame_stack=agent_cfg.get("frame_stack"))
-    example_batch = train_dataset.sample(1)
-    if agent_cfg.get("discrete"):
-        example_batch["actions"] = np.full_like(example_batch["actions"], env_og.action_space.n - 1)
-    ex_obs_dim = int(example_batch["observations"].shape[-1])
+
+    if use_full_obs:
+        if agent_cfg.get("discrete"):
+            raise NotImplementedError(
+                "use_full_obs=True does not support discrete OGBench checkpoints "
+                "(action_space.n is only known after make_env_and_datasets)."
+            )
+        ex_obs_dim = int(jax_env.state_dim)
+        action_size = int(jax_env.action_size)
+        example_batch = {
+            "observations": np.zeros((1, ex_obs_dim), dtype=np.float32),
+            "actions": np.zeros((1, action_size), dtype=np.float32),
+        }
+        base_obs_template = None
+    else:
+        env_og, train_dataset, _ = make_env_and_datasets(env_name_og, frame_stack=agent_cfg.get("frame_stack"))
+        example_batch = train_dataset.sample(1)
+        if agent_cfg.get("discrete"):
+            example_batch["actions"] = np.full_like(example_batch["actions"], env_og.action_space.n - 1)
+        ex_obs_dim = int(example_batch["observations"].shape[-1])
+        base_env = env_og.unwrapped if hasattr(env_og, "unwrapped") else env_og
+        base_obs_template = build_empowerment_base_obs_template(
+            jax_env,
+            env_og,
+            base_env,
+            ex_obs_dim,
+            template_rng,
+        )
 
     agent_class = agent_registry[agent_cfg["agent_name"]]
     emp_agent = agent_class.create(
@@ -237,14 +288,6 @@ def load_offline_empowerment_agent(
     use_epoch = _latest_epoch(run_dir) if epoch is None else int(epoch)
     emp_agent = restore_agent(emp_agent, run_dir, use_epoch)
 
-    base_env = env_og.unwrapped if hasattr(env_og, "unwrapped") else env_og
-    base_obs_template = build_empowerment_base_obs_template(
-        jax_env,
-        env_og,
-        base_env,
-        ex_obs_dim,
-        template_rng,
-    )
     return emp_agent, ex_obs_dim, base_obs_template
 
 
