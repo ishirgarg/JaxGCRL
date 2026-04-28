@@ -346,10 +346,28 @@ class HumanoidMaze(PipelineEnv):
             #      + torso_z_axis(3) + com_lin_vel(3) + qvel(27)
             self.state_dim = 69
             self.goal_indices = jnp.array([0, 1])
+            # MISC controllable_indices: directly-actuated DOFs only.
+            # state[2:23]  = 21 joint angles (qpos[7:])
+            # state[42:69] = qvel: root_linvel(3) + root_angvel(3) + 21 joint vels
+            #                so joint velocities are state[48:69].
+            self.controllable_indices = jnp.array(
+                list(range(2, 23)) + list(range(48, 69))
+            )
             self.goal_reach_thresh = 0.5
         else:
             self.state_dim = 268
             self.goal_indices = jnp.array([0, 1, 2])
+            # MISC controllable_indices: directly-actuated DOFs only.
+            # obs starts with full qpos (26 dims, includes 2 target slide joints
+            # at the end) then full qvel (25 dims).
+            #   state[0:7]   = root pose (xyz + quat)
+            #   state[7:24]  = 17 hinge angles  -> directly actuated
+            #   state[24:26] = target slide joints (goal-related)
+            #   state[26:32] = qvel root (3 linvel + 3 angvel)
+            #   state[32:49] = 17 hinge velocities  -> directly actuated
+            self.controllable_indices = jnp.array(
+                list(range(7, 24)) + list(range(32, 49))
+            )
             self.goal_reach_thresh = 0.5
 
     def reset(self, rng: jax.Array, goal=None, start=None) -> State:

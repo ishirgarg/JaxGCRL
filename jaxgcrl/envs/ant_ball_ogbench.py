@@ -360,6 +360,16 @@ class AntBallOGBench(PipelineEnv):
             self.goal_indices = jnp.array([0, 1, 15, 16])
         else:
             self.goal_indices = jnp.array([15, 16])  # ball x,y in qpos portion
+        # MISC controllable_indices: directly-actuated DOFs of the *ant* only.
+        # The ball is unactuated and is part of s_g (or downstream state); the
+        # ant's free root pose is downstream of joint torques + contact.
+        # state[0:15]  = ant qpos  (root xyz, root quat, 8 hinge angles -> 7..14)
+        # state[15:22] = ball qpos
+        # state[22:36] = ant qvel  (root linvel, root angvel, 8 hinge vels -> 28..35)
+        # state[36:42] = ball qvel
+        self.controllable_indices = jnp.array(
+            list(range(7, 15)) + list(range(28, 36))
+        )
         self.goal_reach_thresh = 0.5
 
         if self._use_contact_forces:

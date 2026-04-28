@@ -57,6 +57,22 @@ class UCBBonusState:
 
 
 @fdataclass
+class MISCBonusState:
+    """Mutable state for the MISC mutual-information intrinsic reward.
+
+    Holds the trainable parameters of the MI estimator T_phi (a small MLP),
+    its Adam optimizer state, and a PRNG key advanced each train step (to
+    produce a fresh trajectory-internal s_c permutation per update). T_phi
+    is trained by gradient ascent on the MINE lower bound (Eq. 7 LHS); the
+    per-transition reward (Eq. 6 surrogate) is computed read-only from the
+    same params.
+    """
+    predictor_params: Any
+    opt_state: Any
+    key: jax.Array
+
+
+@fdataclass
 class RNDBonusState:
     """Mutable state for Random Network Distillation.
 
@@ -130,6 +146,12 @@ def create_exploration_bonus(
     ucb_hidden_dim: int = 256,
     ucb_num_hidden: int = 2,
     ucb_learning_rate: float = 3e-4,
+    # MISC-specific
+    controllable_indices: Optional[Sequence[int]] = None,
+    misc_hidden_dim: int = 256,
+    misc_num_hidden: int = 3,
+    misc_learning_rate: float = 1e-3,
+    misc_alpha: float = 5000.0,
 ) -> Tuple[BonusFn, Any, InitFromStatesFn, NoveltyFn, TrainFn, UCBTrainFn, UCBRelabelFn, UCBOnlineBonusFn]:
     """Factory: returns ``(bonus_fn, initial_state, init_from_states_fn, novelty_fn, train_fn, ucb_train_fn, ucb_relabel_fn, ucb_online_bonus_fn)``.
 
@@ -187,6 +209,26 @@ def create_exploration_bonus(
             goal_indices=goal_indices,
         )
         return bonus_fn, st, init_fn, novelty_fn, train_fn, None, None, None
+    if bonus_type == "misc":
+        if goal_indices is None or len(goal_indices) == 0:
+            raise ValueError(
+                "'misc' bonus requires non-empty goal_indices (s_g)."
+            )
+        if controllable_indices is None or len(controllable_indices) == 0:
+            raise ValueError(
+                "'misc' bonus requires non-empty controllable_indices (s_c)."
+            )
+        bonus_fn, st, init_fn, train_fn = _create_misc_bonus(
+            state_size=state_size,
+            key=key,
+            goal_indices=goal_indices,
+            controllable_indices=controllable_indices,
+            hidden_dim=misc_hidden_dim,
+            num_hidden=misc_num_hidden,
+            learning_rate=misc_learning_rate,
+            alpha=misc_alpha,
+        )
+        return bonus_fn, st, init_fn, None, train_fn, None, None, None
     if bonus_type == "ucb":
         if ucb_action_size is None:
             raise ValueError("'ucb' bonus requires ucb_action_size to be set.")
@@ -499,6 +541,189 @@ def _create_rnd_bonus(
     return rnd_bonus, initial_state, init_from_states, novelty_only, rnd_train
 
 
+def _create_misc_bonus(
+    *,
+    state_size: int,
+    key: jax.Array,
+    goal_indices: Sequence[int],
+    controllable_indices: Sequence[int],
+    hidden_dim: int = 256,
+    num_hidden: int = 3,
+    learning_rate: float = 1e-3,
+    alpha: float = 5000.0,
+) -> Tuple[BonusFn, MISCBonusState, InitFromStatesFn, TrainFn]:
+    """MISC: Mutual Information State-Controllable intrinsic reward.
+
+    Trains an MI estimator ``T_phi(s_g, s_c) -> R`` by gradient ascent on the
+    MINE lower bound (Eq. 7 LHS) with random temporal shuffles inside each
+    sampled trajectory (the marginal sampler). Per-transition reward uses the
+    Eq. 6 surrogate over the (s_t, s_{t+1}) pair, scaled by ``alpha`` and
+    clipped to ``[0, 1]``.
+
+    Both s_g and s_c are sliced from the state portion of the observation
+    (``transitions.observation[..., :state_size]``); they may overlap in
+    principle but the MISC formulation assumes a clean (goal, controllable)
+    split. The estimator is *frozen* during ``bonus_fn`` (no grad, no param
+    update) — its only update path is ``misc_train`` invoked by the agent on
+    online trajectories.
+    """
+    from .networks import Encoder
+
+    goal_idx_arr = jnp.asarray(
+        tuple(int(i) for i in goal_indices), dtype=jnp.int32
+    )
+    ctrl_idx_arr = jnp.asarray(
+        tuple(int(i) for i in controllable_indices), dtype=jnp.int32
+    )
+    dim_g = int(goal_idx_arr.shape[0])
+    dim_c = int(ctrl_idx_arr.shape[0])
+    input_dim = dim_g + dim_c
+
+    # 3-hidden-layer ReLU MLP, no LayerNorm, scalar output (per spec §2).
+    t_phi = Encoder(
+        repr_dim=1,
+        network_width=hidden_dim,
+        network_depth=num_hidden,
+        skip_connections=0,
+        use_relu=True,
+        use_ln=False,
+    )
+
+    init_key, train_key0 = jax.random.split(key)
+    dummy = jnp.zeros((1, input_dim), dtype=jnp.float32)
+    predictor_params0 = t_phi.init(init_key, dummy)
+    optimizer = optax.adam(learning_rate)
+    opt_state0 = optimizer.init(predictor_params0)
+
+    initial_state = MISCBonusState(
+        predictor_params=predictor_params0,
+        opt_state=opt_state0,
+        key=train_key0,
+    )
+
+    alpha_f = jnp.asarray(alpha, dtype=jnp.float32)
+
+    def _t_phi(params, s_g, s_c):
+        """Apply T_phi(concat(s_g, s_c)). Returns scalar (last dim squeezed)."""
+        x = jnp.concatenate([s_g, s_c], axis=-1)
+        return t_phi.apply(params, x)[..., 0]
+
+    def misc_bonus(state: MISCBonusState, transitions, bonus_key):
+        """Per-transition MISC intrinsic reward (Eq. 6 surrogate).
+
+        Read-only over T_phi: the per-transition signal uses the *current*
+        frozen estimator. The estimator itself is updated by ``misc_train``
+        on full trajectories, decoupled from this call.
+        """
+        del bonus_key
+        states = transitions.observation[..., :state_size]
+        next_states = transitions.next_observation[..., :state_size]
+        s_g_t = states[..., goal_idx_arr]
+        s_c_t = states[..., ctrl_idx_arr]
+        s_g_tp1 = next_states[..., goal_idx_arr]
+        s_c_tp1 = next_states[..., ctrl_idx_arr]
+
+        params = jax.lax.stop_gradient(state.predictor_params)
+        v_joint_0 = _t_phi(params, s_g_t, s_c_t)
+        v_joint_1 = _t_phi(params, s_g_tp1, s_c_tp1)
+        v_marg_0 = _t_phi(params, s_g_t, s_c_tp1)
+        v_marg_1 = _t_phi(params, s_g_tp1, s_c_t)
+
+        # log(0.5 * (exp(a) + exp(b))) = logsumexp([a, b]) - log(2).
+        stacked = jnp.stack([v_marg_0, v_marg_1], axis=-1)
+        log_marg_mean = jax.scipy.special.logsumexp(stacked, axis=-1) - jnp.log(2.0)
+        r_raw = 0.5 * (v_joint_0 + v_joint_1) - log_marg_mean
+        r_clipped = jnp.clip(alpha_f * r_raw, 0.0, 1.0)
+
+        metrics = {
+            "misc_raw_reward_mean": jnp.mean(r_raw),
+            "misc_clipped_reward_mean": jnp.mean(r_clipped),
+            "misc_v_joint_mean": 0.5 * (jnp.mean(v_joint_0) + jnp.mean(v_joint_1)),
+            "misc_v_marginal_mean": 0.5 * (jnp.mean(v_marg_0) + jnp.mean(v_marg_1)),
+        }
+        return r_clipped, state, metrics
+
+    def _mine_loss(params, s_g_seq, s_c_seq, s_c_shuffled_seq):
+        """Negative MINE lower bound (Eq. 7 LHS), pooled across the batch.
+
+        ``s_g_seq``, ``s_c_seq``, ``s_c_shuffled_seq`` have a common leading
+        shape ``(...)`` of any rank; we flatten to ``(N, dim)`` before the
+        forward pass so the lower-bound expectation is computed over all
+        timesteps from all trajectories jointly.
+        """
+        joint_t = _t_phi(params, s_g_seq, s_c_seq)
+        marg_t = _t_phi(params, s_g_seq, s_c_shuffled_seq)
+        joint_flat = joint_t.reshape(-1)
+        marg_flat = marg_t.reshape(-1)
+        e_joint = jnp.mean(joint_flat)
+        # log(mean(exp(T))) via log-sum-exp for numerical stability.
+        n = jnp.asarray(marg_flat.shape[0], dtype=marg_flat.dtype)
+        e_marginal = jax.scipy.special.logsumexp(marg_flat) - jnp.log(n)
+        # Negate because we maximize the lower bound but optax does descent.
+        return -(e_joint - e_marginal)
+
+    def misc_train(state: MISCBonusState, online_transitions, num_grad_steps: int = 1):
+        """Train T_phi on online trajectories via the MINE objective (Eq. 7).
+
+        ``online_transitions.observation`` has shape ``(num_envs, T, obs_size)``
+        — i.e. one full episode per env. For each env we permute its s_c
+        sequence along the time axis (the trajectory-internal marginal
+        sampler from §3.2 / Lemma 1), then pool all envs and timesteps for
+        the lower-bound expectation.
+        """
+        states = online_transitions.observation[..., :state_size]
+        if states.ndim < 2:
+            raise ValueError(
+                "MISC train_fn expected trajectory-shaped transitions "
+                f"(.., T, obs); got observation shape {states.shape}."
+            )
+        s_g_seq = states[..., goal_idx_arr]   # (..., T, dim_g)
+        s_c_seq = states[..., ctrl_idx_arr]   # (..., T, dim_c)
+
+        # Per-trajectory random temporal permutation of s_c. ``states`` may
+        # have any number of leading batch dims; we flatten them, permute
+        # each row's time axis independently, then unflatten.
+        leading_shape = s_c_seq.shape[:-2]
+        T = s_c_seq.shape[-2]
+        flat_s_c = s_c_seq.reshape((-1, T, dim_c))
+        num_traj = flat_s_c.shape[0]
+
+        def step(carry, _):
+            params, opt_state, k = carry
+            k, perm_key = jax.random.split(k)
+            perm_keys = jax.random.split(perm_key, num_traj)
+            permutations = jax.vmap(lambda kk: jax.random.permutation(kk, T))(perm_keys)
+            shuffled_flat = jnp.take_along_axis(
+                flat_s_c, permutations[:, :, None], axis=1
+            )
+            s_c_shuffled = shuffled_flat.reshape(s_c_seq.shape)
+
+            loss_value, grads = jax.value_and_grad(_mine_loss)(
+                params, s_g_seq, s_c_seq, s_c_shuffled
+            )
+            updates, new_opt_state = optimizer.update(grads, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+            return (new_params, new_opt_state, k), loss_value
+
+        (new_params, new_opt_state, new_key), losses = jax.lax.scan(
+            step,
+            (state.predictor_params, state.opt_state, state.key),
+            (),
+            length=num_grad_steps,
+        )
+        new_state = state.replace(
+            predictor_params=new_params,
+            opt_state=new_opt_state,
+            key=new_key,
+        )
+        return new_state, {
+            "misc_mine_loss": jnp.mean(losses),
+            "misc_mine_lower_bound": -jnp.mean(losses),
+        }
+
+    return misc_bonus, initial_state, None, misc_train
+
+
 def _create_ucb_bonus(
     *,
     state_size: int,
@@ -661,8 +886,11 @@ class ExplorationBonuses:
     # "novel to the agent". Empowerment is an offline scorer that gives a
     # meaningful reading on offline rows too. UCB's bonus_fn returns zeros
     # (it shapes rewards via separate offline-relabel and online-novelty paths),
-    # so masking it would be a no-op either way.
-    _ONLINE_ONLY_BONUS_TYPES = frozenset({"rnd"})
+    # so masking it would be a no-op either way. MISC's T_phi is trained only
+    # on the agent's online trajectories, so labeling offline transitions with
+    # the per-(s,s') MI surrogate would compare them against an online-only
+    # estimator — leave offline rewards alone.
+    _ONLINE_ONLY_BONUS_TYPES = frozenset({"rnd", "misc"})
 
     def compute(
         self,
@@ -838,6 +1066,12 @@ def create_exploration_bonuses(
     ucb_hidden_dim: int = 256,
     ucb_num_hidden: int = 2,
     ucb_learning_rate: float = 3e-4,
+    # MISC-specific
+    controllable_indices: Optional[Sequence[int]] = None,
+    misc_hidden_dim: int = 256,
+    misc_num_hidden: int = 3,
+    misc_learning_rate: float = 1e-3,
+    misc_alpha: float = 5000.0,
 ) -> ExplorationBonuses:
     """Build an :class:`ExplorationBonuses` bundle from user-facing config.
 
@@ -895,6 +1129,11 @@ def create_exploration_bonuses(
             ucb_hidden_dim=ucb_hidden_dim,
             ucb_num_hidden=ucb_num_hidden,
             ucb_learning_rate=ucb_learning_rate,
+            controllable_indices=controllable_indices,
+            misc_hidden_dim=misc_hidden_dim,
+            misc_num_hidden=misc_num_hidden,
+            misc_learning_rate=misc_learning_rate,
+            misc_alpha=misc_alpha,
         )
         fns.append(fn)
         states.append(st)

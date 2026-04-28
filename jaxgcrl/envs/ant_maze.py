@@ -350,6 +350,13 @@ class AntMaze(PipelineEnv):
         self.dense_reward = dense_reward
         self.state_dim = 29
         self.goal_indices = jnp.array([0, 1])
+        # MISC controllable_indices: directly-actuated DOFs only.
+        # state[0:15]  = ant qpos  (root xyz, root quat, 8 hinge angles)
+        # state[15:29] = ant qvel  (root linvel, root angvel, 8 hinge vels)
+        # Hinges sit at qpos[7:15] and qvel[6:14] -> obs indices [7..14] and [21..28].
+        self.controllable_indices = jnp.array(
+            list(range(7, 15)) + list(range(21, 29))
+        )
         self.goal_reach_thresh = 0.5
 
         if self._use_contact_forces:

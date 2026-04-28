@@ -260,6 +260,18 @@ class GoExploreSimple:
     # If True, RND operates on state[goal_indices] only (novelty over goal dims).
     use_goal_for_rnd: bool = False
 
+    # ── MISC (mutual-information state-controllable intrinsic reward) ──────
+    # Enabled by listing "misc" in `exploration_bonus_type`. Trains a small
+    # MI estimator T_phi on online trajectories (MINE lower bound with
+    # random temporal s_c shuffling) and adds clip(α * MI_surrogate, 0, 1)
+    # to ONLINE rewards only — offline (RLPD) rows are not augmented.
+    # Requires the env to expose `controllable_indices` (s_c); s_g comes
+    # from `goal_indices`.
+    misc_hidden_dim: int = 256
+    misc_num_hidden: int = 3
+    misc_learning_rate: float = 1e-3
+    misc_alpha: float = 5000.0
+
     # ── EXPLORE (UCB labeling of offline data) ─────────────────────────────
     # Enabled by listing "ucb" alongside "rnd" in `exploration_bonus_type`.
     # When present, trains a reward predictor r_θ(s,a) and termination
@@ -590,6 +602,14 @@ class GoExploreSimple:
             ucb_hidden_dim=self.ucb_hidden_dim,
             ucb_num_hidden=self.ucb_num_hidden,
             ucb_learning_rate=self.ucb_lr,
+            controllable_indices=(
+                tuple(int(i) for i in np.asarray(unwrapped_env.controllable_indices))
+                if hasattr(unwrapped_env, "controllable_indices") else None
+            ),
+            misc_hidden_dim=self.misc_hidden_dim,
+            misc_num_hidden=self.misc_num_hidden,
+            misc_learning_rate=self.misc_learning_rate,
+            misc_alpha=self.misc_alpha,
         )
         exploration_bonus_state = exploration_bonuses.initial_state
 
