@@ -232,6 +232,30 @@ class HumanoidMaze(PipelineEnv):
         self.possible_starts = possible_starts
         self.possible_goals = possible_goals
 
+        maze_layout = _layout_for_name(maze_layout_name)
+        num_rows = len(maze_layout)
+        num_cols = len(maze_layout[0])
+        half = 0.5 * maze_size_scaling
+        xy_offset = float(maze_size_scaling)
+        if self._is_ogbench_layout:
+            self.x_bounds = jnp.array([
+                -xy_offset - half,
+                (num_cols - 1) * maze_size_scaling - xy_offset + half,
+            ])
+            self.y_bounds = jnp.array([
+                -xy_offset - half,
+                (num_rows - 1) * maze_size_scaling - xy_offset + half,
+            ])
+        else:
+            self.x_bounds = jnp.array([
+                -half,
+                (num_rows - 1) * maze_size_scaling + half,
+            ])
+            self.y_bounds = jnp.array([
+                -half,
+                (num_cols - 1) * maze_size_scaling + half,
+            ])
+
         if self._is_ogbench_layout:
             # OGBench humanoidmaze: mujoco timestep=0.005 with frame_skip=5
             # -> dt=0.025 s (40 Hz).
