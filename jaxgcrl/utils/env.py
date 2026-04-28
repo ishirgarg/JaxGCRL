@@ -1,4 +1,5 @@
 import argparse
+import csv
 import logging
 import math
 import os
@@ -257,6 +258,9 @@ class MetricsRecorder:
             wandb_osh.set_log_level("ERROR")
         self.trigger_sync = TriggerWandbSyncHook()
 
+        self._csv_path = None
+        self._csv_columns = None
+
     def record(self, num_steps, metrics):
         self.times.append(datetime.now())
         self.x_data.append(int(num_steps))
@@ -278,6 +282,21 @@ class MetricsRecorder:
 
         if self.mode == "offline":
             self.trigger_sync()
+
+    def log_csv(self):
+        run_dir = wandb.run.dir if wandb.run is not None else self.exp_dir
+        if self._csv_path is None:
+            self._csv_path = os.path.join(run_dir, "metrics.csv")
+            self._csv_columns = ["step"] + list(self.metrics_to_collect)
+            with open(self._csv_path, "w", newline="") as f:
+                csv.writer(f).writerow(self._csv_columns)
+
+        row = [self.x_data[-1]]
+        for key in self.metrics_to_collect:
+            values = self.y_data.get(key)
+            row.append(values[-1] if values else "")
+        with open(self._csv_path, "a", newline="") as f:
+            csv.writer(f).writerow(row)
 
     def plot_progress(self):
         num_plots = len(self.y_data)
@@ -326,6 +345,7 @@ class MetricsRecorder:
             {key: value for key, value in metrics.items() if key in self.metrics_to_collect},
         )
         self.log_wandb()
+        self.log_csv()
         self.print_progress()
 
     @staticmethod
