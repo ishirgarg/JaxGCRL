@@ -35,6 +35,7 @@ JAXGCRL_TO_OGBENCH = {
     "ant_ball_4d_ogbench_small_easy_square": "antsoccer-arena-navigate-v0",
     "ant_ball_4d_ogbench_small_easy_square_stitch": "antsoccer-arena-stitch-v0",
     "ant_ball_ogbench_arena_stitch": "antsoccer-arena-stitch-v0",
+    "ant_ball_4d_medium_stitch": "antsoccer-medium-stitch-v0",
     "cube_single": "cube-single-play-v0",
 }
 

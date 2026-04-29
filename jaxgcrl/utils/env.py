@@ -70,6 +70,7 @@ legal_envs = (
     "ant_ball_4d_ogbench_medium",
     "ant_ball_4d_ogbench_small_square",
     "ant_ball_4d_ogbench_easy_square",
+    "ant_ball_4d_medium_stitch",
     "ant_maze_ogbench_arena",
     "ant_maze_ogbench_medium_navigate",
     "ant_maze_ogbench_medium_explore",
@@ -111,6 +112,15 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         env = Ant(backend=backend or "spring", randomize_start=True)
     elif env_name == "ant_ball":
         env = AntBall(backend=backend or "spring")
+    elif env_name == "ant_ball_4d_medium_stitch":
+        # OGBench antsoccer-medium-stitch task: ant resets at the bottom-left
+        # cell, ball spawns anywhere on the open medium maze, and the goal is
+        # any open cell except the reset square. 4D goal = (ant_xy, ball_xy).
+        env = AntBallOGBench(
+            backend=backend or "spring",
+            maze_layout_name="medium_stitch",
+            add_ant_to_goal=True,
+        )
     elif env_name.startswith("ant_ball_4d_ogbench_"):
         # 4D-goal variant: goal = [ant_x, ant_y, ball_x, ball_y] where both
         # ant and ball must reach the same G cell for default goals.

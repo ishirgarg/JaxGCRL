@@ -124,6 +124,21 @@ MEDIUM = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
+# Medium maze with the agent always reset at the bottom-left open cell.
+# Ball spawn is fixed at (4, 2) — the closest open cell to the strict
+# "2 squares diagonally up-right" target (4, 3), which is a wall in the
+# OGBench medium maze. Every other open cell is a ball goal.
+MEDIUM_STITCH = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, G, 1, 1, G, G, 1],
+    [1, G, G, 1, G, G, G, 1],
+    [1, 1, G, B, G, 1, 1, 1],
+    [1, G, B, 1, G, G, G, 1],
+    [1, G, 1, G, G, 1, G, 1],
+    [1, G, G, G, 1, G, G, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
 
 def _cell_xy(i, j, maze_size_scaling, xy_offset):
     # OGBench convention: columns map to x, rows map to y. See
@@ -166,6 +181,8 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
         maze_layout = ARENA_STITCH
     elif maze_layout_name == "medium":
         maze_layout = MEDIUM
+    elif maze_layout_name == "medium_stitch":
+        maze_layout = MEDIUM_STITCH
     elif maze_layout_name == "small_square":
         maze_layout = SMALL_SQUARE
     elif maze_layout_name == "easy_square":
@@ -191,6 +208,11 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
         starts = _find_cells(maze_layout, maze_size_scaling, (R, M))
         goals = _find_cells(maze_layout, maze_size_scaling, (G, M))
         balls = _find_cells(maze_layout, maze_size_scaling, B)
+        # Layouts without B markers (e.g. medium_stitch) sample ball spawns
+        # from any open cell, matching OGBench stitch datasets where
+        # ball_init_ij is drawn freely from the open maze.
+        if balls.shape[0] == 0:
+            balls = _open_cells(maze_layout, maze_size_scaling)
     else:
         open_cells = _open_cells(maze_layout, maze_size_scaling)
         starts = open_cells
