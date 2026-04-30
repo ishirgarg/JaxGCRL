@@ -168,6 +168,18 @@ def create_exploration_bonus(
     online_empowerment_bc_alpha: float = 0.01,
     online_empowerment_bonus_mean: float = 0.0,
     online_empowerment_bonus_scale: float = 1.0,
+    # Online-MINE-empowerment-specific
+    online_mine_empowerment_action_size: Optional[int] = None,
+    online_mine_empowerment_actor_sample_fn: Optional[
+        Callable[[Any, jnp.ndarray, jax.Array], jnp.ndarray]
+    ] = None,
+    online_mine_empowerment_lr_dyn: float = 1e-3,
+    online_mine_empowerment_lr_t: float = 3e-4,
+    online_mine_empowerment_dyn_hidden_dims: Sequence[int] = (512, 512, 512, 512),
+    online_mine_empowerment_t_hidden_dims: Sequence[int] = (512, 512, 512, 512),
+    online_mine_empowerment_layer_norm: bool = True,
+    online_mine_empowerment_bonus_mean: float = 0.0,
+    online_mine_empowerment_bonus_scale: float = 1.0,
 ) -> Tuple[BonusFn, Any, InitFromStatesFn, NoveltyFn, TrainFn, UCBTrainFn, UCBRelabelFn, UCBOnlineBonusFn]:
     """Factory: returns ``(bonus_fn, initial_state, init_from_states_fn, novelty_fn, train_fn, ucb_train_fn, ucb_relabel_fn, ucb_online_bonus_fn)``.
 
@@ -269,6 +281,31 @@ def create_exploration_bonus(
             bc_alpha=online_empowerment_bc_alpha,
             bonus_mean=online_empowerment_bonus_mean,
             bonus_scale=online_empowerment_bonus_scale,
+        )
+        return bonus_fn, st, init_fn, None, train_fn, None, None, None
+    if bonus_type == "online_mine_empowerment":
+        if online_mine_empowerment_action_size is None:
+            raise ValueError(
+                "'online_mine_empowerment' bonus requires online_mine_empowerment_action_size."
+            )
+        if online_mine_empowerment_actor_sample_fn is None:
+            raise ValueError(
+                "'online_mine_empowerment' bonus requires online_mine_empowerment_actor_sample_fn "
+                "(callable (actor_params, obs, key) -> actions sourced from the agent's main actor)."
+            )
+        from .online_mine_empowerment import _create_online_mine_empowerment_bonus
+        bonus_fn, st, init_fn, train_fn = _create_online_mine_empowerment_bonus(
+            state_size=state_size,
+            action_size=online_mine_empowerment_action_size,
+            actor_sample_fn=online_mine_empowerment_actor_sample_fn,
+            key=key,
+            lr_dyn=online_mine_empowerment_lr_dyn,
+            lr_t=online_mine_empowerment_lr_t,
+            dyn_hidden_dims=online_mine_empowerment_dyn_hidden_dims,
+            t_hidden_dims=online_mine_empowerment_t_hidden_dims,
+            layer_norm=online_mine_empowerment_layer_norm,
+            bonus_mean=online_mine_empowerment_bonus_mean,
+            bonus_scale=online_mine_empowerment_bonus_scale,
         )
         return bonus_fn, st, init_fn, None, train_fn, None, None, None
     if bonus_type == "ucb":
@@ -922,6 +959,9 @@ class ExplorationBonuses:
         self._ucb_index: Optional[int] = next(
             (i for i, bt in enumerate(bonus_types) if bt == "ucb"), None
         )
+        self.requires_actor_params: bool = any(
+            bt in self._ACTOR_PARAM_BONUS_TYPES for bt in bonus_types
+        )
 
     # Bonus types whose additive contribution is restricted to ONLINE rows.
     # RND alone qualifies: it's a novelty signal trained on online states, so
@@ -936,7 +976,14 @@ class ExplorationBonuses:
     # empowerment trains its skill-conditioned Q/V/policy from scratch on
     # online data, so its empowerment estimate on offline-only states is
     # untrustworthy and out-of-distribution — same argument as MISC.
-    _ONLINE_ONLY_BONUS_TYPES = frozenset({"rnd", "misc", "online_empowerment"})
+    _ONLINE_ONLY_BONUS_TYPES = frozenset(
+        {"rnd", "misc", "online_empowerment", "online_mine_empowerment"}
+    )
+
+    # Bonus types whose bonus_fn / train_fn require the agent's main actor
+    # params at runtime (for marginal-action sampling). The dispatcher
+    # forwards ``actor_params`` to these and to no others.
+    _ACTOR_PARAM_BONUS_TYPES = frozenset({"online_mine_empowerment"})
 
     def compute(
         self,
@@ -944,6 +991,7 @@ class ExplorationBonuses:
         transitions,
         key: jax.Array,
         is_online: Optional[jnp.ndarray] = None,
+        actor_params: Any = None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, Tuple, dict]:
         """Return ``(weighted_total, raw_total, new_state, metrics)``.
 
@@ -970,7 +1018,16 @@ class ExplorationBonuses:
         for i, (fn, weight, bt, sub_key) in enumerate(
             zip(self.fns, self.weights, self.bonus_types, keys)
         ):
-            bonus, new_state_i, m = fn(state[i], transitions, sub_key)
+            if bt in self._ACTOR_PARAM_BONUS_TYPES:
+                if actor_params is None:
+                    raise ValueError(
+                        f"bonus '{bt}' requires actor_params to be passed to compute()."
+                    )
+                bonus, new_state_i, m = fn(
+                    state[i], transitions, sub_key, actor_params=actor_params,
+                )
+            else:
+                bonus, new_state_i, m = fn(state[i], transitions, sub_key)
             if is_online is not None and bt in self._ONLINE_ONLY_BONUS_TYPES:
                 bonus = bonus * is_online
             total = total + jnp.asarray(weight, dtype=total.dtype) * bonus
@@ -998,7 +1055,8 @@ class ExplorationBonuses:
         """True iff at least one configured bonus exposes a read-only RND novelty fn."""
         return any(fn is not None for fn in self._novelty_fns)
 
-    def train(self, state: Tuple, online_transitions, num_grad_steps: int = 1):
+    def train(self, state: Tuple, online_transitions, num_grad_steps: int = 1,
+              actor_params: Any = None):
         """Train every per-bonus trainable on a batch of online transitions.
 
         Bonuses without a train hook (e.g. empowerment, ucb — which trains
@@ -1013,7 +1071,17 @@ class ExplorationBonuses:
         for i, (train_fn, bt) in enumerate(zip(self._train_fns, self.bonus_types)):
             if train_fn is None:
                 continue
-            new_s, m = train_fn(state[i], online_transitions, num_grad_steps)
+            if bt in self._ACTOR_PARAM_BONUS_TYPES:
+                if actor_params is None:
+                    raise ValueError(
+                        f"bonus '{bt}' requires actor_params to be passed to train()."
+                    )
+                new_s, m = train_fn(
+                    state[i], online_transitions, num_grad_steps,
+                    actor_params=actor_params,
+                )
+            else:
+                new_s, m = train_fn(state[i], online_transitions, num_grad_steps)
             new_states[i] = new_s
             for mk, mv in m.items():
                 all_metrics[f"bonus_{i}_{bt}_{mk}"] = mv
@@ -1023,7 +1091,12 @@ class ExplorationBonuses:
         """True iff the bonus at ``idx`` exposes a per-bonus train hook."""
         return self._train_fns[idx] is not None
 
-    def train_one(self, state: Tuple, idx: int, online_transitions, num_grad_steps: int = 1):
+    def requires_actor_params_at(self, idx: int) -> bool:
+        """True iff bonus ``idx`` needs the main actor's params at train time."""
+        return self.bonus_types[idx] in self._ACTOR_PARAM_BONUS_TYPES
+
+    def train_one(self, state: Tuple, idx: int, online_transitions, num_grad_steps: int = 1,
+                  actor_params: Any = None):
         """Train just the bonus at ``idx`` on an online batch.
 
         Lets the agent run different grad-step counts per bonus (with the
@@ -1035,7 +1108,17 @@ class ExplorationBonuses:
         if train_fn is None:
             return state, {}
         bt = self.bonus_types[idx]
-        new_s, m = train_fn(state[idx], online_transitions, num_grad_steps)
+        if bt in self._actor_param_bonus_types:
+            if actor_params is None:
+                raise ValueError(
+                    f"bonus '{bt}' requires actor_params to be passed to train_one()."
+                )
+            new_s, m = train_fn(
+                state[idx], online_transitions, num_grad_steps,
+                actor_params=actor_params,
+            )
+        else:
+            new_s, m = train_fn(state[idx], online_transitions, num_grad_steps)
         new_states = list(state)
         new_states[idx] = new_s
         prefixed = {f"bonus_{idx}_{bt}_{mk}": mv for mk, mv in m.items()}
@@ -1180,6 +1263,18 @@ def create_exploration_bonuses(
     online_empowerment_bc_alpha: float = 0.01,
     online_empowerment_bonus_mean: float = 0.0,
     online_empowerment_bonus_scale: float = 1.0,
+    # Online-MINE-empowerment-specific
+    online_mine_empowerment_action_size: Optional[int] = None,
+    online_mine_empowerment_actor_sample_fn: Optional[
+        Callable[[Any, jnp.ndarray, jax.Array], jnp.ndarray]
+    ] = None,
+    online_mine_empowerment_lr_dyn: float = 1e-3,
+    online_mine_empowerment_lr_t: float = 3e-4,
+    online_mine_empowerment_dyn_hidden_dims: Sequence[int] = (512, 512, 512, 512),
+    online_mine_empowerment_t_hidden_dims: Sequence[int] = (512, 512, 512, 512),
+    online_mine_empowerment_layer_norm: bool = True,
+    online_mine_empowerment_bonus_mean: float = 0.0,
+    online_mine_empowerment_bonus_scale: float = 1.0,
 ) -> ExplorationBonuses:
     """Build an :class:`ExplorationBonuses` bundle from user-facing config.
 
@@ -1257,6 +1352,15 @@ def create_exploration_bonuses(
             online_empowerment_bc_alpha=online_empowerment_bc_alpha,
             online_empowerment_bonus_mean=online_empowerment_bonus_mean,
             online_empowerment_bonus_scale=online_empowerment_bonus_scale,
+            online_mine_empowerment_action_size=online_mine_empowerment_action_size,
+            online_mine_empowerment_actor_sample_fn=online_mine_empowerment_actor_sample_fn,
+            online_mine_empowerment_lr_dyn=online_mine_empowerment_lr_dyn,
+            online_mine_empowerment_lr_t=online_mine_empowerment_lr_t,
+            online_mine_empowerment_dyn_hidden_dims=online_mine_empowerment_dyn_hidden_dims,
+            online_mine_empowerment_t_hidden_dims=online_mine_empowerment_t_hidden_dims,
+            online_mine_empowerment_layer_norm=online_mine_empowerment_layer_norm,
+            online_mine_empowerment_bonus_mean=online_mine_empowerment_bonus_mean,
+            online_mine_empowerment_bonus_scale=online_mine_empowerment_bonus_scale,
         )
         fns.append(fn)
         states.append(st)

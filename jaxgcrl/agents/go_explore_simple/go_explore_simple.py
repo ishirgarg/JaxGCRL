@@ -371,6 +371,21 @@ class GoExploreSimple:
     online_empowerment_bonus_mean: float = 0.0
     online_empowerment_bonus_scale: float = 1.0
 
+    # ── Online MINE empowerment bonus ──────────────────────────────────────
+    # Enabled by listing "online_mine_empowerment" in `exploration_bonus_type`.
+    # Trains a forward dynamics model f(s,a)->s' and a MINE statistics network
+    # T(s,a,s') on samples from the replay buffer; per-transition
+    # Donsker-Varadhan contribution T(s,a,s') - log E_marg[exp(T)] is added to
+    # the reward (online rows only). Marginal actions are sampled from the
+    # main GCP actor at the current params.
+    online_mine_empowerment_lr_dyn: float = 1e-3
+    online_mine_empowerment_lr_t: float = 3e-4
+    online_mine_empowerment_dyn_hidden_dims: Tuple[int, ...] = (512, 512, 512, 512)
+    online_mine_empowerment_t_hidden_dims: Tuple[int, ...] = (512, 512, 512, 512)
+    online_mine_empowerment_layer_norm: bool = True
+    online_mine_empowerment_bonus_mean: float = 0.0
+    online_mine_empowerment_bonus_scale: float = 1.0
+
     # ── Go Explore specific parameters ──────────────────────────────────────
     num_gcp_steps: int = 250      # max steps in go phase before forcing explore
     num_ep_steps: int = 250        # steps in explore phase before reset to go
@@ -710,6 +725,19 @@ class GoExploreSimple:
             online_empowerment_bc_alpha=self.online_empowerment_bc_alpha,
             online_empowerment_bonus_mean=self.online_empowerment_bonus_mean,
             online_empowerment_bonus_scale=self.online_empowerment_bonus_scale,
+            online_mine_empowerment_action_size=action_size,
+            online_mine_empowerment_actor_sample_fn=(
+                lambda params, obs, k: gcp_actor.sample_actions(
+                    params, obs, k, is_deterministic=False,
+                )
+            ),
+            online_mine_empowerment_lr_dyn=self.online_mine_empowerment_lr_dyn,
+            online_mine_empowerment_lr_t=self.online_mine_empowerment_lr_t,
+            online_mine_empowerment_dyn_hidden_dims=self.online_mine_empowerment_dyn_hidden_dims,
+            online_mine_empowerment_t_hidden_dims=self.online_mine_empowerment_t_hidden_dims,
+            online_mine_empowerment_layer_norm=self.online_mine_empowerment_layer_norm,
+            online_mine_empowerment_bonus_mean=self.online_mine_empowerment_bonus_mean,
+            online_mine_empowerment_bonus_scale=self.online_mine_empowerment_bonus_scale,
         )
         exploration_bonus_state = exploration_bonuses.initial_state
 
@@ -1091,10 +1119,15 @@ class GoExploreSimple:
             # online-only bonuses (RND) to online rows only inside compute().
             bonus_key, train_key = jax.random.split(train_key)
             is_online = transitions.extras["state_extras"]["is_online"]
+            bonus_compute_kwargs = (
+                {"actor_params": training_state.actor_state.params}
+                if exploration_bonuses.requires_actor_params else {}
+            )
             total_bonus, raw_total_bonus, exploration_bonus_state, bonus_metrics = (
                 exploration_bonuses.compute(
                     exploration_bonus_state, transitions, bonus_key,
                     is_online=is_online,
+                    **bonus_compute_kwargs,
                 )
             )
             if self.agent_type == "sac":
@@ -1152,9 +1185,14 @@ class GoExploreSimple:
                 for i, n_i in enumerate(bonus_grad_steps_per_bonus):
                     if not exploration_bonuses.is_trainable(i):
                         continue
+                    bonus_train_kwargs = (
+                        {"actor_params": training_state.actor_state.params}
+                        if exploration_bonuses.requires_actor_params_at(i) else {}
+                    )
                     if n_i == 1:
                         exploration_bonus_state, m_i = exploration_bonuses.train_one(
                             exploration_bonus_state, i, online_transitions, 1,
+                            **bonus_train_kwargs,
                         )
                         metrics.update(m_i)
                     else:
@@ -1177,6 +1215,7 @@ class GoExploreSimple:
                             bs_online = bs_online._replace(extras=bs_online_extras)
                             bonus_st, m = exploration_bonuses.train_one(
                                 bonus_st, _i, bs_online, 1,
+                                **bonus_train_kwargs,
                             )
                             return (bs, bonus_st, k_next), m
 
