@@ -1108,7 +1108,7 @@ class ExplorationBonuses:
         if train_fn is None:
             return state, {}
         bt = self.bonus_types[idx]
-        if bt in self._actor_param_bonus_types:
+        if bt in self._ACTOR_PARAM_BONUS_TYPES:
             if actor_params is None:
                 raise ValueError(
                     f"bonus '{bt}' requires actor_params to be passed to train_one()."
