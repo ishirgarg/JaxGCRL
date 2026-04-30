@@ -25,6 +25,7 @@ from brax import base
 from brax.envs.base import PipelineEnv, State
 from brax.io.mjcf import load_model
 from mujoco import mjx
+from mujoco.mjx._src import support as _mjx_support
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +97,67 @@ _SUCCESS_THRESHOLD = 0.04
 _IK_MAX_ITERS = 5
 _IK_DAMPING = 1e-6
 _IK_MAX_ANGLE_CHANGE = np.radians(45.0)
+
+
+# ---------------------------------------------------------------------------
+# `mjx.rne_postconstraint` raises NotImplementedError on connect/weld equality
+# constraints, which the Robotiq gripper relies on for its 4-bar linkage. We
+# only need the contact-force contribution to `cfrc_ext` (for the gripper
+# contact obs term), so this helper reimplements just that slice.
+# ---------------------------------------------------------------------------
+
+
+def _cfrc_ext_from_contacts(m, d):
+    def _transform_force(frc, offset):
+        force, torque = jnp.split(frc, 2)
+        torque = torque - jnp.cross(offset, force)
+        return jnp.concatenate([torque, force])
+
+    cfrc_ext = jnp.vstack([
+        jnp.zeros((1, 6)),
+        jax.vmap(_transform_force)(
+            d.xfrc_applied[1:],
+            d.subtree_com[jnp.array(m.body_rootid)][1:] - d.xipos[1:],
+        ),
+    ])
+
+    forces = []
+    condim_idx = []
+    for dim in set(d.contact.dim):
+        force, idx = _mjx_support.contact_force_dim(m, d, dim)
+        forces.append(force)
+        condim_idx.append(idx)
+
+    if forces:
+        @jax.vmap
+        def _contact_force_to_cfrc_ext(force, pos, frame, id1, id2, com1, com2):
+            force = force.reshape((-1, 3)) @ frame
+            force = force.reshape(-1)
+            cfrc_com1 = _transform_force(force, com1 - pos)
+            cfrc_com2 = _transform_force(force, com2 - pos)
+            mask1 = id1 != 0
+            mask2 = id2 != 0
+            return (
+                jnp.vstack([-1 * cfrc_com1 * mask1, cfrc_com2 * mask2]),
+                jnp.array([id1, id2]),
+            )
+
+        condim_idx = jnp.concatenate(condim_idx)
+        frame = d.contact.frame[condim_idx]
+        pos = d.contact.pos[condim_idx]
+        id1 = jnp.array(m.geom_bodyid)[d.contact.geom[condim_idx, 0]]
+        id2 = jnp.array(m.geom_bodyid)[d.contact.geom[condim_idx, 1]]
+        com1 = d.subtree_com[jnp.array(m.body_rootid)][id1]
+        com2 = d.subtree_com[jnp.array(m.body_rootid)][id2]
+
+        cfrc_contact, cfrc_idx = _contact_force_to_cfrc_ext(
+            jnp.concatenate(forces), pos, frame, id1, id2, com1, com2
+        )
+        cfrc_ext = cfrc_ext.at[cfrc_idx.reshape(-1)].add(
+            cfrc_contact.reshape((-1, 6))
+        )
+
+    return d.replace(cfrc_ext=cfrc_ext)
 
 
 # ---------------------------------------------------------------------------
@@ -614,8 +676,10 @@ class CubeSingle(PipelineEnv):
 
         # OGBench calls `mj_rnePostConstraint` after each step so contact
         # forces show up in `cfrc_ext` (used by the gripper_contact obs term).
-        # Brax's pipeline_step does not, so we run it ourselves.
-        pipeline_state = mjx.rne_postconstraint(self.sys, pipeline_state)
+        # Brax's pipeline_step does not. We can't use `mjx.rne_postconstraint`
+        # because the Robotiq 4-bar linkage uses connect equality constraints
+        # which mjx doesn't support; we just need the contact contribution.
+        pipeline_state = _cfrc_ext_from_contacts(self.sys, pipeline_state)
 
         timestep = state.info['timestep'] + 1.0 / self.episode_length
         obs = self._get_obs(pipeline_state, state.info['goal'])

@@ -1019,6 +1019,52 @@ class ExplorationBonuses:
                 all_metrics[f"bonus_{i}_{bt}_{mk}"] = mv
         return tuple(new_states), all_metrics
 
+    def is_trainable(self, idx: int) -> bool:
+        """True iff the bonus at ``idx`` exposes a per-bonus train hook."""
+        return self._train_fns[idx] is not None
+
+    def train_one(self, state: Tuple, idx: int, online_transitions, num_grad_steps: int = 1):
+        """Train just the bonus at ``idx`` on an online batch.
+
+        Lets the agent run different grad-step counts per bonus (with the
+        outer resampling loop, when needed, lifted into the agent so each
+        bonus can scan with its own length). Bonuses with no train hook are
+        a no-op pass-through.
+        """
+        train_fn = self._train_fns[idx]
+        if train_fn is None:
+            return state, {}
+        bt = self.bonus_types[idx]
+        new_s, m = train_fn(state[idx], online_transitions, num_grad_steps)
+        new_states = list(state)
+        new_states[idx] = new_s
+        prefixed = {f"bonus_{idx}_{bt}_{mk}": mv for mk, mv in m.items()}
+        return tuple(new_states), prefixed
+
+    def normalize_grad_steps(
+        self, grad_steps: Union[int, Sequence[int]],
+    ) -> Tuple[int, ...]:
+        """Resolve a per-bonus grad-step spec to a per-bonus tuple.
+
+        Accepts an int (broadcast to all bonuses), a length-1 sequence
+        (also broadcast), or a sequence whose length matches the number of
+        configured bonuses. Returns ``()`` for an empty bundle.
+        """
+        n = len(self.bonus_types)
+        if n == 0:
+            return ()
+        if isinstance(grad_steps, int):
+            return (int(grad_steps),) * n
+        gs = tuple(int(x) for x in grad_steps)
+        if len(gs) == 1:
+            return gs * n
+        if len(gs) != n:
+            raise ValueError(
+                "bonus_grad_steps_per_env_step length must be 1 or match "
+                f"exploration_bonus_type ({n}); got {len(gs)} ({gs!r})."
+            )
+        return gs
+
     @property
     def has_ucb(self) -> bool:
         """True iff a ``"ucb"`` bonus is configured (EXPLORE algorithm enabled)."""

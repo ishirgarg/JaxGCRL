@@ -300,11 +300,15 @@ class GoExploreSimple:
     exploration_bonus_type: Optional[Tuple[str, ...]] = None
     exploration_bonus_weight: Tuple[float, ...] = (0.1,)
 
-    # Number of bonus-train gradient steps per env step. Each step samples a
-    # fresh batch from the replay buffer (threaded via lax.scan in
-    # training_step). Applies to every trainable bonus (RND / MISC /
-    # online_empowerment); UCB has its own ucb_grad_steps_per_train_step.
-    bonus_grad_steps_per_env_step: int = 1
+    # Number of bonus-train gradient steps per env step, per-bonus. Mirrors
+    # the layout of `exploration_bonus_weight`: a length-1 tuple is broadcast
+    # to all configured bonuses, otherwise the length must match
+    # `exploration_bonus_type` and each entry applies to the bonus at that
+    # index. For each bonus with n>1, successive steps draw fresh online
+    # batches from the replay buffer (needed for online_empowerment so the
+    # estimator and policy gradient see uncorrelated data); n=1 reuses the
+    # main policy batch bit-for-bit. UCB has its own ucb_grad_steps_per_train_step.
+    bonus_grad_steps_per_env_step: Tuple[int, ...] = (1,)
 
     # Empowerment global normalization: emitted bonus is (raw_emp - mean) / scale.
     empowerment_bonus_mean: float = 1.3
@@ -962,7 +966,12 @@ class GoExploreSimple:
         has_ucb = exploration_bonuses.has_ucb
         ucb_warmup = jnp.asarray(self.ucb_warmup_env_steps, dtype=jnp.float32)
         ucb_grad_steps = int(self.ucb_grad_steps_per_train_step)
-        bonus_grad_steps = int(self.bonus_grad_steps_per_env_step)
+        # Per-bonus grad-step counts. Validated/broadcast against the
+        # configured bonus types so a length-1 tuple still works for any
+        # number of bonuses (default behavior).
+        bonus_grad_steps_per_bonus = exploration_bonuses.normalize_grad_steps(
+            self.bonus_grad_steps_per_env_step
+        )
 
         @jax.jit
         def training_step(
@@ -1127,52 +1136,59 @@ class GoExploreSimple:
             # novelty stays meaningful for offline rows: it reflects "novel
             # relative to what's been seen ONLINE".
             #
-            # Default (bonus_grad_steps_per_env_step == 1): single train call
-            # on the same online_transitions batch the main policy used —
-            # preserves prior RND/MISC behavior bit-for-bit.
-            #
-            # Multi-step (bonus_grad_steps_per_env_step > 1): wrap in a
-            # jax.lax.scan that samples a fresh batch from the replay buffer
-            # per grad step. Each step's samples are independent — needed
-            # for online_empowerment so that the empowerment estimator and
-            # policy gradient see uncorrelated batches.
+            # Per-bonus grad-step counts (bonus_grad_steps_per_env_step) let
+            # different bonuses train at different cadences in the same env
+            # step. For each bonus i with n_i steps:
+            #   n_i == 1: single train call on the same online_transitions
+            #             batch the main policy used — preserves prior
+            #             RND/MISC behavior bit-for-bit when no per-bonus
+            #             override is set.
+            #   n_i  > 1: jax.lax.scan that samples a fresh online batch
+            #             from the replay buffer per grad step. Each step's
+            #             samples are independent — needed for
+            #             online_empowerment so the estimator and policy
+            #             gradient see uncorrelated batches.
             if exploration_bonuses.has_trainables:
-                if bonus_grad_steps == 1:
-                    exploration_bonus_state, online_train_metrics = exploration_bonuses.train(
-                        exploration_bonus_state, online_transitions, 1,
-                    )
-                    metrics.update(online_train_metrics)
-                else:
-                    bonus_loop_key, train_key = jax.random.split(train_key)
+                for i, n_i in enumerate(bonus_grad_steps_per_bonus):
+                    if not exploration_bonuses.is_trainable(i):
+                        continue
+                    if n_i == 1:
+                        exploration_bonus_state, m_i = exploration_bonuses.train_one(
+                            exploration_bonus_state, i, online_transitions, 1,
+                        )
+                        metrics.update(m_i)
+                    else:
+                        bonus_loop_key, train_key = jax.random.split(train_key)
 
-                    def _train_bonus_step(carry, _):
-                        bs, bonus_st, k = carry
-                        sample_k, k_next = jax.random.split(k)
-                        bs, bs_online = replay_buffer.sample(bs)
-                        # Re-tag is_online so masked compute() (and any
-                        # future train_fn that introspects extras) sees the
-                        # same shape as the main path.
-                        bs_online_extras = {
-                            **bs_online.extras,
-                            "state_extras": {
-                                **bs_online.extras["state_extras"],
-                                "is_online": jnp.ones_like(bs_online.reward),
-                            },
-                        }
-                        bs_online = bs_online._replace(extras=bs_online_extras)
-                        bonus_st, m = exploration_bonuses.train(bonus_st, bs_online, 1)
-                        return (bs, bonus_st, k_next), m
+                        def _train_bonus_step(carry, _, _i=i):
+                            bs, bonus_st, k = carry
+                            sample_k, k_next = jax.random.split(k)
+                            bs, bs_online = replay_buffer.sample(bs)
+                            # Re-tag is_online so any train_fn that
+                            # introspects extras sees the same shape as
+                            # the main path.
+                            bs_online_extras = {
+                                **bs_online.extras,
+                                "state_extras": {
+                                    **bs_online.extras["state_extras"],
+                                    "is_online": jnp.ones_like(bs_online.reward),
+                                },
+                            }
+                            bs_online = bs_online._replace(extras=bs_online_extras)
+                            bonus_st, m = exploration_bonuses.train_one(
+                                bonus_st, _i, bs_online, 1,
+                            )
+                            return (bs, bonus_st, k_next), m
 
-                    (buffer_state, exploration_bonus_state, _), bonus_metrics_seq = jax.lax.scan(
-                        _train_bonus_step,
-                        (buffer_state, exploration_bonus_state, bonus_loop_key),
-                        (),
-                        length=bonus_grad_steps,
-                    )
-                    online_train_metrics = jax.tree_util.tree_map(
-                        jnp.mean, bonus_metrics_seq,
-                    )
-                    metrics.update(online_train_metrics)
+                        (buffer_state, exploration_bonus_state, _), bonus_metrics_seq = jax.lax.scan(
+                            _train_bonus_step,
+                            (buffer_state, exploration_bonus_state, bonus_loop_key),
+                            (),
+                            length=int(n_i),
+                        )
+                        metrics.update(jax.tree_util.tree_map(
+                            jnp.mean, bonus_metrics_seq,
+                        ))
 
             if has_ucb:
                 # Train reward + termination predictors on the *online* batch
