@@ -317,7 +317,7 @@ class GoExploreSimple:
     # RND predictor/target network shape.
     rnd_feature_dim: int = 64
     rnd_hidden_dim: int = 256
-    rnd_num_hidden: int = 2
+    rnd_num_hidden: int = 3
     rnd_learning_rate: float = 1e-4
     rnd_obs_clip: float = 5.0
     # If True, RND operates on state[goal_indices] only (novelty over goal dims).
@@ -356,8 +356,8 @@ class GoExploreSimple:
     # from the replay buffer; per-state empowerment I(Z;S+|s) is added to
     # the reward identical to the offline empowerment bonus path.
     online_empowerment_lr: float = 3e-4
-    online_empowerment_value_hidden_dims: Tuple[int, ...] = (512, 512, 512, 512)
-    online_empowerment_actor_hidden_dims: Tuple[int, ...] = (512, 512, 512, 512)
+    online_empowerment_value_hidden_dims: Tuple[int, ...] = (256, 256, 256)
+    online_empowerment_actor_hidden_dims: Tuple[int, ...] = (256, 256, 256)
     online_empowerment_value_latent_dim: int = 128
     online_empowerment_num_skills: int = 5
     online_empowerment_num_splus_samples: int = 32
@@ -380,8 +380,8 @@ class GoExploreSimple:
     # main GCP actor at the current params.
     online_mine_empowerment_lr_dyn: float = 1e-3
     online_mine_empowerment_lr_t: float = 3e-4
-    online_mine_empowerment_dyn_hidden_dims: Tuple[int, ...] = (512, 512, 512, 512)
-    online_mine_empowerment_t_hidden_dims: Tuple[int, ...] = (512, 512, 512, 512)
+    online_mine_empowerment_dyn_hidden_dims: Tuple[int, ...] = (256, 256, 256)
+    online_mine_empowerment_t_hidden_dims: Tuple[int, ...] = (256, 256, 256)
     online_mine_empowerment_layer_norm: bool = True
     online_mine_empowerment_bonus_mean: float = 0.0
     online_mine_empowerment_bonus_scale: float = 1.0
