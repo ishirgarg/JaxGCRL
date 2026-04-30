@@ -926,14 +926,17 @@ class ExplorationBonuses:
     # Bonus types whose additive contribution is restricted to ONLINE rows.
     # RND alone qualifies: it's a novelty signal trained on online states, so
     # firing it on offline rows would just reward "different from online" not
-    # "novel to the agent". Empowerment is an offline scorer that gives a
-    # meaningful reading on offline rows too. UCB's bonus_fn returns zeros
-    # (it shapes rewards via separate offline-relabel and online-novelty paths),
-    # so masking it would be a no-op either way. MISC's T_phi is trained only
-    # on the agent's online trajectories, so labeling offline transitions with
-    # the per-(s,s') MI surrogate would compare them against an online-only
-    # estimator — leave offline rewards alone.
-    _ONLINE_ONLY_BONUS_TYPES = frozenset({"rnd", "misc"})
+    # "novel to the agent". (Offline) empowerment is an offline scorer that
+    # gives a meaningful reading on offline rows too. UCB's bonus_fn returns
+    # zeros (it shapes rewards via separate offline-relabel and online-novelty
+    # paths), so masking it would be a no-op either way. MISC's T_phi is
+    # trained only on the agent's online trajectories, so labeling offline
+    # transitions with the per-(s,s') MI surrogate would compare them against
+    # an online-only estimator — leave offline rewards alone. Online
+    # empowerment trains its skill-conditioned Q/V/policy from scratch on
+    # online data, so its empowerment estimate on offline-only states is
+    # untrustworthy and out-of-distribution — same argument as MISC.
+    _ONLINE_ONLY_BONUS_TYPES = frozenset({"rnd", "misc", "online_empowerment"})
 
     def compute(
         self,
