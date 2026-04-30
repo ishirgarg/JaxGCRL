@@ -81,34 +81,19 @@ EASY_SQUARE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
-# OGBench arena task layout: open 8x8 with R/B/G/M cells placed at the
-# (agent_init, ball_init, goal) ij positions of the 5 antsoccer-arena tasks
-# defined in ogbench/locomaze/maze.py:592 (set_tasks for ball envs):
-#   [(1,6),(2,3),(5,2)], [(2,2),(5,5),(2,2)], [(6,1),(2,3),(6,6)],
-#   [(6,6),(1,1),(6,1)], [(4,6),(6,2),(1,6)].
-# M marks cells that appear as both an agent init AND a goal across tasks.
+# OGBench arena (open 8x8) structured as concentric rings for stitch training:
+# ant resets on the outer ring of open cells, ball goals are the next inner
+# ring, and ball spawns are the 4 innermost cells. Pairs with the
+# antsoccer-arena-stitch RLPD dataset.
 ARENA_STITCH = [
     [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, B, 0, 0, 0, 0, M, 1],
-    [1, 0, M, B, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, R, 1],
-    [1, 0, G, 0, 0, B, 0, 1],
-    [1, M, B, 0, 0, 0, M, 1],
+    [1, R, R, R, R, R, R, 1],
+    [1, R, G, G, G, G, R, 1],
+    [1, R, G, B, B, G, R, 1],
+    [1, R, G, B, B, G, R, 1],
+    [1, R, G, G, G, G, R, 1],
+    [1, R, R, R, R, R, R, 1],
     [1, 1, 1, 1, 1, 1, 1, 1],
-]
-
-# Paired (agent_init_ij, ball_init_ij, goal_ij) tuples for the 5 OGBench
-# antsoccer-arena tasks (set_tasks in ogbench/locomaze/maze.py:592). Used by
-# the arena_stitch env to reset all three positions jointly — independent
-# sampling from R/G/B/M markers would produce combinations OGBench never
-# evaluates on.
-ARENA_STITCH_TASKS = [
-    [(1, 6), (2, 3), (5, 2)],
-    [(2, 2), (5, 5), (2, 2)],
-    [(6, 1), (2, 3), (6, 6)],
-    [(6, 6), (1, 1), (6, 1)],
-    [(4, 6), (6, 2), (1, 6)],
 ]
 
 # OGBench medium maze in OGBench's native row/col orientation.
@@ -220,14 +205,9 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
         balls = open_cells
 
     # Paired (agent_xy, ball_xy, goal_xy) tuples — only set for layouts that
-    # define a fixed task list (e.g. arena_stitch). Otherwise None and the env
-    # samples R/G/B independently at reset.
+    # define a fixed task list. Otherwise None and the env samples R/G/B
+    # independently at reset.
     paired_tasks = None
-    if maze_layout_name == "arena_stitch":
-        paired_tasks = jnp.array([
-            [_cell_xy(ij[0], ij[1], maze_size_scaling, xy_offset) for ij in task]
-            for task in ARENA_STITCH_TASKS
-        ])  # shape (5, 3, 2): (num_tasks, [agent, ball, goal], xy)
 
     rows = len(maze_layout)
     cols = len(maze_layout[0])
