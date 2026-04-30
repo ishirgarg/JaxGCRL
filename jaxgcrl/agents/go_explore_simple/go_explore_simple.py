@@ -145,6 +145,59 @@ def _log_trajectory_reward(reward_viz, current_step: int):
     _plt.close(fig)
 
 
+def _log_online_empowerment_xy_map(
+    score_fn,
+    bonus_state,
+    template_state,
+    state_size: int,
+    x_bounds,
+    y_bounds,
+    grid_res: int,
+    rng,
+    current_step: int,
+):
+    """2D (x, y) heatmap of per-state empowerment from the online-empowerment bonus.
+
+    ``score_fn`` is the ``bonus_fn.score_states`` attribute exposed by the
+    online-empowerment factory: ``(bonus_state, states, key) -> (B,)``.
+    A representative state vector ``template_state`` (shape ``(state_size,)``)
+    is broadcast over the grid and columns 0,1 are overwritten with the
+    grid's x and y values, mirroring the prior art in
+    ``empowerment_sac._log_empowerment_map``.
+    """
+    if _plt is None or _wandb is None:
+        return
+
+    xs = np.linspace(float(x_bounds[0]), float(x_bounds[1]), grid_res)
+    ys = np.linspace(float(y_bounds[0]), float(y_bounds[1]), grid_res)
+    xx, yy = np.meshgrid(xs, ys)
+    flat_x = jnp.asarray(xx.reshape(-1), dtype=jnp.float32)
+    flat_y = jnp.asarray(yy.reshape(-1), dtype=jnp.float32)
+    n = flat_x.shape[0]
+
+    obs_batch = jnp.broadcast_to(
+        jnp.asarray(template_state, dtype=jnp.float32)[None, :], (n, state_size),
+    )
+    obs_batch = obs_batch.at[:, 0].set(flat_x).at[:, 1].set(flat_y)
+
+    emps = np.asarray(score_fn(bonus_state, obs_batch, rng))
+    emp_map = emps.reshape(grid_res, grid_res)
+
+    fig, ax = _plt.subplots(figsize=(5, 5))
+    im = ax.imshow(
+        emp_map, origin="lower",
+        extent=[xs[0], xs[-1], ys[0], ys[-1]],
+        cmap="viridis", aspect="equal",
+    )
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Empowerment")
+    ax.set_xlabel("obs[0] (x)")
+    ax.set_ylabel("obs[1] (y)")
+    ax.set_title(f"online empowerment  step={current_step}")
+    fig.tight_layout()
+    _wandb.log({"viz/online_empowerment_xy_map": _wandb.Image(fig)}, step=current_step)
+    _plt.close(fig)
+
+
 def _log_exploration_bonus_goal_heatmap(reward_viz, goal_indices, current_step: int):
     """Scatter the total exploration bonus (no env reward) over the first-two
     and last-two ``goal_indices`` columns of the sampled states. ``reward_viz``
@@ -247,6 +300,12 @@ class GoExploreSimple:
     exploration_bonus_type: Optional[Tuple[str, ...]] = None
     exploration_bonus_weight: Tuple[float, ...] = (0.1,)
 
+    # Number of bonus-train gradient steps per env step. Each step samples a
+    # fresh batch from the replay buffer (threaded via lax.scan in
+    # training_step). Applies to every trainable bonus (RND / MISC /
+    # online_empowerment); UCB has its own ucb_grad_steps_per_train_step.
+    bonus_grad_steps_per_env_step: int = 1
+
     # Empowerment global normalization: emitted bonus is (raw_emp - mean) / scale.
     empowerment_bonus_mean: float = 1.3
     empowerment_bonus_scale: float = 0.2
@@ -286,6 +345,27 @@ class GoExploreSimple:
     ucb_num_hidden: int = 2
     ucb_grad_steps_per_train_step: int = 1
     ucb_warmup_env_steps: int = 10000  # state-based default from the paper
+
+    # ── Online empowerment bonus ───────────────────────────────────────────
+    # Enabled by listing "online_empowerment" in `exploration_bonus_type`.
+    # Trains a skill-conditioned policy + Q (and optionally V) on samples
+    # from the replay buffer; per-state empowerment I(Z;S+|s) is added to
+    # the reward identical to the offline empowerment bonus path.
+    online_empowerment_lr: float = 3e-4
+    online_empowerment_value_hidden_dims: Tuple[int, ...] = (512, 512, 512, 512)
+    online_empowerment_actor_hidden_dims: Tuple[int, ...] = (512, 512, 512, 512)
+    online_empowerment_value_latent_dim: int = 128
+    online_empowerment_num_skills: int = 5
+    online_empowerment_num_splus_samples: int = 32
+    online_empowerment_discount: float = 0.99
+    online_empowerment_tau: float = 0.005
+    online_empowerment_separate_qv: bool = False
+    online_empowerment_use_self_q_loss: bool = True
+    online_empowerment_layer_norm: bool = True
+    online_empowerment_bc_alpha: float = 0.01
+    # Emit (raw_emp - mean) / scale per the existing empowerment bonus path.
+    online_empowerment_bonus_mean: float = 0.0
+    online_empowerment_bonus_scale: float = 1.0
 
     # ── Go Explore specific parameters ──────────────────────────────────────
     num_gcp_steps: int = 250      # max steps in go phase before forcing explore
@@ -611,6 +691,21 @@ class GoExploreSimple:
             misc_num_hidden=self.misc_num_hidden,
             misc_learning_rate=self.misc_learning_rate,
             misc_alpha=self.misc_alpha,
+            online_empowerment_action_size=action_size,
+            online_empowerment_lr=self.online_empowerment_lr,
+            online_empowerment_value_hidden_dims=self.online_empowerment_value_hidden_dims,
+            online_empowerment_actor_hidden_dims=self.online_empowerment_actor_hidden_dims,
+            online_empowerment_value_latent_dim=self.online_empowerment_value_latent_dim,
+            online_empowerment_num_skills=self.online_empowerment_num_skills,
+            online_empowerment_num_splus_samples=self.online_empowerment_num_splus_samples,
+            online_empowerment_discount=self.online_empowerment_discount,
+            online_empowerment_tau=self.online_empowerment_tau,
+            online_empowerment_separate_qv=self.online_empowerment_separate_qv,
+            online_empowerment_use_self_q_loss=self.online_empowerment_use_self_q_loss,
+            online_empowerment_layer_norm=self.online_empowerment_layer_norm,
+            online_empowerment_bc_alpha=self.online_empowerment_bc_alpha,
+            online_empowerment_bonus_mean=self.online_empowerment_bonus_mean,
+            online_empowerment_bonus_scale=self.online_empowerment_bonus_scale,
         )
         exploration_bonus_state = exploration_bonuses.initial_state
 
@@ -867,6 +962,7 @@ class GoExploreSimple:
         has_ucb = exploration_bonuses.has_ucb
         ucb_warmup = jnp.asarray(self.ucb_warmup_env_steps, dtype=jnp.float32)
         ucb_grad_steps = int(self.ucb_grad_steps_per_train_step)
+        bonus_grad_steps = int(self.bonus_grad_steps_per_env_step)
 
         @jax.jit
         def training_step(
@@ -1025,16 +1121,58 @@ class GoExploreSimple:
             metrics.update(bonus_metrics)
             metrics["reward_mean"] = jnp.mean(transitions.reward)
 
-            # Train all bonus-side trainables (RND predictor, etc.) on the
-            # *online* batch only. compute() above is read-only over predictor
-            # params, so RND novelty stays meaningful for offline rows: it
-            # reflects "novel relative to what's been seen ONLINE". The reward-
-            # stats normalizer inside compute() still tracks the full batch.
+            # Train all bonus-side trainables (RND predictor, online
+            # empowerment networks, etc.) on the *online* batch only.
+            # compute() above is read-only over predictor params, so RND
+            # novelty stays meaningful for offline rows: it reflects "novel
+            # relative to what's been seen ONLINE".
+            #
+            # Default (bonus_grad_steps_per_env_step == 1): single train call
+            # on the same online_transitions batch the main policy used —
+            # preserves prior RND/MISC behavior bit-for-bit.
+            #
+            # Multi-step (bonus_grad_steps_per_env_step > 1): wrap in a
+            # jax.lax.scan that samples a fresh batch from the replay buffer
+            # per grad step. Each step's samples are independent — needed
+            # for online_empowerment so that the empowerment estimator and
+            # policy gradient see uncorrelated batches.
             if exploration_bonuses.has_trainables:
-                exploration_bonus_state, online_train_metrics = exploration_bonuses.train(
-                    exploration_bonus_state, online_transitions, 1,
-                )
-                metrics.update(online_train_metrics)
+                if bonus_grad_steps == 1:
+                    exploration_bonus_state, online_train_metrics = exploration_bonuses.train(
+                        exploration_bonus_state, online_transitions, 1,
+                    )
+                    metrics.update(online_train_metrics)
+                else:
+                    bonus_loop_key, train_key = jax.random.split(train_key)
+
+                    def _train_bonus_step(carry, _):
+                        bs, bonus_st, k = carry
+                        sample_k, k_next = jax.random.split(k)
+                        bs, bs_online = replay_buffer.sample(bs)
+                        # Re-tag is_online so masked compute() (and any
+                        # future train_fn that introspects extras) sees the
+                        # same shape as the main path.
+                        bs_online_extras = {
+                            **bs_online.extras,
+                            "state_extras": {
+                                **bs_online.extras["state_extras"],
+                                "is_online": jnp.ones_like(bs_online.reward),
+                            },
+                        }
+                        bs_online = bs_online._replace(extras=bs_online_extras)
+                        bonus_st, m = exploration_bonuses.train(bonus_st, bs_online, 1)
+                        return (bs, bonus_st, k_next), m
+
+                    (buffer_state, exploration_bonus_state, _), bonus_metrics_seq = jax.lax.scan(
+                        _train_bonus_step,
+                        (buffer_state, exploration_bonus_state, bonus_loop_key),
+                        (),
+                        length=bonus_grad_steps,
+                    )
+                    online_train_metrics = jax.tree_util.tree_map(
+                        jnp.mean, bonus_metrics_seq,
+                    )
+                    metrics.update(online_train_metrics)
 
             if has_ucb:
                 # Train reward + termination predictors on the *online* batch
@@ -1257,6 +1395,28 @@ class GoExploreSimple:
                         goal_indices=tuple(unwrapped_env.goal_indices),
                         current_step=current_step,
                     )
+                    if (
+                        self.exploration_bonus_type is not None
+                        and "online_empowerment" in self.exploration_bonus_type
+                    ):
+                        oe_idx = self.exploration_bonus_type.index("online_empowerment")
+                        oe_bonus_fn = exploration_bonuses.fns[oe_idx]
+                        score_fn = getattr(oe_bonus_fn, "score_states", None)
+                        if score_fn is not None:
+                            buffer_state, viz_transitions = replay_buffer.sample(buffer_state)
+                            template_state = viz_transitions.observation[0, 0, :state_size]
+                            key, viz_emp_key = jax.random.split(key)
+                            _log_online_empowerment_xy_map(
+                                score_fn=score_fn,
+                                bonus_state=exploration_bonus_state[oe_idx],
+                                template_state=template_state,
+                                state_size=state_size,
+                                x_bounds=unwrapped_env.x_bounds,
+                                y_bounds=unwrapped_env.y_bounds,
+                                grid_res=64,
+                                rng=viz_emp_key,
+                                current_step=current_step,
+                            )
                 if use_exploration_q_critic:
                     visualize_exploration_q_xy(
                         xs=last_exp_q_viz[0],

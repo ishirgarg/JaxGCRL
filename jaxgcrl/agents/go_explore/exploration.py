@@ -152,6 +152,22 @@ def create_exploration_bonus(
     misc_num_hidden: int = 3,
     misc_learning_rate: float = 1e-3,
     misc_alpha: float = 5000.0,
+    # Online-empowerment-specific
+    online_empowerment_action_size: Optional[int] = None,
+    online_empowerment_lr: float = 3e-4,
+    online_empowerment_value_hidden_dims: Sequence[int] = (512, 512, 512, 512),
+    online_empowerment_actor_hidden_dims: Sequence[int] = (512, 512, 512, 512),
+    online_empowerment_value_latent_dim: int = 128,
+    online_empowerment_num_skills: int = 5,
+    online_empowerment_num_splus_samples: int = 32,
+    online_empowerment_discount: float = 0.99,
+    online_empowerment_tau: float = 0.005,
+    online_empowerment_separate_qv: bool = False,
+    online_empowerment_use_self_q_loss: bool = True,
+    online_empowerment_layer_norm: bool = True,
+    online_empowerment_bc_alpha: float = 0.01,
+    online_empowerment_bonus_mean: float = 0.0,
+    online_empowerment_bonus_scale: float = 1.0,
 ) -> Tuple[BonusFn, Any, InitFromStatesFn, NoveltyFn, TrainFn, UCBTrainFn, UCBRelabelFn, UCBOnlineBonusFn]:
     """Factory: returns ``(bonus_fn, initial_state, init_from_states_fn, novelty_fn, train_fn, ucb_train_fn, ucb_relabel_fn, ucb_online_bonus_fn)``.
 
@@ -227,6 +243,32 @@ def create_exploration_bonus(
             num_hidden=misc_num_hidden,
             learning_rate=misc_learning_rate,
             alpha=misc_alpha,
+        )
+        return bonus_fn, st, init_fn, None, train_fn, None, None, None
+    if bonus_type == "online_empowerment":
+        if online_empowerment_action_size is None:
+            raise ValueError(
+                "'online_empowerment' bonus requires online_empowerment_action_size."
+            )
+        from .online_empowerment import _create_online_empowerment_bonus
+        bonus_fn, st, init_fn, train_fn = _create_online_empowerment_bonus(
+            state_size=state_size,
+            action_size=online_empowerment_action_size,
+            key=key,
+            lr=online_empowerment_lr,
+            value_hidden_dims=online_empowerment_value_hidden_dims,
+            actor_hidden_dims=online_empowerment_actor_hidden_dims,
+            value_latent_dim=online_empowerment_value_latent_dim,
+            num_skills=online_empowerment_num_skills,
+            num_splus_samples=online_empowerment_num_splus_samples,
+            discount=online_empowerment_discount,
+            tau=online_empowerment_tau,
+            separate_qv=online_empowerment_separate_qv,
+            use_self_q_loss=online_empowerment_use_self_q_loss,
+            layer_norm=online_empowerment_layer_norm,
+            bc_alpha=online_empowerment_bc_alpha,
+            bonus_mean=online_empowerment_bonus_mean,
+            bonus_scale=online_empowerment_bonus_scale,
         )
         return bonus_fn, st, init_fn, None, train_fn, None, None, None
     if bonus_type == "ucb":
@@ -1073,6 +1115,22 @@ def create_exploration_bonuses(
     misc_num_hidden: int = 3,
     misc_learning_rate: float = 1e-3,
     misc_alpha: float = 5000.0,
+    # Online-empowerment-specific
+    online_empowerment_action_size: Optional[int] = None,
+    online_empowerment_lr: float = 3e-4,
+    online_empowerment_value_hidden_dims: Sequence[int] = (512, 512, 512, 512),
+    online_empowerment_actor_hidden_dims: Sequence[int] = (512, 512, 512, 512),
+    online_empowerment_value_latent_dim: int = 128,
+    online_empowerment_num_skills: int = 5,
+    online_empowerment_num_splus_samples: int = 32,
+    online_empowerment_discount: float = 0.99,
+    online_empowerment_tau: float = 0.005,
+    online_empowerment_separate_qv: bool = False,
+    online_empowerment_use_self_q_loss: bool = True,
+    online_empowerment_layer_norm: bool = True,
+    online_empowerment_bc_alpha: float = 0.01,
+    online_empowerment_bonus_mean: float = 0.0,
+    online_empowerment_bonus_scale: float = 1.0,
 ) -> ExplorationBonuses:
     """Build an :class:`ExplorationBonuses` bundle from user-facing config.
 
@@ -1135,6 +1193,21 @@ def create_exploration_bonuses(
             misc_num_hidden=misc_num_hidden,
             misc_learning_rate=misc_learning_rate,
             misc_alpha=misc_alpha,
+            online_empowerment_action_size=online_empowerment_action_size,
+            online_empowerment_lr=online_empowerment_lr,
+            online_empowerment_value_hidden_dims=online_empowerment_value_hidden_dims,
+            online_empowerment_actor_hidden_dims=online_empowerment_actor_hidden_dims,
+            online_empowerment_value_latent_dim=online_empowerment_value_latent_dim,
+            online_empowerment_num_skills=online_empowerment_num_skills,
+            online_empowerment_num_splus_samples=online_empowerment_num_splus_samples,
+            online_empowerment_discount=online_empowerment_discount,
+            online_empowerment_tau=online_empowerment_tau,
+            online_empowerment_separate_qv=online_empowerment_separate_qv,
+            online_empowerment_use_self_q_loss=online_empowerment_use_self_q_loss,
+            online_empowerment_layer_norm=online_empowerment_layer_norm,
+            online_empowerment_bc_alpha=online_empowerment_bc_alpha,
+            online_empowerment_bonus_mean=online_empowerment_bonus_mean,
+            online_empowerment_bonus_scale=online_empowerment_bonus_scale,
         )
         fns.append(fn)
         states.append(st)
