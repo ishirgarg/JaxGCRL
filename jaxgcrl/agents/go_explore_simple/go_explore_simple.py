@@ -291,7 +291,7 @@ class GoExploreSimple:
     # If True, feed the full state (obs with goal sliced off) to the
     # empowerment network instead of overwriting a few indices of a cached
     # OGBench template. Requires state_size == checkpoint ex_obs_dim.
-    use_full_empowerment: bool = False
+    use_full_empowerment: bool = True
 
     # ── RLPD (offline data mixing) ─────────────────────────────────────────
     use_rlpd: bool = True  # Mix 50% offline OGBench data into each training batch
