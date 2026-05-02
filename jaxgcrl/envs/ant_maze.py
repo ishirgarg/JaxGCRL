@@ -16,6 +16,7 @@ RESET = R = "r"
 GOAL = G = "g"
 
 
+
 U_MAZE = [
     [1, 1, 1, 1, 1],
     [1, R, G, G, 1],
@@ -77,6 +78,18 @@ BIG_MAZE = [
     [1, G, 1, G, G, 1, G, 1],
     [1, G, G, G, 1, G, G, 1],
     [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+CROSS_MAZE = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, R, 1, 1, 1, 1],
+    [1, 1, 1, R, G, R, 1, 1, 1],
+    [1, 1, R, 1, G, 1, R, 1, 1],
+    [1, R, G, G, G, G, G, R, 1],
+    [1, 1, R, 1, G, 1, R, 1, 1],
+    [1, 1, 1, R, G, R, 1, 1, 1],
+    [1, 1, 1, 1, R, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
 BIG_MAZE_HARD = [
@@ -182,6 +195,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
         maze_layout = BIG_MAZE_HARD
     elif maze_layout_name == "big_maze_eval":
         maze_layout = BIG_MAZE_EVAL
+    elif maze_layout_name == "cross_maze":
+        maze_layout = CROSS_MAZE
     elif maze_layout_name == "hardest_maze":
         maze_layout = HARDEST_MAZE
     else:
@@ -271,6 +286,8 @@ class AntMaze(PipelineEnv):
             maze_layout = BIG_MAZE_HARD
         elif maze_layout_name == "big_maze_eval":
             maze_layout = BIG_MAZE_EVAL
+        elif maze_layout_name == "cross_maze":
+            maze_layout = CROSS_MAZE
         elif maze_layout_name == "hardest_maze":
             maze_layout = HARDEST_MAZE
         else:
