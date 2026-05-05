@@ -158,7 +158,7 @@ class OfflineTrajectoryBuffer:
             all_traj_id.append(traj_ids)
             all_truncation.append(truncation)
 
-            if agent_type == "sac" and "next_observations" in ep:
+            if "next_observations" in ep:
                 next_obs = np.concatenate([ep["next_observations"], goal_pad], axis=-1)
                 all_next_obs.append(next_obs)
 
@@ -204,7 +204,7 @@ class OfflineTrajectoryBuffer:
             action=jnp.zeros(action_size),
             reward=jnp.float32(0.0),
             discount=jnp.float32(0.0),
-            next_observation=jnp.zeros(obs_size) if agent_type == "sac" else None,
+            next_observation=jnp.zeros(obs_size) if slot_next_obs is not None else None,
             extras={"state_extras": state_extras},
         )
         dummy_flat, self._unflatten_fn = flatten_util.ravel_pytree(dummy_transition)

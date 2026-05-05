@@ -862,10 +862,9 @@ class GoExploreSimple:
             state_extras = {x: nstate.info[x] for x in extra_fields}
             state_extras['phase'] = phase
 
-            # Build next_observation for SAC if needed
             next_obs = jnp.concatenate(
                 [nstate.obs[:, :state_size], go_goal], axis=-1
-            ) if self.agent_type == "sac" else None
+            )
 
             return nstate, Transition(
                 observation=gcp_obs,
