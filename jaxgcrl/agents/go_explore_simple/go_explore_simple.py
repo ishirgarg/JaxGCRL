@@ -369,6 +369,28 @@ class GoExploreSimple:
     eme_max_reward_scaling: float = 10.0
     eme_bootstrap_keep_prob: float = 0.8
 
+    # ── APT (Liu & Abbeel, 2021) ───────────────────────────────────────────
+    # Enabled by listing "apt" in `exploration_bonus_type`. Trains a state
+    # encoder + projection head via a SimCLR contrastive loss (with
+    # Gaussian-noise augmentations as the state-based analogue of the
+    # paper's random-shift / color-jitter on images); per-transition
+    # bonus is the particle-based entropy estimator
+    # log(c + (1/k) * sum_{z^{(j)} in N_k(f(s'))} ||f(s') - z^{(j)}||),
+    # normalized by a running mean. Added to ONLINE rewards only — APT
+    # measures novelty relative to the agent's online visitation, so
+    # offline (RLPD) rows are masked out.
+    apt_repr_dim: int = 16
+    apt_encoder_hidden_dim: int = 256
+    apt_encoder_num_hidden: int = 2
+    apt_projection_hidden_dim: int = 256
+    apt_projection_num_hidden: int = 1
+    apt_learning_rate: float = 1e-3
+    apt_temperature: float = 0.1
+    apt_knn_k: int = 3
+    apt_knn_c: float = 1.0
+    apt_aug_noise_std: float = 0.1
+    apt_train_batch_size: int = 256
+
     # ── EXPLORE (UCB labeling of offline data) ─────────────────────────────
     # Enabled by listing "ucb" alongside "rnd" in `exploration_bonus_type`.
     # When present, trains a reward predictor r_θ(s,a) and termination
@@ -770,6 +792,17 @@ class GoExploreSimple:
             eme_ensemble_size=self.eme_ensemble_size,
             eme_max_reward_scaling=self.eme_max_reward_scaling,
             eme_bootstrap_keep_prob=self.eme_bootstrap_keep_prob,
+            apt_repr_dim=self.apt_repr_dim,
+            apt_encoder_hidden_dim=self.apt_encoder_hidden_dim,
+            apt_encoder_num_hidden=self.apt_encoder_num_hidden,
+            apt_projection_hidden_dim=self.apt_projection_hidden_dim,
+            apt_projection_num_hidden=self.apt_projection_num_hidden,
+            apt_learning_rate=self.apt_learning_rate,
+            apt_temperature=self.apt_temperature,
+            apt_knn_k=self.apt_knn_k,
+            apt_knn_c=self.apt_knn_c,
+            apt_aug_noise_std=self.apt_aug_noise_std,
+            apt_train_batch_size=self.apt_train_batch_size,
             online_empowerment_action_size=action_size,
             online_empowerment_lr=self.online_empowerment_lr,
             online_empowerment_value_hidden_dims=self.online_empowerment_value_hidden_dims,

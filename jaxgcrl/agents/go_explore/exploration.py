@@ -96,6 +96,36 @@ class EMEBonusState:
 
 
 @fdataclass
+class APTBonusState:
+    """Mutable state for the APT (Active Pre-Training) intrinsic reward.
+
+    Carries the trainable encoder ``f_theta`` and projection head
+    ``h_phi`` (both as one shared pytree) used to map states into a
+    representation space, their shared Adam optimizer state, a Welford
+    running mean of the raw intrinsic reward (used to keep the bonus on a
+    consistent scale as in the paper: "we normalize the intrinsic reward
+    by dividing it by a running estimate of the mean of the intrinsic
+    reward"), and a PRNG key advanced each train step (fresh Gaussian
+    augmentations per minibatch).
+
+    Per-transition reward (Eq. 5 of Liu & Abbeel, 2021):
+      ``r(s, a, s') = log(c + (1/k) * sum_{z^{(j)} in N_k(f(s'))} ||f(s') - z^{(j)}||)``
+    averaged over the ``k`` nearest neighbors of ``f(s')`` within the same
+    batch. The encoder is read-only inside ``bonus_fn``; learning happens
+    in ``train_fn`` via a SimCLR-style contrastive loss with two
+    Gaussian-noise augmentations of each state (state-based analogue of
+    the random-shift / color-jitter augmentations the paper uses on
+    images, since the representation learning module is "modular of
+    [the] entropy maximization" per §3.2).
+    """
+    predictor_params: Any
+    opt_state: Any
+    reward_mean: jnp.ndarray   # scalar (running mean of raw intrinsic reward)
+    reward_count: jnp.ndarray  # scalar
+    key: jax.Array             # PRNG key for per-step training augmentations
+
+
+@fdataclass
 class ICMBonusState:
     """Mutable state for the ICM (Intrinsic Curiosity Module) intrinsic reward.
 
@@ -238,6 +268,23 @@ def create_exploration_bonus(
     eme_ensemble_size: int = 6,
     eme_max_reward_scaling: float = 10.0,
     eme_bootstrap_keep_prob: float = 0.8,
+    # APT-specific (Liu & Abbeel, 2021). State-based adaptation: a small
+    # MLP encoder + projection head trained via SimCLR contrastive loss
+    # with Gaussian-noise augmentations (paper §3.2 makes the
+    # representation-learning module modular). The particle-based entropy
+    # reward (Eq. 5) is a read-only k-NN average inside the same batch
+    # of f(s') particles, log-transformed and divided by a running mean.
+    apt_repr_dim: int = 16,
+    apt_encoder_hidden_dim: int = 256,
+    apt_encoder_num_hidden: int = 2,
+    apt_projection_hidden_dim: int = 256,
+    apt_projection_num_hidden: int = 1,
+    apt_learning_rate: float = 1e-3,
+    apt_temperature: float = 0.1,
+    apt_knn_k: int = 3,
+    apt_knn_c: float = 1.0,
+    apt_aug_noise_std: float = 0.1,
+    apt_train_batch_size: int = 256,
     # Online-empowerment-specific
     online_empowerment_action_size: Optional[int] = None,
     online_empowerment_lr: float = 3e-4,
@@ -385,6 +432,23 @@ def create_exploration_bonus(
             max_reward_scaling=eme_max_reward_scaling,
             gamma=discount,
             bootstrap_keep_prob=eme_bootstrap_keep_prob,
+        )
+        return bonus_fn, st, init_fn, None, train_fn, None, None, None
+    if bonus_type == "apt":
+        bonus_fn, st, init_fn, train_fn = _create_apt_bonus(
+            state_size=state_size,
+            key=key,
+            repr_dim=apt_repr_dim,
+            encoder_hidden_dim=apt_encoder_hidden_dim,
+            encoder_num_hidden=apt_encoder_num_hidden,
+            projection_hidden_dim=apt_projection_hidden_dim,
+            projection_num_hidden=apt_projection_num_hidden,
+            learning_rate=apt_learning_rate,
+            temperature=apt_temperature,
+            knn_k=apt_knn_k,
+            knn_c=apt_knn_c,
+            aug_noise_std=apt_aug_noise_std,
+            train_batch_size=apt_train_batch_size,
         )
         return bonus_fn, st, init_fn, None, train_fn, None, None, None
     if bonus_type == "online_empowerment":
@@ -1529,6 +1593,259 @@ def _create_eme_bonus(
     return eme_bonus, initial_state, None, eme_train
 
 
+def _create_apt_bonus(
+    *,
+    state_size: int,
+    key: jax.Array,
+    repr_dim: int = 16,
+    encoder_hidden_dim: int = 256,
+    encoder_num_hidden: int = 2,
+    projection_hidden_dim: int = 256,
+    projection_num_hidden: int = 1,
+    learning_rate: float = 1e-3,
+    temperature: float = 0.1,
+    knn_k: int = 3,
+    knn_c: float = 1.0,
+    aug_noise_std: float = 0.1,
+    train_batch_size: int = 256,
+) -> Tuple[BonusFn, APTBonusState, InitFromStatesFn, TrainFn]:
+    """APT: Active Pre-Training particle-based entropy bonus (Liu & Abbeel, 2021).
+
+    Two jointly trained networks share one Adam optimizer:
+      * ``f_theta(s)``: encoder, ``state_size -> repr_dim``.
+      * ``h_phi(z)``: projection head, ``repr_dim -> repr_dim``, only used
+        for the contrastive loss (the entropy reward operates directly on
+        the encoder output ``z = f_theta(s)``, per Figure 2).
+
+    Per-transition reward (Eq. 5):
+      ``r(s, a, s') = log(c + (1/k) * sum_{z^{(j)} in N_k(f(s'))} ||f(s') - z^{(j)}||)``,
+    averaged over the ``k`` nearest neighbors of ``f(s')`` within the same
+    batch of transitions. The emitted bonus is normalized by a Welford
+    running mean of the raw intrinsic reward, matching the paper:
+    "we normalize the intrinsic reward by dividing it by a running
+    estimate of the mean of the intrinsic reward."
+
+    Representation learning uses a SimCLR-style NT-Xent loss with two
+    Gaussian-noise augmented views of each state (state-based analogue of
+    the random-shift / color-jitter augmentations used in the paper for
+    images). The encoder is frozen during ``bonus_fn`` and updated only
+    by ``apt_train`` on online transitions.
+
+    Online-only: APT measures novelty relative to what's been visited
+    *online*; firing on offline rows would just reward "different from
+    online" rather than "novel to the agent" (same logic as RND/ICM/EME).
+    Wired into ``ExplorationBonuses._ONLINE_ONLY_BONUS_TYPES``.
+    """
+    from .networks import Encoder
+
+    encoder = Encoder(
+        repr_dim=repr_dim,
+        network_width=encoder_hidden_dim,
+        network_depth=encoder_num_hidden,
+        skip_connections=0,
+        use_relu=True,
+        use_ln=True,
+    )
+    # Projection head: small MLP from z -> z, used only for the contrastive
+    # loss (per Figure 2 of the paper, the contrastive head is separate
+    # from the representation head used for entropy maximization).
+    projection = Encoder(
+        repr_dim=repr_dim,
+        network_width=projection_hidden_dim,
+        network_depth=projection_num_hidden,
+        skip_connections=0,
+        use_relu=True,
+        use_ln=False,
+    )
+
+    enc_key, proj_key, state_key = jax.random.split(key, 3)
+    dummy_state = jnp.zeros((1, state_size), dtype=jnp.float32)
+    dummy_repr = jnp.zeros((1, repr_dim), dtype=jnp.float32)
+    encoder_params = encoder.init(enc_key, dummy_state)
+    projection_params = projection.init(proj_key, dummy_repr)
+
+    predictor_params0 = {
+        "encoder": encoder_params,
+        "projection": projection_params,
+    }
+    optimizer = optax.adam(learning_rate)
+    opt_state0 = optimizer.init(predictor_params0)
+
+    initial_state = APTBonusState(
+        predictor_params=predictor_params0,
+        opt_state=opt_state0,
+        reward_mean=jnp.asarray(0.0, dtype=jnp.float32),
+        reward_count=jnp.asarray(0.0, dtype=jnp.float32),
+        key=state_key,
+    )
+
+    c_f = jnp.asarray(knn_c, dtype=jnp.float32)
+    temp_f = jnp.asarray(temperature, dtype=jnp.float32)
+    aug_std_f = jnp.asarray(aug_noise_std, dtype=jnp.float32)
+    k = int(knn_k)
+
+    def _encode(params, states):
+        return encoder.apply(params["encoder"], states)
+
+    def _project(params, z):
+        return projection.apply(params["projection"], z)
+
+    def _welford_update_mean(mean, count, batch_flat):
+        """Parallel Welford update for a running mean over a flat batch."""
+        n = jnp.asarray(batch_flat.shape[0], dtype=jnp.float32)
+        batch_mean = jnp.mean(batch_flat)
+        new_count = count + n
+        delta = batch_mean - mean
+        new_mean = mean + delta * n / new_count
+        return new_mean, new_count
+
+    def _knn_avg_distance(z_flat):
+        """Per-particle average L2 distance to its ``k`` nearest neighbors.
+
+        Computes the full ``(N, N)`` pairwise distance matrix and uses
+        ``jax.lax.top_k`` over the negated row to pick the smallest
+        ``k+1`` distances (one of which is the particle's own zero
+        distance to itself); averaging includes that self-zero, matching
+        the behavior of the official APT implementation.
+        """
+        # Pairwise L2 distances; shape (N, N).
+        diffs = z_flat[:, None, :] - z_flat[None, :, :]
+        dists = jnp.sqrt(jnp.sum(diffs ** 2, axis=-1) + 1e-12)
+        # top_k selects largest, so negate to pick smallest. Take k+1 to
+        # absorb the self-distance row (== 0); the resulting average is
+        # ``(0 + d_1 + ... + d_k) / (k+1)`` which the official code also
+        # uses (it does NOT mask the diagonal).
+        N = dists.shape[0]
+        k_eff = min(k + 1, N)
+        top_neg, _ = jax.lax.top_k(-dists, k_eff)
+        nn_dists = -top_neg  # shape (N, k_eff)
+        return jnp.mean(nn_dists, axis=-1)
+
+    def apt_bonus(state: APTBonusState, transitions, bonus_key):
+        """Per-transition APT intrinsic reward (Eq. 5).
+
+        Read-only over the encoder params. Updates the running-mean
+        normalizer on the full batch (online + offline) so the
+        bonus-scale stays consistent with what's actually emitted; the
+        masking to online-only rows is applied externally by
+        ``ExplorationBonuses.compute`` via ``_ONLINE_ONLY_BONUS_TYPES``.
+        """
+        del bonus_key
+        next_states = transitions.next_observation[..., :state_size]
+        shape = next_states.shape[:-1]
+        flat_sp = next_states.reshape(-1, state_size)
+
+        params = jax.lax.stop_gradient(state.predictor_params)
+        z = _encode(params, flat_sp)  # (N, repr_dim)
+
+        avg_dist = _knn_avg_distance(z)              # (N,)
+        raw_bonus_flat = jnp.log(c_f + avg_dist)     # (N,)
+
+        # Update running mean *before* using it so the first batch produces
+        # a sensible scale (mean=1 fallback via reward_count<=0).
+        new_reward_mean, new_reward_count = _welford_update_mean(
+            state.reward_mean, state.reward_count, raw_bonus_flat
+        )
+        scale = jnp.where(new_reward_count > 0.0, jnp.abs(new_reward_mean), 1.0)
+        bonus_flat = raw_bonus_flat / jnp.maximum(scale, 1e-8)
+        bonus = bonus_flat.reshape(shape)
+
+        new_state = state.replace(
+            reward_mean=new_reward_mean,
+            reward_count=new_reward_count,
+        )
+        metrics = {
+            "apt_avg_knn_dist_mean": jnp.mean(avg_dist),
+            "apt_raw_bonus_mean": jnp.mean(raw_bonus_flat),
+            "apt_bonus_mean": jnp.mean(bonus),
+            "apt_reward_running_mean": new_reward_mean,
+        }
+        return bonus, new_state, metrics
+
+    def _contrastive_loss(params, states_aug_k, states_aug_v):
+        """SimCLR NT-Xent loss across two augmented views of the same batch.
+
+        Each row ``i`` of the two views is a positive pair; all other rows
+        across both views are negatives. Mirrors the paper's loss
+        (§3.2), with the caveat that the denominator's ``j != i`` mask is
+        applied via a -inf diagonal so logsumexp ignores the (i,i) self-
+        similarity in the within-view similarity block.
+        """
+        # Encode and project both views; features are L2-normalized so the
+        # dot product is a cosine similarity (standard SimCLR convention).
+        z_k = _encode(params, states_aug_k)
+        z_v = _encode(params, states_aug_v)
+        h_k = _project(params, z_k)
+        h_v = _project(params, z_v)
+
+        h_k = h_k / (jnp.linalg.norm(h_k, axis=-1, keepdims=True) + 1e-8)
+        h_v = h_v / (jnp.linalg.norm(h_v, axis=-1, keepdims=True) + 1e-8)
+
+        n = h_k.shape[0]
+        # Similarities scaled by temperature.
+        sim_kv = (h_k @ h_v.T) / temp_f   # (n, n) — positives on the diag
+        sim_kk = (h_k @ h_k.T) / temp_f   # (n, n) — within-view, drop diag
+
+        # Mask the diagonal of the within-view block so logsumexp excludes
+        # the trivial (i,i) self-match.
+        eye = jnp.eye(n, dtype=sim_kk.dtype)
+        sim_kk = sim_kk - 1e9 * eye
+
+        # Numerator: positive at sim_kv[i, i] = h_k_i · h_v_i / tau.
+        pos = jnp.diag(sim_kv)
+
+        # Denominator: logsumexp over [sim_kk (no diag), sim_kv].
+        denom_logits = jnp.concatenate([sim_kk, sim_kv], axis=1)  # (n, 2n)
+        denom = jax.scipy.special.logsumexp(denom_logits, axis=-1)
+
+        return jnp.mean(denom - pos)
+
+    def apt_train(state: APTBonusState, online_transitions, num_grad_steps: int = 1):
+        """Train the encoder + projection head via SimCLR contrastive loss.
+
+        Subsamples ``train_batch_size`` rows from the flattened
+        ``num_envs * episode_length`` online batch each grad step, draws
+        two i.i.d. Gaussian-noise augmentations per row (the state-based
+        analogue of the paper's random-shift / color-jitter on images),
+        and updates both networks jointly.
+        """
+        states = online_transitions.observation[..., :state_size].reshape(-1, state_size)
+        N = states.shape[0]
+        mb = min(int(train_batch_size), N)
+
+        def step(carry, _):
+            params, opt_state, k_in = carry
+            k_in, sub_key, aug_k_key, aug_v_key = jax.random.split(k_in, 4)
+            idx = jax.random.choice(sub_key, N, (mb,), replace=False)
+            batch = states[idx]
+            aug_k = batch + aug_std_f * jax.random.normal(aug_k_key, batch.shape)
+            aug_v = batch + aug_std_f * jax.random.normal(aug_v_key, batch.shape)
+
+            loss_value, grads = jax.value_and_grad(_contrastive_loss)(
+                params, aug_k, aug_v
+            )
+            updates, new_opt_state = optimizer.update(grads, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+            return (new_params, new_opt_state, k_in), loss_value
+
+        (new_params, new_opt_state, new_key), losses = jax.lax.scan(
+            step,
+            (state.predictor_params, state.opt_state, state.key),
+            (),
+            length=num_grad_steps,
+        )
+        new_state = state.replace(
+            predictor_params=new_params,
+            opt_state=new_opt_state,
+            key=new_key,
+        )
+        return new_state, {
+            "apt_contrastive_loss": jnp.mean(losses),
+        }
+
+    return apt_bonus, initial_state, None, apt_train
+
+
 def _create_ucb_bonus(
     *,
     state_size: int,
@@ -1704,7 +2021,7 @@ class ExplorationBonuses:
     # online data, so its empowerment estimate on offline-only states is
     # untrustworthy and out-of-distribution — same argument as MISC.
     _ONLINE_ONLY_BONUS_TYPES = frozenset(
-        {"rnd", "misc", "online_empowerment", "online_mine_empowerment", "icm", "eme"}
+        {"rnd", "misc", "online_empowerment", "online_mine_empowerment", "icm", "eme", "apt"}
     )
 
     # Bonus types whose bonus_fn / train_fn require the agent's main actor
@@ -2010,6 +2327,18 @@ def create_exploration_bonuses(
     eme_ensemble_size: int = 6,
     eme_max_reward_scaling: float = 10.0,
     eme_bootstrap_keep_prob: float = 0.8,
+    # APT-specific (Liu & Abbeel, 2021).
+    apt_repr_dim: int = 16,
+    apt_encoder_hidden_dim: int = 256,
+    apt_encoder_num_hidden: int = 2,
+    apt_projection_hidden_dim: int = 256,
+    apt_projection_num_hidden: int = 1,
+    apt_learning_rate: float = 1e-3,
+    apt_temperature: float = 0.1,
+    apt_knn_k: int = 3,
+    apt_knn_c: float = 1.0,
+    apt_aug_noise_std: float = 0.1,
+    apt_train_batch_size: int = 256,
     # Online-empowerment-specific
     online_empowerment_action_size: Optional[int] = None,
     online_empowerment_lr: float = 3e-4,
@@ -2124,6 +2453,17 @@ def create_exploration_bonuses(
             eme_ensemble_size=eme_ensemble_size,
             eme_max_reward_scaling=eme_max_reward_scaling,
             eme_bootstrap_keep_prob=eme_bootstrap_keep_prob,
+            apt_repr_dim=apt_repr_dim,
+            apt_encoder_hidden_dim=apt_encoder_hidden_dim,
+            apt_encoder_num_hidden=apt_encoder_num_hidden,
+            apt_projection_hidden_dim=apt_projection_hidden_dim,
+            apt_projection_num_hidden=apt_projection_num_hidden,
+            apt_learning_rate=apt_learning_rate,
+            apt_temperature=apt_temperature,
+            apt_knn_k=apt_knn_k,
+            apt_knn_c=apt_knn_c,
+            apt_aug_noise_std=apt_aug_noise_std,
+            apt_train_batch_size=apt_train_batch_size,
             online_empowerment_action_size=online_empowerment_action_size,
             online_empowerment_lr=online_empowerment_lr,
             online_empowerment_value_hidden_dims=online_empowerment_value_hidden_dims,
