@@ -319,7 +319,7 @@ class GoExploreWrapper(Wrapper):
         # Bug 3 fix: ep_done takes priority — mask it out of go→explore so a
         # simultaneous episode termination always routes through should_reset (go phase).
         should_go_to_explore = in_go & (goal_reached | ((phase_step + 1) >= self.num_gcp_steps)) & ~ep_done
-        should_explore_to_go = in_explore & ((phase_step + 1) >= self.num_ep_steps)
+        should_explore_to_go = in_explore & (goal_reached | ((phase_step + 1) >= self.num_ep_steps))
 
         # Any condition that resets to the go-phase start state
         should_reset = should_explore_to_go | ep_done
