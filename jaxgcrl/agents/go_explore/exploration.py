@@ -1729,17 +1729,30 @@ def _create_apt_bonus(
         bonus-scale stays consistent with what's actually emitted; the
         masking to online-only rows is applied externally by
         ``ExplorationBonuses.compute`` via ``_ONLINE_ONLY_BONUS_TYPES``.
+
+        KNN is computed *per minibatch* (the trailing dim of
+        ``next_states`` before features), matching the APT paper which
+        estimates entropy within each SAC update batch. Computing it
+        across the full flattened (num_batches * batch_size) tensor
+        would materialize an O(N^2) pairwise matrix and OOM.
         """
         del bonus_key
         next_states = transitions.next_observation[..., :state_size]
-        shape = next_states.shape[:-1]
+        shape = next_states.shape[:-1]                    # (..., M)
         flat_sp = next_states.reshape(-1, state_size)
 
         params = jax.lax.stop_gradient(state.predictor_params)
-        z = _encode(params, flat_sp)  # (N, repr_dim)
+        z_flat = _encode(params, flat_sp)                 # (N, repr_dim)
+        z = z_flat.reshape(*shape, -1)                    # (..., M, repr_dim)
 
-        avg_dist = _knn_avg_distance(z)              # (N,)
-        raw_bonus_flat = jnp.log(c_f + avg_dist)     # (N,)
+        # vmap KNN over all leading dims so each minibatch of size M gets
+        # its own (M, M) pairwise distance — never the full (N, N).
+        knn_per_batch = _knn_avg_distance
+        for _ in range(z.ndim - 2):
+            knn_per_batch = jax.vmap(knn_per_batch)
+        avg_dist = knn_per_batch(z)                       # shape == ``shape``
+        raw_bonus = jnp.log(c_f + avg_dist)               # shape == ``shape``
+        raw_bonus_flat = raw_bonus.reshape(-1)
 
         # Update running mean *before* using it so the first batch produces
         # a sensible scale (mean=1 fallback via reward_count<=0).
@@ -1747,8 +1760,7 @@ def _create_apt_bonus(
             state.reward_mean, state.reward_count, raw_bonus_flat
         )
         scale = jnp.where(new_reward_count > 0.0, jnp.abs(new_reward_mean), 1.0)
-        bonus_flat = raw_bonus_flat / jnp.maximum(scale, 1e-8)
-        bonus = bonus_flat.reshape(shape)
+        bonus = raw_bonus / jnp.maximum(scale, 1e-8)
 
         new_state = state.replace(
             reward_mean=new_reward_mean,
