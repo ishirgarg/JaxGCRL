@@ -320,6 +320,7 @@ class GoExploreSimple:
     rnd_num_hidden: int = 3
     rnd_learning_rate: float = 1e-4
     rnd_obs_clip: float = 5.0
+    rnd_train_batch_size: int = 512
     # If True, RND operates on state[goal_indices] only (novelty over goal dims).
     use_goal_for_rnd: bool = False
 
@@ -351,6 +352,7 @@ class GoExploreSimple:
     icm_beta: float = 0.2
     icm_eta: float = 1.0
     icm_obs_clip: float = 5.0
+    icm_train_batch_size: int = 512
 
     # ── EME (Wang et al., 2024) ────────────────────────────────────────────
     # Enabled by listing "eme" in `exploration_bonus_type`. Trains an EME
@@ -729,6 +731,7 @@ class GoExploreSimple:
             rnd_learning_rate=self.rnd_learning_rate,
             rnd_obs_clip=self.rnd_obs_clip,
             rnd_use_goal=self.use_goal_for_rnd,
+            rnd_train_batch_size=self.rnd_train_batch_size,
             goal_indices=goal_indices_tuple,
             ucb_action_size=action_size,
             ucb_coeff=self.ucb_coeff,
@@ -754,6 +757,7 @@ class GoExploreSimple:
             icm_beta=self.icm_beta,
             icm_eta=self.icm_eta,
             icm_obs_clip=self.icm_obs_clip,
+            icm_train_batch_size=self.icm_train_batch_size,
             # EME's metric loss needs the actor's pre-tanh (mean, log_std)
             # at arbitrary states for the closed-form Gaussian KL term.
             eme_actor_dist_fn=(lambda params, obs: gcp_actor.apply(params, obs)),

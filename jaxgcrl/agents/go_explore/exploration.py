@@ -119,6 +119,7 @@ class ICMBonusState:
     reward_mean: jnp.ndarray   # scalar
     reward_m2: jnp.ndarray     # scalar (Welford sum of squared deviations)
     reward_count: jnp.ndarray  # scalar
+    key: jax.Array             # PRNG key for per-step training subsample
 
 
 @fdataclass
@@ -138,6 +139,7 @@ class RNDBonusState:
     reward_mean: jnp.ndarray   # scalar
     reward_m2: jnp.ndarray     # scalar (Welford sum of squared deviations)
     reward_count: jnp.ndarray  # scalar
+    key: jax.Array             # PRNG key for per-step training subsample
 
 
 BonusFn = Callable[[Any, Any, jax.Array], Tuple[jnp.ndarray, Any, dict]]
@@ -192,6 +194,7 @@ def create_exploration_bonus(
     rnd_learning_rate: float = 1e-4,
     rnd_obs_clip: float = 5.0,
     rnd_use_goal: bool = False,
+    rnd_train_batch_size: int = 512,
     goal_indices: Optional[Sequence[int]] = None,
     # UCB-specific (EXPLORE algorithm)
     ucb_action_size: Optional[int] = None,
@@ -219,6 +222,7 @@ def create_exploration_bonus(
     icm_beta: float = 0.2,
     icm_eta: float = 1.0,
     icm_obs_clip: float = 5.0,
+    icm_train_batch_size: int = 512,
     # EME-specific (Wang et al., 2024). Defaults follow the paper:
     # ensemble size 6, max reward scaling M=10. The discount is sourced
     # from the top-level ``discount`` argument (= the agent's discount).
@@ -317,6 +321,7 @@ def create_exploration_bonus(
             obs_clip=rnd_obs_clip,
             use_goal=rnd_use_goal,
             goal_indices=goal_indices,
+            train_batch_size=rnd_train_batch_size,
         )
         return bonus_fn, st, init_fn, novelty_fn, train_fn, None, None, None
     if bonus_type == "misc":
@@ -355,6 +360,7 @@ def create_exploration_bonus(
             beta=icm_beta,
             eta=icm_eta,
             obs_clip=icm_obs_clip,
+            train_batch_size=icm_train_batch_size,
         )
         return bonus_fn, st, init_fn, None, train_fn, None, None, None
     if bonus_type == "eme":
@@ -449,6 +455,7 @@ def create_exploration_bonus(
             rnd_learning_rate=rnd_learning_rate,
             rnd_obs_clip=rnd_obs_clip,
             rnd_use_goal=rnd_use_goal,
+            rnd_train_batch_size=rnd_train_batch_size,
             goal_indices=goal_indices,
         )
         return bonus_fn, st, init_fn, None, None, ucb_train_fn, ucb_relabel_fn, ucb_online_bonus_fn
@@ -552,6 +559,7 @@ def _create_rnd_bonus(
     obs_clip: float,
     use_goal: bool = False,
     goal_indices: Optional[Sequence[int]] = None,
+    train_batch_size: int = 512,
 ) -> Tuple[BonusFn, RNDBonusState, InitFromStatesFn, NoveltyFn, TrainFn]:
     """Random Network Distillation with observation normalization.
 
@@ -595,7 +603,7 @@ def _create_rnd_bonus(
         use_ln=True,
     )
 
-    tkey, pkey = jax.random.split(key)
+    tkey, pkey, state_key = jax.random.split(key, 3)
     dummy = jnp.zeros((1, input_dim), dtype=jnp.float32)
     target_params = target_net.init(tkey, dummy)
     predictor_params0 = predictor_net.init(pkey, dummy)
@@ -629,6 +637,7 @@ def _create_rnd_bonus(
         reward_mean=jnp.asarray(0.0, dtype=jnp.float32),
         reward_m2=jnp.asarray(0.0, dtype=jnp.float32),
         reward_count=jnp.asarray(0.0, dtype=jnp.float32),
+        key=state_key,
     )
 
     def _welford_update(mean, m2, count, batch_flat):
@@ -691,6 +700,11 @@ def _create_rnd_bonus(
         relative to what's been seen ONLINE" so that offline transitions can
         get a meaningful novelty bonus. Training on offline would collapse the
         signal we're trying to elicit.
+
+        Subsamples ``train_batch_size`` rows from the flattened
+        ``num_envs * episode_length`` online batch before each grad step
+        — bounds activation memory at high num_envs/episode_length. The
+        rnd bonus path still sees every transition.
         """
         states = online_transitions.observation[..., :state_size]
         flat = states.reshape(-1, state_size)
@@ -698,14 +712,20 @@ def _create_rnd_bonus(
             flat = flat[:, goal_idx_arr]
         normalized = _normalize(flat, state.obs_mean, state.obs_std)
 
+        N = normalized.shape[0]
+        mb = min(int(train_batch_size), N)
+
         def step(carry, _):
             st = carry
-            loss_value, grads = jax.value_and_grad(_loss_fn)(st.predictor_params, normalized)
+            new_key, sub_key = jax.random.split(st.key)
+            idx = jax.random.choice(sub_key, N, (mb,), replace=False)
+            loss_value, grads = jax.value_and_grad(_loss_fn)(st.predictor_params, normalized[idx])
             updates, new_opt_state = optimizer.update(grads, st.opt_state, st.predictor_params)
             new_predictor_params = optax.apply_updates(st.predictor_params, updates)
             new_st = st.replace(
                 predictor_params=new_predictor_params,
                 opt_state=new_opt_state,
+                key=new_key,
             )
             return new_st, loss_value
 
@@ -944,6 +964,7 @@ def _create_icm_bonus(
     beta: float = 0.2,
     eta: float = 1.0,
     obs_clip: float = 5.0,
+    train_batch_size: int = 512,
 ) -> Tuple[BonusFn, ICMBonusState, InitFromStatesFn, TrainFn]:
     """ICM: Intrinsic Curiosity Module (Pathak et al., 2017).
 
@@ -994,7 +1015,7 @@ def _create_icm_bonus(
         use_ln=False,
     )
 
-    enc_key, inv_key, fwd_key = jax.random.split(key, 3)
+    enc_key, inv_key, fwd_key, state_key = jax.random.split(key, 4)
     dummy_state = jnp.zeros((1, state_size), dtype=jnp.float32)
     dummy_phi_pair = jnp.zeros((1, 2 * feature_dim), dtype=jnp.float32)
     dummy_phi_act = jnp.zeros((1, feature_dim + action_size), dtype=jnp.float32)
@@ -1019,6 +1040,7 @@ def _create_icm_bonus(
         reward_mean=jnp.asarray(0.0, dtype=jnp.float32),
         reward_m2=jnp.asarray(0.0, dtype=jnp.float32),
         reward_count=jnp.asarray(0.0, dtype=jnp.float32),
+        key=state_key,
     )
 
     beta_f = jnp.asarray(beta, dtype=jnp.float32)
@@ -1132,6 +1154,12 @@ def _create_icm_bonus(
         Uses the same observation normalization as ``icm_bonus`` (read-only
         on running stats — only ``init_from_states`` and ``icm_bonus``
         update them, exactly mirroring RND).
+
+        Subsamples ``train_batch_size`` rows from the flattened
+        ``num_envs * episode_length`` online batch before each grad step
+        — three networks (encoder x2 + inverse + forward) all need
+        backward activations, so training on the full batch blows
+        memory. The icm bonus path still sees every transition.
         """
         states = online_transitions.observation[..., :state_size].reshape(-1, state_size)
         next_states = online_transitions.next_observation[..., :state_size].reshape(-1, state_size)
@@ -1139,24 +1167,30 @@ def _create_icm_bonus(
         norm_states = _normalize(states, state.obs_mean, state.obs_std)
         norm_next_states = _normalize(next_states, state.obs_mean, state.obs_std)
 
+        N = norm_states.shape[0]
+        mb = min(int(train_batch_size), N)
+
         def step(carry, _):
-            params, opt_state = carry
+            params, opt_state, k = carry
+            k, sub_key = jax.random.split(k)
+            idx = jax.random.choice(sub_key, N, (mb,), replace=False)
             (loss_value, (l_inv, l_fwd)), grads = jax.value_and_grad(
                 _icm_loss, has_aux=True
-            )(params, norm_states, norm_next_states, actions)
+            )(params, norm_states[idx], norm_next_states[idx], actions[idx])
             updates, new_opt_state = optimizer.update(grads, opt_state, params)
             new_params = optax.apply_updates(params, updates)
-            return (new_params, new_opt_state), (loss_value, l_inv, l_fwd)
+            return (new_params, new_opt_state, k), (loss_value, l_inv, l_fwd)
 
-        (new_params, new_opt_state), (losses, l_inv, l_fwd) = jax.lax.scan(
+        (new_params, new_opt_state, new_key), (losses, l_inv, l_fwd) = jax.lax.scan(
             step,
-            (state.predictor_params, state.opt_state),
+            (state.predictor_params, state.opt_state, state.key),
             (),
             length=num_grad_steps,
         )
         new_state = state.replace(
             predictor_params=new_params,
             opt_state=new_opt_state,
+            key=new_key,
         )
         return new_state, {
             "icm_loss": jnp.mean(losses),
@@ -1512,6 +1546,7 @@ def _create_ucb_bonus(
     rnd_learning_rate: float = 1e-4,
     rnd_obs_clip: float = 5.0,
     rnd_use_goal: bool = False,
+    rnd_train_batch_size: int = 512,
     goal_indices: Optional[Sequence[int]] = None,
 ) -> Tuple[BonusFn, UCBBonusState, InitFromStatesFn, UCBTrainFn, UCBRelabelFn]:
     """EXPLORE: optimistic UCB reward labeling for offline data.
@@ -1554,6 +1589,7 @@ def _create_ucb_bonus(
             obs_clip=rnd_obs_clip,
             use_goal=rnd_use_goal,
             goal_indices=goal_indices,
+            train_batch_size=rnd_train_batch_size,
         )
     )
 
@@ -1930,6 +1966,7 @@ def create_exploration_bonuses(
     rnd_learning_rate: float = 1e-4,
     rnd_obs_clip: float = 5.0,
     rnd_use_goal: bool = False,
+    rnd_train_batch_size: int = 512,
     goal_indices: Optional[Sequence[int]] = None,
     # UCB-specific
     ucb_action_size: Optional[int] = None,
@@ -1957,6 +1994,7 @@ def create_exploration_bonuses(
     icm_beta: float = 0.2,
     icm_eta: float = 1.0,
     icm_obs_clip: float = 5.0,
+    icm_train_batch_size: int = 512,
     # EME-specific (Wang et al., 2024). Defaults follow the paper:
     # ensemble size 6, max reward scaling M=10. The discount is sourced
     # from the top-level ``discount`` argument (= the agent's discount).
@@ -2052,6 +2090,7 @@ def create_exploration_bonuses(
             rnd_learning_rate=rnd_learning_rate,
             rnd_obs_clip=rnd_obs_clip,
             rnd_use_goal=rnd_use_goal,
+            rnd_train_batch_size=rnd_train_batch_size,
             goal_indices=goal_indices,
             ucb_action_size=ucb_action_size,
             ucb_coeff=ucb_coeff,
@@ -2074,6 +2113,7 @@ def create_exploration_bonuses(
             icm_beta=icm_beta,
             icm_eta=icm_eta,
             icm_obs_clip=icm_obs_clip,
+            icm_train_batch_size=icm_train_batch_size,
             eme_actor_dist_fn=eme_actor_dist_fn,
             eme_metric_hidden_dim=eme_metric_hidden_dim,
             eme_metric_num_hidden=eme_metric_num_hidden,
