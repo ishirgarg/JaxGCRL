@@ -340,12 +340,12 @@ class GoExploreSimple:
     # encoder + inverse model + forward model and adds the forward-model
     # prediction error in feature space to ONLINE rewards only — offline
     # (RLPD) rows are not augmented. Defaults match the paper.
-    icm_feature_dim: int = 288
-    icm_encoder_hidden_dim: int = 256
+    icm_feature_dim: int = 64
+    icm_encoder_hidden_dim: int = 128
     icm_encoder_num_hidden: int = 2
-    icm_inverse_hidden_dim: int = 256
+    icm_inverse_hidden_dim: int = 128
     icm_inverse_num_hidden: int = 1
-    icm_forward_hidden_dim: int = 256
+    icm_forward_hidden_dim: int = 128
     icm_forward_num_hidden: int = 1
     icm_learning_rate: float = 1e-3
     icm_beta: float = 0.2
