@@ -250,8 +250,8 @@ class GoExploreSimple:
     # Algorithm type for the goal-conditioned policy
     agent_type: Literal["sac", "crl"] = "crl"
 
-    policy_lr: float = 3e-4
-    critic_lr: float = 3e-4
+    policy_lr: float = 1e-4
+    critic_lr: float = 1e-4
     alpha_lr: float = 3e-4
     batch_size: int = 256
 
