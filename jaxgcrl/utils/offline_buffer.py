@@ -22,6 +22,7 @@ from jaxgcrl.agents.go_explore.types import Transition
 JAXGCRL_TO_OGBENCH = {
     "ant_maze_ogbench_medium_navigate": "antmaze-medium-navigate-v0",
     "ant_maze_ogbench_medium_explore": "antmaze-medium-explore-v0",
+    "ant_maze_ogbench_medium_1g": "antmaze-medium-explore-v0",
     "ant_maze_ogbench_arena": "antmaze-arena-v0",
     "humanoidmaze_ogbench_giant_stitch": "humanoidmaze-giant-stitch-v0",
     "ant_ball_ogbench_arena": "antsoccer-arena-navigate-v0",
@@ -34,6 +35,10 @@ JAXGCRL_TO_OGBENCH = {
     "ant_ball_4d_ogbench_arena": "antsoccer-arena-navigate-v0",
     "ant_ball_4d_ogbench_small_easy_square": "antsoccer-arena-navigate-v0",
     "ant_ball_4d_ogbench_small_easy_square_stitch": "antsoccer-arena-stitch-v0",
+    "ant_ball_ogbench_small_easy_square_1g": "antsoccer-arena-stitch-v0",
+    "ant_ball_ogbench_small_square_1g": "antsoccer-arena-stitch-v0",
+    "ant_ball_4d_ogbench_small_easy_square_1g": "antsoccer-arena-stitch-v0",
+    "ant_ball_4d_ogbench_small_square_1g": "antsoccer-arena-stitch-v0",
     "ant_ball_ogbench_arena_stitch": "antsoccer-arena-stitch-v0",
     "ant_ball_4d_medium_stitch": "antsoccer-medium-stitch-v0",
     "cube_single": "cube-single-play-v0",

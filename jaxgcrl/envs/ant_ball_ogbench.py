@@ -124,6 +124,27 @@ MEDIUM_STITCH = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
+SMALL_EASY_SQUARE_1G= [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, 0, 0, 0, 0, 0, 1],
+    [1, 0, B, 0, 0, 0, 0, 1],
+    [1, 0, 0, G, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+SMALL_SQUARE_1G= [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, B, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, G, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
 
 def _cell_xy(i, j, maze_size_scaling, xy_offset):
     # OGBench convention: columns map to x, rows map to y. See
@@ -174,6 +195,10 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
         maze_layout = EASY_SQUARE
     elif maze_layout_name == "small_easy_square":
         maze_layout = SMALL_EASY_SQUARE
+    elif maze_layout_name == "small_easy_square_1g":
+        maze_layout = SMALL_EASY_SQUARE_1G
+    elif maze_layout_name == "small_square_1g":
+        maze_layout = SMALL_SQUARE_1G
     else:
         raise ValueError(f"Unknown OGBench ball maze layout: {maze_layout_name}")
 

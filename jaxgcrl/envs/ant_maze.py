@@ -144,6 +144,17 @@ HARDEST_MAZE = [
     [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
+OGBENCH_MEDIUM_1G = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, 0, 1, 1, 0, 0, 1],
+    [1, 0, 0, 1, 0, 0, 0, 1],
+    [1, 1, 0, 0, 0, 1, 1, 1],
+    [1, 0, 0, 1, 0, 0, 0, 1],
+    [1, 0, 1, 0, G, 1, 0, 1],
+    [1, 0, 0, 0, 1, 0, 0, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
 
 MAZE_HEIGHT = 0.5
 
@@ -188,6 +199,7 @@ def find_goals(structure, size_scaling, use_ogbench_convention=False):
 OGBENCH_MAZE_LAYOUTS = {
     "maze_ogbench_arena",
     "maze_ogbench_medium_navigate",
+    "maze_ogbench_medium_1g",
 }
 
 
@@ -207,6 +219,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
         maze_layout = OGBENCH_ARENA
     elif maze_layout_name == "maze_ogbench_medium_navigate":
         maze_layout = OGBENCH_MEDIUM_NAVIGATE
+    elif maze_layout_name == "maze_ogbench_medium_1g":
+        maze_layout = OGBENCH_MEDIUM_1G
     elif maze_layout_name == "big_maze":
         maze_layout = BIG_MAZE
     elif maze_layout_name == "big_maze_hard":
@@ -300,6 +314,8 @@ class AntMaze(PipelineEnv):
             maze_layout = OGBENCH_ARENA
         elif maze_layout_name == "maze_ogbench_medium_navigate":
             maze_layout = OGBENCH_MEDIUM_NAVIGATE
+        elif maze_layout_name == "maze_ogbench_medium_1g":
+            maze_layout = OGBENCH_MEDIUM_1G
         elif maze_layout_name == "big_maze":
             maze_layout = BIG_MAZE
         elif maze_layout_name == "big_maze_hard":
