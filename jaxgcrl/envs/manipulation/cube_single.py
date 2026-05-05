@@ -25,7 +25,6 @@ from brax import base
 from brax.envs.base import PipelineEnv, State
 from brax.io.mjcf import load_model
 from mujoco import mjx
-from mujoco.mjx._src import support as _mjx_support
 
 
 # ---------------------------------------------------------------------------
@@ -97,67 +96,6 @@ _SUCCESS_THRESHOLD = 0.04
 _IK_MAX_ITERS = 5
 _IK_DAMPING = 1e-6
 _IK_MAX_ANGLE_CHANGE = np.radians(45.0)
-
-
-# ---------------------------------------------------------------------------
-# `mjx.rne_postconstraint` raises NotImplementedError on connect/weld equality
-# constraints, which the Robotiq gripper relies on for its 4-bar linkage. We
-# only need the contact-force contribution to `cfrc_ext` (for the gripper
-# contact obs term), so this helper reimplements just that slice.
-# ---------------------------------------------------------------------------
-
-
-def _cfrc_ext_from_contacts(m, d):
-    def _transform_force(frc, offset):
-        force, torque = jnp.split(frc, 2)
-        torque = torque - jnp.cross(offset, force)
-        return jnp.concatenate([torque, force])
-
-    cfrc_ext = jnp.vstack([
-        jnp.zeros((1, 6)),
-        jax.vmap(_transform_force)(
-            d.xfrc_applied[1:],
-            d.subtree_com[jnp.array(m.body_rootid)][1:] - d.xipos[1:],
-        ),
-    ])
-
-    forces = []
-    condim_idx = []
-    for dim in set(d.contact.dim):
-        force, idx = _mjx_support.contact_force_dim(m, d, dim)
-        forces.append(force)
-        condim_idx.append(idx)
-
-    if forces:
-        @jax.vmap
-        def _contact_force_to_cfrc_ext(force, pos, frame, id1, id2, com1, com2):
-            force = force.reshape((-1, 3)) @ frame
-            force = force.reshape(-1)
-            cfrc_com1 = _transform_force(force, com1 - pos)
-            cfrc_com2 = _transform_force(force, com2 - pos)
-            mask1 = id1 != 0
-            mask2 = id2 != 0
-            return (
-                jnp.vstack([-1 * cfrc_com1 * mask1, cfrc_com2 * mask2]),
-                jnp.array([id1, id2]),
-            )
-
-        condim_idx = jnp.concatenate(condim_idx)
-        frame = d.contact.frame[condim_idx]
-        pos = d.contact.pos[condim_idx]
-        id1 = jnp.array(m.geom_bodyid)[d.contact.geom[condim_idx, 0]]
-        id2 = jnp.array(m.geom_bodyid)[d.contact.geom[condim_idx, 1]]
-        com1 = d.subtree_com[jnp.array(m.body_rootid)][id1]
-        com2 = d.subtree_com[jnp.array(m.body_rootid)][id2]
-
-        cfrc_contact, cfrc_idx = _contact_force_to_cfrc_ext(
-            jnp.concatenate(forces), pos, frame, id1, id2, com1, com2
-        )
-        cfrc_ext = cfrc_ext.at[cfrc_idx.reshape(-1)].add(
-            cfrc_contact.reshape((-1, 6))
-        )
-
-    return d.replace(cfrc_ext=cfrc_ext)
 
 
 # ---------------------------------------------------------------------------
@@ -418,14 +356,16 @@ class _JaxDiffIK:
 class CubeSingle(PipelineEnv):
     """OGBench cube-single ported for online goal-conditioned RL.
 
-    Observation (28-D, identical to OGBench `compute_observation`):
+    Observation (28-D, layout identical to OGBench `compute_observation`):
         [0:6]    arm joint positions
         [6:12]   arm joint velocities
         [12:15]  (pinch_pos - center) * 10
         [15]     cos(pinch_yaw)
         [16]     sin(pinch_yaw)
         [17]     gripper_opening * 3
-        [18]     gripper contact force (clipped to [0, 1])
+        [18]     gripper contact force — stubbed to 0.0 in this port (mjx can't
+                 run mj_rnePostConstraint through the Robotiq <connect>
+                 equalities; the dim is kept for shape parity with OGBench)
         [19:22]  (cube_pos - center) * 10
         [22:26]  cube quaternion (wxyz)
         [26]     cos(cube_yaw)
@@ -544,7 +484,6 @@ class CubeSingle(PipelineEnv):
         self._cube_qvel_start = 14  # object_joint_0 dofadr
 
         self._pinch_site_id = pinch_site_id
-        self._right_pad_body_id = int(mj.body('ur5e/robotiq/right_pad').id)
         self._cube_target_mocap_id = int(mj.body('object_target_0').mocapid[0])
 
         # IK solver (lazy compilation).
@@ -674,13 +613,6 @@ class CubeSingle(PipelineEnv):
         ctrl = self._compute_control(pipeline_state0, action)
         pipeline_state = self.pipeline_step(pipeline_state0, ctrl)
 
-        # OGBench calls `mj_rnePostConstraint` after each step so contact
-        # forces show up in `cfrc_ext` (used by the gripper_contact obs term).
-        # Brax's pipeline_step does not. We can't use `mjx.rne_postconstraint`
-        # because the Robotiq 4-bar linkage uses connect equality constraints
-        # which mjx doesn't support; we just need the contact contribution.
-        pipeline_state = _cfrc_ext_from_contacts(self.sys, pipeline_state)
-
         timestep = state.info['timestep'] + 1.0 / self.episode_length
         obs = self._get_obs(pipeline_state, state.info['goal'])
         success, success_easy, success_hard, dist = self._compute_goal_completion(
@@ -770,10 +702,6 @@ class CubeSingle(PipelineEnv):
         gripper_opening = jnp.clip(
             pipeline_state.qpos[self._gripper_opening_qpos_idx] / 0.8, 0.0, 1.0
         )
-        # Gripper contact is OGBench's clipped contact-force norm on the right pad.
-        # mjx exposes per-body contact-force info via `cfrc_ext`.
-        cfrc = pipeline_state.cfrc_ext[self._right_pad_body_id]
-        gripper_contact = jnp.clip(jnp.linalg.norm(cfrc) / 50.0, 0.0, 1.0)
 
         cube_pos = pipeline_state.qpos[self._cube_qpos_start:self._cube_qpos_start + 3]
         cube_pos_scaled = (cube_pos - self._xyz_center) * _XYZ_SCALER
@@ -790,7 +718,7 @@ class CubeSingle(PipelineEnv):
                 jnp.array([jnp.cos(eff_yaw)]),   # 15
                 jnp.array([jnp.sin(eff_yaw)]),   # 16
                 jnp.array([gripper_opening * _GRIPPER_SCALER]),  # 17
-                jnp.array([gripper_contact]),    # 18
+                jnp.zeros(1),                    # 18 (gripper_contact — stubbed)
                 cube_pos_scaled,                 # 19:22
                 cube_quat,                       # 22:26
                 jnp.array([jnp.cos(cube_yaw)]),  # 26
