@@ -335,6 +335,37 @@ class GoExploreSimple:
     misc_learning_rate: float = 1e-3
     misc_alpha: float = 5000.0
 
+    # ── ICM (Pathak et al., 2017) ──────────────────────────────────────────
+    # Enabled by listing "icm" in `exploration_bonus_type`. Trains a feature
+    # encoder + inverse model + forward model and adds the forward-model
+    # prediction error in feature space to ONLINE rewards only — offline
+    # (RLPD) rows are not augmented. Defaults match the paper.
+    icm_feature_dim: int = 288
+    icm_encoder_hidden_dim: int = 256
+    icm_encoder_num_hidden: int = 2
+    icm_inverse_hidden_dim: int = 256
+    icm_inverse_num_hidden: int = 1
+    icm_forward_hidden_dim: int = 256
+    icm_forward_num_hidden: int = 1
+    icm_learning_rate: float = 1e-3
+    icm_beta: float = 0.2
+    icm_eta: float = 1.0
+
+    # ── EME (Wang et al., 2024) ────────────────────────────────────────────
+    # Enabled by listing "eme" in `exploration_bonus_type`. Trains an EME
+    # metric d_E^phi(s_i, s_j) and a K-member reward ensemble; per-transition
+    # bonus is d_E(s_t, s_{t+1}) * clip(max(zeta(s_t, a_t), 1), 1, M). Added
+    # to ONLINE rewards only. Defaults match the paper (M=10, K=6, gamma=0.99).
+    eme_metric_hidden_dim: int = 256
+    eme_metric_num_hidden: int = 2
+    eme_reward_hidden_dim: int = 256
+    eme_reward_num_hidden: int = 2
+    eme_metric_learning_rate: float = 1e-3
+    eme_reward_learning_rate: float = 1e-3
+    eme_ensemble_size: int = 6
+    eme_max_reward_scaling: float = 10.0
+    eme_bootstrap_keep_prob: float = 0.8
+
     # ── EXPLORE (UCB labeling of offline data) ─────────────────────────────
     # Enabled by listing "ucb" alongside "rnd" in `exploration_bonus_type`.
     # When present, trains a reward predictor r_θ(s,a) and termination
@@ -682,6 +713,7 @@ class GoExploreSimple:
             env=unwrapped_env,
             state_size=state_size,
             key=bonus_init_key,
+            discount=self.discounting,
             empowerment_run_dir=self.empowerment_run_dir,
             empowerment_epoch=self.empowerment_epoch,
             empowerment_num_splus_samples=self.empowerment_num_splus_samples,
@@ -710,6 +742,28 @@ class GoExploreSimple:
             misc_num_hidden=self.misc_num_hidden,
             misc_learning_rate=self.misc_learning_rate,
             misc_alpha=self.misc_alpha,
+            icm_feature_dim=self.icm_feature_dim,
+            icm_encoder_hidden_dim=self.icm_encoder_hidden_dim,
+            icm_encoder_num_hidden=self.icm_encoder_num_hidden,
+            icm_inverse_hidden_dim=self.icm_inverse_hidden_dim,
+            icm_inverse_num_hidden=self.icm_inverse_num_hidden,
+            icm_forward_hidden_dim=self.icm_forward_hidden_dim,
+            icm_forward_num_hidden=self.icm_forward_num_hidden,
+            icm_learning_rate=self.icm_learning_rate,
+            icm_beta=self.icm_beta,
+            icm_eta=self.icm_eta,
+            # EME's metric loss needs the actor's pre-tanh (mean, log_std)
+            # at arbitrary states for the closed-form Gaussian KL term.
+            eme_actor_dist_fn=(lambda params, obs: gcp_actor.apply(params, obs)),
+            eme_metric_hidden_dim=self.eme_metric_hidden_dim,
+            eme_metric_num_hidden=self.eme_metric_num_hidden,
+            eme_reward_hidden_dim=self.eme_reward_hidden_dim,
+            eme_reward_num_hidden=self.eme_reward_num_hidden,
+            eme_metric_learning_rate=self.eme_metric_learning_rate,
+            eme_reward_learning_rate=self.eme_reward_learning_rate,
+            eme_ensemble_size=self.eme_ensemble_size,
+            eme_max_reward_scaling=self.eme_max_reward_scaling,
+            eme_bootstrap_keep_prob=self.eme_bootstrap_keep_prob,
             online_empowerment_action_size=action_size,
             online_empowerment_lr=self.online_empowerment_lr,
             online_empowerment_value_hidden_dims=self.online_empowerment_value_hidden_dims,

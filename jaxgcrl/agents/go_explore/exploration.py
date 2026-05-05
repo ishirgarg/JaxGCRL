@@ -73,6 +73,44 @@ class MISCBonusState:
 
 
 @fdataclass
+class EMEBonusState:
+    """Mutable state for the EME (Effective Metric-based Exploration) intrinsic reward.
+
+    Carries the trainable EME metric ``d_E^phi(s_i, s_j)`` (with its Adam
+    state) and an ensemble of ``K`` reward predictors ``g(s, a; eta_k)`` whose
+    output variance acts as the diversity-enhanced scaling factor (Eq. 8 of
+    the paper). Per-transition reward is read-only over both, mirroring the
+    other trainable bonuses; the joint update is driven by ``train_fn``.
+
+    The ensemble is stored as a single pytree with a leading ``K`` axis; we
+    train it with ``jax.vmap`` so all members share one optimizer call but
+    their parameters are kept distinct (paper §4.2: each model is initialized
+    differently and trained on a bootstrap-sampled subset to maintain
+    diversity in their predictions on unvisited states).
+    """
+    metric_params: Any
+    metric_opt_state: Any
+    ensemble_params: Any
+    ensemble_opt_state: Any
+    key: jax.Array
+
+
+@fdataclass
+class ICMBonusState:
+    """Mutable state for the ICM (Intrinsic Curiosity Module) intrinsic reward.
+
+    Holds the joint trainable parameters of the feature encoder ``phi``, the
+    inverse model ``g(phi(s_t), phi(s_{t+1})) -> a_t``, and the forward model
+    ``f(phi(s_t), a_t) -> phi_hat(s_{t+1})``, together with their shared Adam
+    optimizer state. The per-transition reward is the read-only forward-model
+    prediction error in the *current* feature space; all three networks are
+    trained jointly via gradient descent on ``(1-beta) * L_I + beta * L_F``.
+    """
+    predictor_params: Any
+    opt_state: Any
+
+
+@fdataclass
 class RNDBonusState:
     """Mutable state for Random Network Distillation.
 
@@ -123,6 +161,10 @@ def create_exploration_bonus(
     env,
     state_size: int,
     key: jax.Array,
+    # Shared knob used by ICM and EME (the agent's RL discount). The action
+    # dimension is sourced directly from ``env.action_size`` inside each
+    # branch — it's a property of the env, not a config parameter.
+    discount: float = 0.99,
     # empowerment-specific
     empowerment_run_dir: Optional[str] = None,
     empowerment_epoch: Optional[int] = None,
@@ -152,6 +194,34 @@ def create_exploration_bonus(
     misc_num_hidden: int = 3,
     misc_learning_rate: float = 1e-3,
     misc_alpha: float = 5000.0,
+    # ICM-specific (Pathak et al., 2017). Defaults follow the paper:
+    # learning rate 1e-3, beta=0.2, feature dim 288, hidden 256. The action
+    # dimension is sourced from the top-level ``action_size`` argument.
+    icm_feature_dim: int = 288,
+    icm_encoder_hidden_dim: int = 256,
+    icm_encoder_num_hidden: int = 2,
+    icm_inverse_hidden_dim: int = 256,
+    icm_inverse_num_hidden: int = 1,
+    icm_forward_hidden_dim: int = 256,
+    icm_forward_num_hidden: int = 1,
+    icm_learning_rate: float = 1e-3,
+    icm_beta: float = 0.2,
+    icm_eta: float = 1.0,
+    # EME-specific (Wang et al., 2024). Defaults follow the paper:
+    # ensemble size 6, max reward scaling M=10. The discount is sourced
+    # from the top-level ``discount`` argument (= the agent's discount).
+    eme_actor_dist_fn: Optional[
+        Callable[[Any, jnp.ndarray], Tuple[jnp.ndarray, jnp.ndarray]]
+    ] = None,
+    eme_metric_hidden_dim: int = 256,
+    eme_metric_num_hidden: int = 2,
+    eme_reward_hidden_dim: int = 256,
+    eme_reward_num_hidden: int = 2,
+    eme_metric_learning_rate: float = 1e-3,
+    eme_reward_learning_rate: float = 1e-3,
+    eme_ensemble_size: int = 6,
+    eme_max_reward_scaling: float = 10.0,
+    eme_bootstrap_keep_prob: float = 0.8,
     # Online-empowerment-specific
     online_empowerment_action_size: Optional[int] = None,
     online_empowerment_lr: float = 3e-4,
@@ -255,6 +325,47 @@ def create_exploration_bonus(
             num_hidden=misc_num_hidden,
             learning_rate=misc_learning_rate,
             alpha=misc_alpha,
+        )
+        return bonus_fn, st, init_fn, None, train_fn, None, None, None
+    if bonus_type == "icm":
+        bonus_fn, st, init_fn, train_fn = _create_icm_bonus(
+            state_size=state_size,
+            action_size=int(env.action_size),
+            key=key,
+            feature_dim=icm_feature_dim,
+            encoder_hidden_dim=icm_encoder_hidden_dim,
+            encoder_num_hidden=icm_encoder_num_hidden,
+            inverse_hidden_dim=icm_inverse_hidden_dim,
+            inverse_num_hidden=icm_inverse_num_hidden,
+            forward_hidden_dim=icm_forward_hidden_dim,
+            forward_num_hidden=icm_forward_num_hidden,
+            learning_rate=icm_learning_rate,
+            beta=icm_beta,
+            eta=icm_eta,
+        )
+        return bonus_fn, st, init_fn, None, train_fn, None, None, None
+    if bonus_type == "eme":
+        if eme_actor_dist_fn is None:
+            raise ValueError(
+                "'eme' bonus requires eme_actor_dist_fn (callable "
+                "(actor_params, obs) -> (mean, log_std) for the agent's actor) — "
+                "needed for the KL term in the EME metric loss (Eq. 9)."
+            )
+        bonus_fn, st, init_fn, train_fn = _create_eme_bonus(
+            state_size=state_size,
+            action_size=int(env.action_size),
+            actor_dist_fn=eme_actor_dist_fn,
+            key=key,
+            metric_hidden_dim=eme_metric_hidden_dim,
+            metric_num_hidden=eme_metric_num_hidden,
+            reward_hidden_dim=eme_reward_hidden_dim,
+            reward_num_hidden=eme_reward_num_hidden,
+            metric_learning_rate=eme_metric_learning_rate,
+            reward_learning_rate=eme_reward_learning_rate,
+            ensemble_size=eme_ensemble_size,
+            max_reward_scaling=eme_max_reward_scaling,
+            gamma=discount,
+            bootstrap_keep_prob=eme_bootstrap_keep_prob,
         )
         return bonus_fn, st, init_fn, None, train_fn, None, None, None
     if bonus_type == "online_empowerment":
@@ -804,6 +915,489 @@ def _create_misc_bonus(
     return misc_bonus, initial_state, None, misc_train
 
 
+def _create_icm_bonus(
+    *,
+    state_size: int,
+    action_size: int,
+    key: jax.Array,
+    feature_dim: int = 288,
+    encoder_hidden_dim: int = 256,
+    encoder_num_hidden: int = 2,
+    inverse_hidden_dim: int = 256,
+    inverse_num_hidden: int = 1,
+    forward_hidden_dim: int = 256,
+    forward_num_hidden: int = 1,
+    learning_rate: float = 1e-3,
+    beta: float = 0.2,
+    eta: float = 1.0,
+) -> Tuple[BonusFn, ICMBonusState, InitFromStatesFn, TrainFn]:
+    """ICM: Intrinsic Curiosity Module (Pathak et al., 2017).
+
+    Three jointly trained networks share one Adam optimizer:
+      * ``phi(s)``: feature encoder, ``state_size -> feature_dim``.
+      * ``g(phi(s_t), phi(s_{t+1}))``: inverse dynamics, predicts ``a_t``.
+      * ``f(phi(s_t), a_t)``: forward dynamics, predicts ``phi(s_{t+1})``.
+
+    The intrinsic reward is the forward-model error in the *current* feature
+    space, ``(eta/2) * ||phi_hat(s_{t+1}) - phi(s_{t+1})||^2`` (Eq. 6); the
+    estimator is updated by descending ``(1-beta) * L_I + beta * L_F`` on the
+    same online minibatch (Eq. 7 with the policy term excluded — that lives in
+    the agent's RL loss). For continuous actions we use MSE for ``L_I``; the
+    paper uses cross-entropy for discrete action spaces.
+    """
+    from .networks import Encoder
+
+    encoder = Encoder(
+        repr_dim=feature_dim,
+        network_width=encoder_hidden_dim,
+        network_depth=encoder_num_hidden,
+        skip_connections=0,
+        use_relu=True,
+        use_ln=False,
+    )
+    inverse_net = Encoder(
+        repr_dim=action_size,
+        network_width=inverse_hidden_dim,
+        network_depth=inverse_num_hidden,
+        skip_connections=0,
+        use_relu=True,
+        use_ln=False,
+    )
+    forward_net = Encoder(
+        repr_dim=feature_dim,
+        network_width=forward_hidden_dim,
+        network_depth=forward_num_hidden,
+        skip_connections=0,
+        use_relu=True,
+        use_ln=False,
+    )
+
+    enc_key, inv_key, fwd_key = jax.random.split(key, 3)
+    dummy_state = jnp.zeros((1, state_size), dtype=jnp.float32)
+    dummy_phi_pair = jnp.zeros((1, 2 * feature_dim), dtype=jnp.float32)
+    dummy_phi_act = jnp.zeros((1, feature_dim + action_size), dtype=jnp.float32)
+    encoder_params = encoder.init(enc_key, dummy_state)
+    inverse_params = inverse_net.init(inv_key, dummy_phi_pair)
+    forward_params = forward_net.init(fwd_key, dummy_phi_act)
+
+    predictor_params0 = {
+        "encoder": encoder_params,
+        "inverse": inverse_params,
+        "forward": forward_params,
+    }
+    optimizer = optax.adam(learning_rate)
+    opt_state0 = optimizer.init(predictor_params0)
+
+    initial_state = ICMBonusState(
+        predictor_params=predictor_params0,
+        opt_state=opt_state0,
+    )
+
+    beta_f = jnp.asarray(beta, dtype=jnp.float32)
+    eta_f = jnp.asarray(eta, dtype=jnp.float32)
+
+    def _encode(params, states):
+        return encoder.apply(params["encoder"], states)
+
+    def _predict_action(params, phi_t, phi_tp1):
+        x = jnp.concatenate([phi_t, phi_tp1], axis=-1)
+        return inverse_net.apply(params["inverse"], x)
+
+    def _predict_phi_next(params, phi_t, actions):
+        x = jnp.concatenate([phi_t, actions], axis=-1)
+        return forward_net.apply(params["forward"], x)
+
+    def icm_bonus(state: ICMBonusState, transitions, bonus_key):
+        """Per-transition ICM intrinsic reward (Eq. 6).
+
+        Read-only over all three networks; the joint estimator is updated only
+        by ``icm_train`` on online transitions.
+        """
+        del bonus_key
+        states = transitions.observation[..., :state_size]
+        next_states = transitions.next_observation[..., :state_size]
+        actions = transitions.action
+
+        params = jax.lax.stop_gradient(state.predictor_params)
+        phi_t = _encode(params, states)
+        phi_tp1 = _encode(params, next_states)
+        phi_hat_tp1 = _predict_phi_next(params, phi_t, actions)
+        sq_err = jnp.sum((phi_hat_tp1 - phi_tp1) ** 2, axis=-1)
+        bonus = 0.5 * eta_f * sq_err
+
+        metrics = {
+            "icm_forward_sq_err_mean": jnp.mean(sq_err),
+            "icm_bonus_mean": jnp.mean(bonus),
+        }
+        return bonus, state, metrics
+
+    def _icm_loss(params, states, next_states, actions):
+        """Joint inverse + forward loss, ``(1-beta) * L_I + beta * L_F``.
+
+        ``L_F`` uses ``stop_gradient(phi(s_{t+1}))`` as the target so the
+        encoder is shaped only by the inverse-model objective (the standard
+        ICM training trick: otherwise the encoder can collapse phi to a
+        constant to drive the forward loss to zero).
+        """
+        phi_t = _encode(params, states)
+        phi_tp1 = _encode(params, next_states)
+        phi_hat_tp1 = _predict_phi_next(params, phi_t, actions)
+        a_hat = _predict_action(params, phi_t, phi_tp1)
+
+        l_inverse = jnp.mean(jnp.sum((a_hat - actions) ** 2, axis=-1))
+        l_forward = 0.5 * jnp.mean(
+            jnp.sum((phi_hat_tp1 - jax.lax.stop_gradient(phi_tp1)) ** 2, axis=-1)
+        )
+        loss = (1.0 - beta_f) * l_inverse + beta_f * l_forward
+        return loss, (l_inverse, l_forward)
+
+    def icm_train(state: ICMBonusState, online_transitions, num_grad_steps: int = 1):
+        """Joint Adam update for encoder + inverse + forward on online data."""
+        states = online_transitions.observation[..., :state_size]
+        next_states = online_transitions.next_observation[..., :state_size]
+        actions = online_transitions.action
+        states = states.reshape(-1, state_size)
+        next_states = next_states.reshape(-1, state_size)
+        actions = actions.reshape(-1, action_size)
+
+        def step(carry, _):
+            params, opt_state = carry
+            (loss_value, (l_inv, l_fwd)), grads = jax.value_and_grad(
+                _icm_loss, has_aux=True
+            )(params, states, next_states, actions)
+            updates, new_opt_state = optimizer.update(grads, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+            return (new_params, new_opt_state), (loss_value, l_inv, l_fwd)
+
+        (new_params, new_opt_state), (losses, l_inv, l_fwd) = jax.lax.scan(
+            step,
+            (state.predictor_params, state.opt_state),
+            (),
+            length=num_grad_steps,
+        )
+        new_state = state.replace(
+            predictor_params=new_params,
+            opt_state=new_opt_state,
+        )
+        return new_state, {
+            "icm_loss": jnp.mean(losses),
+            "icm_inverse_loss": jnp.mean(l_inv),
+            "icm_forward_loss": jnp.mean(l_fwd),
+        }
+
+    return icm_bonus, initial_state, None, icm_train
+
+
+def _create_eme_bonus(
+    *,
+    state_size: int,
+    action_size: int,
+    actor_dist_fn: Callable[[Any, jnp.ndarray], Tuple[jnp.ndarray, jnp.ndarray]],
+    key: jax.Array,
+    metric_hidden_dim: int = 256,
+    metric_num_hidden: int = 2,
+    reward_hidden_dim: int = 256,
+    reward_num_hidden: int = 2,
+    metric_learning_rate: float = 1e-3,
+    reward_learning_rate: float = 1e-3,
+    ensemble_size: int = 6,
+    max_reward_scaling: float = 10.0,
+    gamma: float = 0.99,
+    bootstrap_keep_prob: float = 0.8,
+) -> Tuple[BonusFn, EMEBonusState, InitFromStatesFn, TrainFn]:
+    """EME: Effective Metric-based Exploration bonus (Wang et al., 2024).
+
+    Two trainable subsystems:
+      * EME metric ``d_E^phi(s_i, s_j) -> R``: a small MLP over the
+        concatenated state pair. Trained on Eq. 9 of the paper, the tractable
+        regression target for the unique fixed-point of the EME distance
+        function (Theorem 1). The target uses a sample-based reward gap with
+        ensemble-variance correction (Eq. 7), a bootstrapped next-pair metric
+        with ``stop_gradient``, and a closed-form Gaussian KL between the
+        actor's pre-tanh action distributions at the two states.
+      * Reward ensemble ``{g(eta_1), ..., g(eta_K)}``: K MLPs each predicting
+        ``r_{t+1}`` from ``(s_t, a_t)``. Trained jointly via ``jax.vmap`` with
+        member-specific Bernoulli bootstrap masks (sample-with-replacement
+        approximation), so each member's predictions diverge most on
+        rarely-visited (s, a) — high cross-member variance there is what the
+        scaling factor ``zeta`` keys on (paper §4.2).
+
+    Per-transition reward (Eq. 10):
+      ``b = d_E(s_t, s_{t+1}) * clip(max(zeta(s_t, a_t), 1), 1, M)``
+
+    where ``zeta(s_t, a_t) = mean_d Var_eta[g(s_t, a_t; eta)_d]`` (squared L2
+    radius of the ensemble's outputs around their mean). Both ``d_E`` and the
+    ensemble are read-only inside ``bonus_fn``; learning happens in
+    ``train_fn`` and consumes the agent's actor params for the KL term.
+    """
+    from .networks import Encoder
+
+    metric_net = Encoder(
+        repr_dim=1,
+        network_width=metric_hidden_dim,
+        network_depth=metric_num_hidden,
+        skip_connections=0,
+        use_relu=True,
+        use_ln=False,
+    )
+    reward_net = Encoder(
+        repr_dim=1,
+        network_width=reward_hidden_dim,
+        network_depth=reward_num_hidden,
+        skip_connections=0,
+        use_relu=True,
+        use_ln=False,
+    )
+
+    metric_key, ensemble_key, train_key0 = jax.random.split(key, 3)
+    dummy_pair = jnp.zeros((1, 2 * state_size), dtype=jnp.float32)
+    dummy_sa = jnp.zeros((1, state_size + action_size), dtype=jnp.float32)
+    metric_params0 = metric_net.init(metric_key, dummy_pair)
+
+    ensemble_keys = jax.random.split(ensemble_key, ensemble_size)
+    ensemble_params0 = jax.vmap(lambda k: reward_net.init(k, dummy_sa))(ensemble_keys)
+
+    metric_optimizer = optax.adam(metric_learning_rate)
+    metric_opt_state0 = metric_optimizer.init(metric_params0)
+    # One Adam over the whole stacked ensemble pytree. Each leaf has a leading
+    # K axis, but optax treats this as ordinary pytree shape and applies
+    # per-element scaling — no per-member optimizer state needed (and
+    # vmapping ``init`` is wrong here because Adam's bias-correction count
+    # would become per-member, then broadcast incorrectly across the K axis).
+    reward_optimizer = optax.adam(reward_learning_rate)
+    reward_opt_state0 = reward_optimizer.init(ensemble_params0)
+
+    initial_state = EMEBonusState(
+        metric_params=metric_params0,
+        metric_opt_state=metric_opt_state0,
+        ensemble_params=ensemble_params0,
+        ensemble_opt_state=reward_opt_state0,
+        key=train_key0,
+    )
+
+    M = jnp.asarray(max_reward_scaling, dtype=jnp.float32)
+    gamma_f = jnp.asarray(gamma, dtype=jnp.float32)
+    keep_p = jnp.asarray(bootstrap_keep_prob, dtype=jnp.float32)
+
+    def _metric(metric_params, s_i, s_j):
+        x = jnp.concatenate([s_i, s_j], axis=-1)
+        return metric_net.apply(metric_params, x)[..., 0]
+
+    def _reward_one(reward_params_one, s, a):
+        x = jnp.concatenate([s, a], axis=-1)
+        return reward_net.apply(reward_params_one, x)[..., 0]
+
+    def _ensemble_predictions(ensemble_params, s, a):
+        """Stacked predictions across ensemble members; shape (K, ...)."""
+        return jax.vmap(_reward_one, in_axes=(0, None, None))(
+            ensemble_params, s, a
+        )
+
+    def _ensemble_variance(ensemble_params, s, a):
+        """Cross-member variance ``Var_eta[g(s, a; eta)]``, scalar per (s, a)."""
+        preds = _ensemble_predictions(ensemble_params, s, a)
+        return jnp.var(preds, axis=0)
+
+    def eme_bonus(state: EMEBonusState, transitions, bonus_key, actor_params=None):
+        """Per-transition EME bonus (Eq. 10). ``actor_params`` is unused here."""
+        del bonus_key, actor_params
+        states = transitions.observation[..., :state_size]
+        next_states = transitions.next_observation[..., :state_size]
+        actions = transitions.action
+
+        params_metric = jax.lax.stop_gradient(state.metric_params)
+        params_ensemble = jax.lax.stop_gradient(state.ensemble_params)
+
+        d = _metric(params_metric, states, next_states)
+        zeta = _ensemble_variance(params_ensemble, states, actions)
+        scale = jnp.clip(jnp.maximum(zeta, 1.0), 1.0, M)
+        bonus = d * scale
+
+        metrics = {
+            "eme_metric_mean": jnp.mean(d),
+            "eme_zeta_mean": jnp.mean(zeta),
+            "eme_scale_mean": jnp.mean(scale),
+            "eme_bonus_mean": jnp.mean(bonus),
+        }
+        return bonus, state, metrics
+
+    def _gaussian_kl(mean_p, log_std_p, mean_q, log_std_q):
+        """Closed-form KL between two diagonal Gaussians, summed over action dims.
+
+        Operates on the actor's pre-tanh distribution: SAC's actor returns
+        ``(mean, log_std)`` of a diagonal Gaussian *before* the tanh squash.
+        The tanh adds a constant log-determinant term that cancels exactly
+        between ``pi(.|s_i)`` and ``pi(.|s_j)`` under KL, so the closed-form
+        Gaussian KL on the pre-tanh parameters is exact.
+        """
+        var_p = jnp.exp(2.0 * log_std_p)
+        var_q = jnp.exp(2.0 * log_std_q)
+        return jnp.sum(
+            log_std_q - log_std_p
+            + (var_p + (mean_p - mean_q) ** 2) / (2.0 * var_q + 1e-8)
+            - 0.5,
+            axis=-1,
+        )
+
+    def _metric_loss(
+        metric_params,
+        ensemble_params_sg,
+        actor_params,
+        s_i, a_i, r_i, sp_i,
+        s_j, a_j, r_j, sp_j,
+    ):
+        """Eq. 9 regression loss, evaluated on a permuted-pair batch.
+
+        Reward gap correction: ``sqrt(max(|r_i - r_j|^2 - var_i - var_j, 0))``.
+        Bootstrap target: ``stop_gradient(d_E(sp_i, sp_j))``.
+        Policy term: closed-form pre-tanh Gaussian KL between ``pi(.|s_i)`` and
+        ``pi(.|s_j)``.
+        """
+        d_pred = _metric(metric_params, s_i, s_j)
+
+        var_i = _ensemble_variance(ensemble_params_sg, s_i, a_i)
+        var_j = _ensemble_variance(ensemble_params_sg, s_j, a_j)
+        reward_gap_sq = (r_i - r_j) ** 2 - var_i - var_j
+        reward_term = jnp.sqrt(jnp.maximum(reward_gap_sq, 0.0))
+
+        d_next = jax.lax.stop_gradient(_metric(metric_params, sp_i, sp_j))
+
+        mean_i, log_std_i = actor_dist_fn(actor_params, s_i)
+        mean_j, log_std_j = actor_dist_fn(actor_params, s_j)
+        kl_term = _gaussian_kl(mean_i, log_std_i, mean_j, log_std_j)
+
+        target = jax.lax.stop_gradient(
+            reward_term + gamma_f * d_next + gamma_f * kl_term
+        )
+        loss = jnp.mean((d_pred - target) ** 2)
+        return loss, {
+            "eme_target_mean": jnp.mean(target),
+            "eme_pred_mean": jnp.mean(d_pred),
+            "eme_reward_term_mean": jnp.mean(reward_term),
+            "eme_bootstrap_mean": jnp.mean(d_next),
+            "eme_kl_term_mean": jnp.mean(kl_term),
+        }
+
+    def _ensemble_loss(ensemble_params, states, actions, rewards, masks):
+        """Per-member MSE on ``r_{t+1}``, weighted by member-specific masks.
+
+        ``masks`` has shape ``(K, N)``; element ``(k, i) ∈ {0, 1}`` decides
+        whether transition ``i`` is in member ``k``'s bootstrap subset. We
+        sum over weighted squared errors and divide by the per-member kept
+        count, recovering an unbiased per-member MSE on its own subset.
+        """
+        def _per_member(params_k, mask_k):
+            preds = _reward_one(params_k, states, actions)
+            sq = (preds - rewards) ** 2
+            kept = jnp.maximum(jnp.sum(mask_k), 1.0)
+            return jnp.sum(sq * mask_k) / kept
+
+        per_member = jax.vmap(_per_member)(ensemble_params, masks)
+        return jnp.mean(per_member), per_member
+
+    def eme_train(
+        state: EMEBonusState,
+        online_transitions,
+        num_grad_steps: int = 1,
+        actor_params: Any = None,
+    ):
+        """Joint update for ``d_E^phi`` (Eq. 9) and the reward ensemble (MSE).
+
+        Per inner step:
+          1. Resample a permutation of the batch to form pairs ``(s_i, s_j)``,
+             plus per-member Bernoulli bootstrap masks (independent of the
+             permutation, drawn fresh each step from ``state.key``).
+          2. Update the reward ensemble first so the metric loss in this same
+             step sees the updated (still ``stop_gradient``'d) ensemble.
+          3. Update ``d_E^phi`` against the Eq. 9 target.
+        """
+        if actor_params is None:
+            raise ValueError("eme_train requires actor_params for the KL term.")
+
+        states = online_transitions.observation[..., :state_size].reshape(-1, state_size)
+        next_states = online_transitions.next_observation[..., :state_size].reshape(-1, state_size)
+        actions = online_transitions.action.reshape(-1, action_size)
+        rewards = online_transitions.reward.reshape(-1)
+        N = states.shape[0]
+
+        def step(carry, _):
+            metric_p, metric_opt, ensemble_p, ensemble_opt, k = carry
+            k, perm_key, mask_key = jax.random.split(k, 3)
+
+            # 1. Bootstrap masks (independent across ensemble members).
+            mask_keys = jax.random.split(mask_key, ensemble_size)
+            masks = jax.vmap(
+                lambda kk: (jax.random.uniform(kk, (N,)) < keep_p).astype(jnp.float32)
+            )(mask_keys)
+
+            # 2. Reward-ensemble Adam step.
+            (e_loss, per_member), e_grads = jax.value_and_grad(
+                _ensemble_loss, has_aux=True
+            )(ensemble_p, states, actions, rewards, masks)
+            e_updates, new_ensemble_opt = reward_optimizer.update(
+                e_grads, ensemble_opt, ensemble_p
+            )
+            new_ensemble_p = optax.apply_updates(ensemble_p, e_updates)
+
+            # 3. Metric step on a fresh permutation. ``stop_gradient`` on the
+            # ensemble and on the bootstrap d_E target keeps the metric loss
+            # from leaking gradients into the ensemble or the next-pair
+            # prediction.
+            perm = jax.random.permutation(perm_key, N)
+            s_i = states
+            a_i = actions
+            r_i = rewards
+            sp_i = next_states
+            s_j = states[perm]
+            a_j = actions[perm]
+            r_j = rewards[perm]
+            sp_j = next_states[perm]
+            ensemble_sg = jax.lax.stop_gradient(new_ensemble_p)
+
+            (m_loss, m_aux), m_grads = jax.value_and_grad(_metric_loss, has_aux=True)(
+                metric_p,
+                ensemble_sg,
+                actor_params,
+                s_i, a_i, r_i, sp_i,
+                s_j, a_j, r_j, sp_j,
+            )
+            m_updates, new_metric_opt = metric_optimizer.update(
+                m_grads, metric_opt, metric_p
+            )
+            new_metric_p = optax.apply_updates(metric_p, m_updates)
+
+            return (new_metric_p, new_metric_opt, new_ensemble_p, new_ensemble_opt, k), {
+                "eme_metric_loss": m_loss,
+                "eme_ensemble_loss": e_loss,
+                "eme_ensemble_member_loss_mean": jnp.mean(per_member),
+                "eme_ensemble_member_loss_std": jnp.std(per_member),
+                **m_aux,
+            }
+
+        (new_metric_p, new_metric_opt, new_ensemble_p, new_ensemble_opt, new_key), step_metrics = jax.lax.scan(
+            step,
+            (
+                state.metric_params,
+                state.metric_opt_state,
+                state.ensemble_params,
+                state.ensemble_opt_state,
+                state.key,
+            ),
+            (),
+            length=num_grad_steps,
+        )
+        new_state = state.replace(
+            metric_params=new_metric_p,
+            metric_opt_state=new_metric_opt,
+            ensemble_params=new_ensemble_p,
+            ensemble_opt_state=new_ensemble_opt,
+            key=new_key,
+        )
+        return new_state, jax.tree_util.tree_map(jnp.mean, step_metrics)
+
+    return eme_bonus, initial_state, None, eme_train
+
+
 def _create_ucb_bonus(
     *,
     state_size: int,
@@ -977,13 +1571,14 @@ class ExplorationBonuses:
     # online data, so its empowerment estimate on offline-only states is
     # untrustworthy and out-of-distribution — same argument as MISC.
     _ONLINE_ONLY_BONUS_TYPES = frozenset(
-        {"rnd", "misc", "online_empowerment", "online_mine_empowerment"}
+        {"rnd", "misc", "online_empowerment", "online_mine_empowerment", "icm", "eme"}
     )
 
     # Bonus types whose bonus_fn / train_fn require the agent's main actor
-    # params at runtime (for marginal-action sampling). The dispatcher
-    # forwards ``actor_params`` to these and to no others.
-    _ACTOR_PARAM_BONUS_TYPES = frozenset({"online_mine_empowerment"})
+    # params at runtime (for marginal-action sampling, or for the policy KL
+    # term in EME's metric loss). The dispatcher forwards ``actor_params``
+    # to these and to no others.
+    _ACTOR_PARAM_BONUS_TYPES = frozenset({"online_mine_empowerment", "eme"})
 
     def compute(
         self,
@@ -1218,6 +1813,10 @@ def create_exploration_bonuses(
     env,
     state_size: int,
     key: jax.Array,
+    # Shared knob used by ICM and EME (the agent's RL discount). The action
+    # dimension is sourced directly from ``env.action_size`` inside each
+    # branch — it's a property of the env, not a config parameter.
+    discount: float = 0.99,
     # empowerment-specific
     empowerment_run_dir: Optional[str] = None,
     empowerment_epoch: Optional[int] = None,
@@ -1247,6 +1846,34 @@ def create_exploration_bonuses(
     misc_num_hidden: int = 3,
     misc_learning_rate: float = 1e-3,
     misc_alpha: float = 5000.0,
+    # ICM-specific (Pathak et al., 2017). Defaults follow the paper:
+    # learning rate 1e-3, beta=0.2, feature dim 288, hidden 256. The action
+    # dimension is sourced from the top-level ``action_size`` argument.
+    icm_feature_dim: int = 288,
+    icm_encoder_hidden_dim: int = 256,
+    icm_encoder_num_hidden: int = 2,
+    icm_inverse_hidden_dim: int = 256,
+    icm_inverse_num_hidden: int = 1,
+    icm_forward_hidden_dim: int = 256,
+    icm_forward_num_hidden: int = 1,
+    icm_learning_rate: float = 1e-3,
+    icm_beta: float = 0.2,
+    icm_eta: float = 1.0,
+    # EME-specific (Wang et al., 2024). Defaults follow the paper:
+    # ensemble size 6, max reward scaling M=10. The discount is sourced
+    # from the top-level ``discount`` argument (= the agent's discount).
+    eme_actor_dist_fn: Optional[
+        Callable[[Any, jnp.ndarray], Tuple[jnp.ndarray, jnp.ndarray]]
+    ] = None,
+    eme_metric_hidden_dim: int = 256,
+    eme_metric_num_hidden: int = 2,
+    eme_reward_hidden_dim: int = 256,
+    eme_reward_num_hidden: int = 2,
+    eme_metric_learning_rate: float = 1e-3,
+    eme_reward_learning_rate: float = 1e-3,
+    eme_ensemble_size: int = 6,
+    eme_max_reward_scaling: float = 10.0,
+    eme_bootstrap_keep_prob: float = 0.8,
     # Online-empowerment-specific
     online_empowerment_action_size: Optional[int] = None,
     online_empowerment_lr: float = 3e-4,
@@ -1312,6 +1939,7 @@ def create_exploration_bonuses(
             env=env,
             state_size=state_size,
             key=sub_key,
+            discount=discount,
             empowerment_run_dir=empowerment_run_dir,
             empowerment_epoch=empowerment_epoch,
             empowerment_num_splus_samples=empowerment_num_splus_samples,
@@ -1337,6 +1965,26 @@ def create_exploration_bonuses(
             misc_num_hidden=misc_num_hidden,
             misc_learning_rate=misc_learning_rate,
             misc_alpha=misc_alpha,
+            icm_feature_dim=icm_feature_dim,
+            icm_encoder_hidden_dim=icm_encoder_hidden_dim,
+            icm_encoder_num_hidden=icm_encoder_num_hidden,
+            icm_inverse_hidden_dim=icm_inverse_hidden_dim,
+            icm_inverse_num_hidden=icm_inverse_num_hidden,
+            icm_forward_hidden_dim=icm_forward_hidden_dim,
+            icm_forward_num_hidden=icm_forward_num_hidden,
+            icm_learning_rate=icm_learning_rate,
+            icm_beta=icm_beta,
+            icm_eta=icm_eta,
+            eme_actor_dist_fn=eme_actor_dist_fn,
+            eme_metric_hidden_dim=eme_metric_hidden_dim,
+            eme_metric_num_hidden=eme_metric_num_hidden,
+            eme_reward_hidden_dim=eme_reward_hidden_dim,
+            eme_reward_num_hidden=eme_reward_num_hidden,
+            eme_metric_learning_rate=eme_metric_learning_rate,
+            eme_reward_learning_rate=eme_reward_learning_rate,
+            eme_ensemble_size=eme_ensemble_size,
+            eme_max_reward_scaling=eme_max_reward_scaling,
+            eme_bootstrap_keep_prob=eme_bootstrap_keep_prob,
             online_empowerment_action_size=online_empowerment_action_size,
             online_empowerment_lr=online_empowerment_lr,
             online_empowerment_value_hidden_dims=online_empowerment_value_hidden_dims,
