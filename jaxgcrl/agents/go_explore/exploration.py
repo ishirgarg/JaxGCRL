@@ -1335,15 +1335,17 @@ def _create_eme_bonus(
         metric_params,
         ensemble_params_sg,
         actor_params,
-        s_i, a_i, r_i, sp_i,
-        s_j, a_j, r_j, sp_j,
+        s_i, a_i, r_i, sp_i, obs_i,
+        s_j, a_j, r_j, sp_j, obs_j,
     ):
         """Eq. 9 regression loss, evaluated on a permuted-pair batch.
 
         Reward gap correction: ``sqrt(max(|r_i - r_j|^2 - var_i - var_j, 0))``.
         Bootstrap target: ``stop_gradient(d_E(sp_i, sp_j))``.
         Policy term: closed-form pre-tanh Gaussian KL between ``pi(.|s_i)`` and
-        ``pi(.|s_j)``.
+        ``pi(.|s_j)``. The actor here is goal-conditioned, so we feed it the
+        full ``(state, goal)`` observation; the metric and ensemble still see
+        only the state.
         """
         d_pred = _metric(metric_params, s_i, s_j)
 
@@ -1354,8 +1356,8 @@ def _create_eme_bonus(
 
         d_next = jax.lax.stop_gradient(_metric(metric_params, sp_i, sp_j))
 
-        mean_i, log_std_i = actor_dist_fn(actor_params, s_i)
-        mean_j, log_std_j = actor_dist_fn(actor_params, s_j)
+        mean_i, log_std_i = actor_dist_fn(actor_params, obs_i)
+        mean_j, log_std_j = actor_dist_fn(actor_params, obs_j)
         kl_term = _gaussian_kl(mean_i, log_std_i, mean_j, log_std_j)
 
         target = jax.lax.stop_gradient(
@@ -1406,7 +1408,8 @@ def _create_eme_bonus(
         if actor_params is None:
             raise ValueError("eme_train requires actor_params for the KL term.")
 
-        states = online_transitions.observation[..., :state_size].reshape(-1, state_size)
+        obs = online_transitions.observation.reshape(-1, online_transitions.observation.shape[-1])
+        states = obs[..., :state_size]
         next_states = online_transitions.next_observation[..., :state_size].reshape(-1, state_size)
         actions = online_transitions.action.reshape(-1, action_size)
         rewards = online_transitions.reward.reshape(-1)
@@ -1440,18 +1443,20 @@ def _create_eme_bonus(
             a_i = actions
             r_i = rewards
             sp_i = next_states
+            obs_i = obs
             s_j = states[perm]
             a_j = actions[perm]
             r_j = rewards[perm]
             sp_j = next_states[perm]
+            obs_j = obs[perm]
             ensemble_sg = jax.lax.stop_gradient(new_ensemble_p)
 
             (m_loss, m_aux), m_grads = jax.value_and_grad(_metric_loss, has_aux=True)(
                 metric_p,
                 ensemble_sg,
                 actor_params,
-                s_i, a_i, r_i, sp_i,
-                s_j, a_j, r_j, sp_j,
+                s_i, a_i, r_i, sp_i, obs_i,
+                s_j, a_j, r_j, sp_j, obs_j,
             )
             m_updates, new_metric_opt = metric_optimizer.update(
                 m_grads, metric_opt, metric_p
