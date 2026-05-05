@@ -206,7 +206,7 @@ def _dummy_transition(
     action = jnp.zeros(prefix + (action_size,))
     reward = jnp.zeros(prefix) if prefix else jnp.asarray(0.0)
     discount = jnp.zeros(prefix) if prefix else jnp.asarray(0.0)
-    next_obs = obs if agent_type == "sac" else None
+    next_obs = obs
     state_extras = {
         "traj_id": jnp.zeros(prefix, dtype=jnp.float32) if prefix else jnp.asarray(0.0),
         "truncation": jnp.zeros(prefix, dtype=jnp.float32) if prefix else jnp.asarray(0.0),
