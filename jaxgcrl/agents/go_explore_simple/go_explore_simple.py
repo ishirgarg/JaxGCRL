@@ -265,8 +265,8 @@ class GoExploreSimple:
     min_replay_size: int = 1000
     unroll_length: int = 50
     h_dim: int = 256
-    n_hidden: int = 4
-    skip_connections: int = 4
+    n_hidden: int = 3
+    skip_connections: int = 3
     use_relu: bool = False
 
     repr_dim: int = 64
