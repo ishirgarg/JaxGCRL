@@ -350,6 +350,7 @@ class GoExploreSimple:
     icm_learning_rate: float = 1e-3
     icm_beta: float = 0.2
     icm_eta: float = 1.0
+    icm_obs_clip: float = 5.0
 
     # ── EME (Wang et al., 2024) ────────────────────────────────────────────
     # Enabled by listing "eme" in `exploration_bonus_type`. Trains an EME
@@ -752,6 +753,7 @@ class GoExploreSimple:
             icm_learning_rate=self.icm_learning_rate,
             icm_beta=self.icm_beta,
             icm_eta=self.icm_eta,
+            icm_obs_clip=self.icm_obs_clip,
             # EME's metric loss needs the actor's pre-tanh (mean, log_std)
             # at arbitrary states for the closed-form Gaussian KL term.
             eme_actor_dist_fn=(lambda params, obs: gcp_actor.apply(params, obs)),

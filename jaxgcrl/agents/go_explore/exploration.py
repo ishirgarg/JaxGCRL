@@ -105,9 +105,20 @@ class ICMBonusState:
     optimizer state. The per-transition reward is the read-only forward-model
     prediction error in the *current* feature space; all three networks are
     trained jointly via gradient descent on ``(1-beta) * L_I + beta * L_F``.
+
+    Mirrors RND's running statistics: ``obs_mean``/``obs_std`` are seeded once
+    post-prefill via ``init_from_states`` (so the encoder always sees
+    clipped, zero-mean / unit-std inputs), and a Welford running stat over
+    the raw intrinsic reward gives a per-call standard deviation that the
+    emitted bonus is divided by — so ICM behaves on the same scale as RND.
     """
     predictor_params: Any
     opt_state: Any
+    obs_mean: jnp.ndarray  # (state_size,)
+    obs_std: jnp.ndarray   # (state_size,)
+    reward_mean: jnp.ndarray   # scalar
+    reward_m2: jnp.ndarray     # scalar (Welford sum of squared deviations)
+    reward_count: jnp.ndarray  # scalar
 
 
 @fdataclass
@@ -207,6 +218,7 @@ def create_exploration_bonus(
     icm_learning_rate: float = 1e-3,
     icm_beta: float = 0.2,
     icm_eta: float = 1.0,
+    icm_obs_clip: float = 5.0,
     # EME-specific (Wang et al., 2024). Defaults follow the paper:
     # ensemble size 6, max reward scaling M=10. The discount is sourced
     # from the top-level ``discount`` argument (= the agent's discount).
@@ -342,6 +354,7 @@ def create_exploration_bonus(
             learning_rate=icm_learning_rate,
             beta=icm_beta,
             eta=icm_eta,
+            obs_clip=icm_obs_clip,
         )
         return bonus_fn, st, init_fn, None, train_fn, None, None, None
     if bonus_type == "eme":
@@ -930,6 +943,7 @@ def _create_icm_bonus(
     learning_rate: float = 1e-3,
     beta: float = 0.2,
     eta: float = 1.0,
+    obs_clip: float = 5.0,
 ) -> Tuple[BonusFn, ICMBonusState, InitFromStatesFn, TrainFn]:
     """ICM: Intrinsic Curiosity Module (Pathak et al., 2017).
 
@@ -944,6 +958,14 @@ def _create_icm_bonus(
     same online minibatch (Eq. 7 with the policy term excluded — that lives in
     the agent's RL loss). For continuous actions we use MSE for ``L_I``; the
     paper uses cross-entropy for discrete action spaces.
+
+    Normalization mirrors RND exactly:
+      * Inputs to ``phi`` are ``clip((s - obs_mean) / obs_std, -obs_clip,
+        obs_clip)`` with ``obs_mean``/``obs_std`` seeded once via
+        ``init_from_states`` (post-prefill, from random-policy rollouts).
+      * The emitted bonus is divided by a Welford-running stdev of the raw
+        intrinsic reward updated on every ``bonus_fn`` call. The training
+        path uses the same normalization (read-only on the running stats).
     """
     from .networks import Encoder
 
@@ -988,16 +1010,41 @@ def _create_icm_bonus(
     optimizer = optax.adam(learning_rate)
     opt_state0 = optimizer.init(predictor_params0)
 
+    # Pre-init (mean=0, std=1) is used until init_from_states runs post-prefill.
     initial_state = ICMBonusState(
         predictor_params=predictor_params0,
         opt_state=opt_state0,
+        obs_mean=jnp.zeros((state_size,), dtype=jnp.float32),
+        obs_std=jnp.ones((state_size,), dtype=jnp.float32),
+        reward_mean=jnp.asarray(0.0, dtype=jnp.float32),
+        reward_m2=jnp.asarray(0.0, dtype=jnp.float32),
+        reward_count=jnp.asarray(0.0, dtype=jnp.float32),
     )
 
     beta_f = jnp.asarray(beta, dtype=jnp.float32)
     eta_f = jnp.asarray(eta, dtype=jnp.float32)
+    clip_val = float(obs_clip)
 
-    def _encode(params, states):
-        return encoder.apply(params["encoder"], states)
+    def _normalize(flat_states, mean, std):
+        return jnp.clip(
+            (flat_states - mean) / jnp.maximum(std, 1e-8),
+            -clip_val,
+            clip_val,
+        )
+
+    def _welford_update(mean, m2, count, batch_flat):
+        """Parallel Welford update for running mean/M2 over a flat batch."""
+        n = jnp.asarray(batch_flat.shape[0], dtype=jnp.float32)
+        batch_mean = jnp.mean(batch_flat)
+        batch_m2 = jnp.sum((batch_flat - batch_mean) ** 2)
+        new_count = count + n
+        delta = batch_mean - mean
+        new_mean = mean + delta * n / new_count
+        new_m2 = m2 + batch_m2 + (delta ** 2) * count * n / new_count
+        return new_mean, new_m2, new_count
+
+    def _encode(params, normalized_states):
+        return encoder.apply(params["encoder"], normalized_states)
 
     def _predict_action(params, phi_t, phi_tp1):
         x = jnp.concatenate([phi_t, phi_tp1], axis=-1)
@@ -1008,30 +1055,58 @@ def _create_icm_bonus(
         return forward_net.apply(params["forward"], x)
 
     def icm_bonus(state: ICMBonusState, transitions, bonus_key):
-        """Per-transition ICM intrinsic reward (Eq. 6).
+        """Per-transition ICM intrinsic reward (Eq. 6), with RND-style scaling.
 
-        Read-only over all three networks; the joint estimator is updated only
-        by ``icm_train`` on online transitions.
+        Read-only over predictor params, but DOES update the running
+        reward-stats normalizer on the full batch — same pattern as RND, so
+        the bonus-scale normalization stays consistent with what we actually
+        emit (online + offline, even though offline rows are masked at the
+        agent level for ``_ONLINE_ONLY_BONUS_TYPES``).
         """
         del bonus_key
         states = transitions.observation[..., :state_size]
         next_states = transitions.next_observation[..., :state_size]
         actions = transitions.action
+        shape = states.shape[:-1]
+
+        flat_s = states.reshape(-1, state_size)
+        flat_sp = next_states.reshape(-1, state_size)
+        norm_s = _normalize(flat_s, state.obs_mean, state.obs_std)
+        norm_sp = _normalize(flat_sp, state.obs_mean, state.obs_std)
+        flat_a = actions.reshape(-1, action_size)
 
         params = jax.lax.stop_gradient(state.predictor_params)
-        phi_t = _encode(params, states)
-        phi_tp1 = _encode(params, next_states)
-        phi_hat_tp1 = _predict_phi_next(params, phi_t, actions)
+        phi_t = _encode(params, norm_s)
+        phi_tp1 = _encode(params, norm_sp)
+        phi_hat_tp1 = _predict_phi_next(params, phi_t, flat_a)
         sq_err = jnp.sum((phi_hat_tp1 - phi_tp1) ** 2, axis=-1)
-        bonus = 0.5 * eta_f * sq_err
+        raw_bonus_flat = 0.5 * eta_f * sq_err
 
+        # Welford reward-stats update *before* using std so the first batch
+        # produces a sensible scale (std=1 fallback via reward_count<=1).
+        new_reward_mean, new_reward_m2, new_reward_count = _welford_update(
+            state.reward_mean, state.reward_m2, state.reward_count, raw_bonus_flat
+        )
+        reward_std = jnp.sqrt(
+            jnp.where(new_reward_count > 1.0, new_reward_m2 / new_reward_count, 1.0)
+        )
+        bonus_flat = raw_bonus_flat / jnp.maximum(reward_std, 1e-8)
+        bonus = bonus_flat.reshape(shape)
+
+        new_state = state.replace(
+            reward_mean=new_reward_mean,
+            reward_m2=new_reward_m2,
+            reward_count=new_reward_count,
+        )
         metrics = {
             "icm_forward_sq_err_mean": jnp.mean(sq_err),
+            "icm_raw_bonus_mean": jnp.mean(raw_bonus_flat),
             "icm_bonus_mean": jnp.mean(bonus),
+            "icm_reward_std": reward_std,
         }
-        return bonus, state, metrics
+        return bonus, new_state, metrics
 
-    def _icm_loss(params, states, next_states, actions):
+    def _icm_loss(params, norm_states, norm_next_states, actions):
         """Joint inverse + forward loss, ``(1-beta) * L_I + beta * L_F``.
 
         ``L_F`` uses ``stop_gradient(phi(s_{t+1}))`` as the target so the
@@ -1039,8 +1114,8 @@ def _create_icm_bonus(
         ICM training trick: otherwise the encoder can collapse phi to a
         constant to drive the forward loss to zero).
         """
-        phi_t = _encode(params, states)
-        phi_tp1 = _encode(params, next_states)
+        phi_t = _encode(params, norm_states)
+        phi_tp1 = _encode(params, norm_next_states)
         phi_hat_tp1 = _predict_phi_next(params, phi_t, actions)
         a_hat = _predict_action(params, phi_t, phi_tp1)
 
@@ -1052,19 +1127,23 @@ def _create_icm_bonus(
         return loss, (l_inverse, l_forward)
 
     def icm_train(state: ICMBonusState, online_transitions, num_grad_steps: int = 1):
-        """Joint Adam update for encoder + inverse + forward on online data."""
-        states = online_transitions.observation[..., :state_size]
-        next_states = online_transitions.next_observation[..., :state_size]
-        actions = online_transitions.action
-        states = states.reshape(-1, state_size)
-        next_states = next_states.reshape(-1, state_size)
-        actions = actions.reshape(-1, action_size)
+        """Joint Adam update for encoder + inverse + forward on online data.
+
+        Uses the same observation normalization as ``icm_bonus`` (read-only
+        on running stats — only ``init_from_states`` and ``icm_bonus``
+        update them, exactly mirroring RND).
+        """
+        states = online_transitions.observation[..., :state_size].reshape(-1, state_size)
+        next_states = online_transitions.next_observation[..., :state_size].reshape(-1, state_size)
+        actions = online_transitions.action.reshape(-1, action_size)
+        norm_states = _normalize(states, state.obs_mean, state.obs_std)
+        norm_next_states = _normalize(next_states, state.obs_mean, state.obs_std)
 
         def step(carry, _):
             params, opt_state = carry
             (loss_value, (l_inv, l_fwd)), grads = jax.value_and_grad(
                 _icm_loss, has_aux=True
-            )(params, states, next_states, actions)
+            )(params, norm_states, norm_next_states, actions)
             updates, new_opt_state = optimizer.update(grads, opt_state, params)
             new_params = optax.apply_updates(params, updates)
             return (new_params, new_opt_state), (loss_value, l_inv, l_fwd)
@@ -1085,7 +1164,20 @@ def _create_icm_bonus(
             "icm_forward_loss": jnp.mean(l_fwd),
         }
 
-    return icm_bonus, initial_state, None, icm_train
+    def init_from_states(state: ICMBonusState, states: jnp.ndarray) -> ICMBonusState:
+        """Seed ``obs_mean``/``obs_std`` from a batch of observed states.
+
+        Per the RND paper (and mirrored here for ICM), normalization
+        parameters are initialized by stepping a random agent in the
+        environment for a small number of steps. The agent calls this with
+        the prefill (uniform-random buffer warmup) rollouts.
+        """
+        flat = states.reshape(-1, state_size)
+        new_mean = jnp.mean(flat, axis=0)
+        new_std = jnp.std(flat, axis=0)
+        return state.replace(obs_mean=new_mean, obs_std=new_std)
+
+    return icm_bonus, initial_state, init_from_states, icm_train
 
 
 def _create_eme_bonus(
@@ -1859,6 +1951,7 @@ def create_exploration_bonuses(
     icm_learning_rate: float = 1e-3,
     icm_beta: float = 0.2,
     icm_eta: float = 1.0,
+    icm_obs_clip: float = 5.0,
     # EME-specific (Wang et al., 2024). Defaults follow the paper:
     # ensemble size 6, max reward scaling M=10. The discount is sourced
     # from the top-level ``discount`` argument (= the agent's discount).
@@ -1975,6 +2068,7 @@ def create_exploration_bonuses(
             icm_learning_rate=icm_learning_rate,
             icm_beta=icm_beta,
             icm_eta=icm_eta,
+            icm_obs_clip=icm_obs_clip,
             eme_actor_dist_fn=eme_actor_dist_fn,
             eme_metric_hidden_dim=eme_metric_hidden_dim,
             eme_metric_num_hidden=eme_metric_num_hidden,
