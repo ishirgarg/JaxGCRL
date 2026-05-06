@@ -1,0 +1,79 @@
+<mujoco model="pointmaze_ogbench_teleport">
+    <!-- OGBench-aligned PointMass for the pointmaze-teleport datasets.
+
+         Mirrors ogbench/locomaze/assets/point.xml (2D point with two slide
+         joints, 0.7-radius ball, target slide-pair at the end of qpos for
+         GCRL goal markers). Integrator is Euler (not RK4) and contact
+         params match ant_maze_ogbench.xml — trades exact OGBench dynamics
+         parity for Brax/MJX speed.
+
+         qpos layout: ball_xy(2) + target_xy(2) = 4
+         qvel layout: ball_xy(2) + target_xy(2) = 4
+
+         The agent dynamics in step() do not use these motor actuators — the
+         OGBench step rule (qpos[:2] += 0.2*action; qvel = 0) is applied
+         directly in PointMazeOGBenchTeleport.step. Motors are kept so that
+         sys.act_size() == 2 matches the action dimension expected by the
+         RLPD pipeline. -->
+    <compiler inertiafromgeom="true" angle="degree" coordinate="local"/>
+
+    <option timestep="0.02" iterations="4"/>
+
+    <custom>
+        <!-- brax custom params -->
+        <numeric data="1000" name="constraint_limit_stiffness"/>
+        <numeric data="4000" name="constraint_stiffness"/>
+        <numeric data="10" name="constraint_ang_damping"/>
+        <numeric data="20" name="constraint_vel_damping"/>
+        <numeric data="0.5" name="joint_scale_pos"/>
+        <numeric data="0.2" name="joint_scale_ang"/>
+        <numeric data="0.0" name="ang_damping"/>
+        <numeric data="1" name="spring_mass_scale"/>
+        <numeric data="1" name="spring_inertia_scale"/>
+        <numeric data="15" name="solver_maxls"/>
+    </custom>
+
+    <default>
+        <joint limited="false" armature="0" damping="0"/>
+        <geom condim="3" conaffinity="0" margin="0" friction="1 0.5 0.5" density="100" material="self"/>
+    </default>
+
+    <asset>
+        <texture type="skybox" builtin="gradient" width="100" height="100" rgb1="1 1 1" rgb2="0 0 0"/>
+        <texture name="grid" type="2d" builtin="checker" rgb1=".08 .11 .16" rgb2=".15 .18 .25" width="300" height="300"/>
+        <texture name="texgeom" type="cube" builtin="flat" mark="cross" width="127" height="1278" rgb1="0.8 0.6 0.4" rgb2="0.8 0.6 0.4" markrgb="1 1 1" random="0.01"/>
+        <texture name="teleport_in" type="2d" builtin="gradient" rgb1=".1 .1 .1" rgb2="0.35 0.55 0.91" width="300" height="300"/>
+        <texture name="teleport_out" type="2d" builtin="gradient" rgb1=".9 .9 .9" rgb2="0.35 0.55 0.91" width="300" height="300"/>
+        <material name="grid" texture="grid" texrepeat="1 1" texuniform="true"/>
+        <material name="self" rgba=".7 .5 .3 1"/>
+        <material name="geom" texture="texgeom" texuniform="true"/>
+        <material name="wall" rgba="1 1 1 1"/>
+        <material name="target" rgba="0.96 0.26 0.33 1"/>
+        <material name="teleport_in" texture="teleport_in"/>
+        <material name="teleport_out" texture="teleport_out"/>
+    </asset>
+
+    <worldbody>
+        <light name="global" directional="true" cutoff="100" exponent="1" ambient=".2 .2 .2" diffuse="1 1 1" specular=".1 .1 .1" pos="0 0 1.3" dir="-0 0 -1.3"/>
+        <geom name="floor" pos="0 0 0" size="100 100 .2" type="plane" conaffinity="1" condim="3" material="grid"/>
+        <body name="torso" pos="0 0 0">
+            <geom name="pointbody" type="sphere" size="0.7" pos="0 0 0.7" contype="1" conaffinity="1"/>
+            <joint name="ballx" type="slide" axis="1 0 0" pos="0 0 0"/>
+            <joint name="bally" type="slide" axis="0 1 0" pos="0 0 0"/>
+            <light name="torso_light" pos="0 0 8" mode="trackcom"/>
+        </body>
+
+        <!-- Non-physical target marker for GCRL goal specification.
+             Two slide joints at the end of q/qd, stripped by _get_obs via q[:-2]. -->
+        <body name="target" pos="0 0 0.01">
+            <joint armature="0" axis="1 0 0" damping="0" limited="true" name="target_x" pos="0 0 0" range="-100 100" stiffness="0" type="slide"/>
+            <joint armature="0" axis="0 1 0" damping="0" limited="true" name="target_y" pos="0 0 0" range="-100 100" stiffness="0" type="slide"/>
+            <geom conaffinity="0" contype="0" name="target" pos="0 0 0" size=".5" type="sphere" mass="1.0" material="target"/>
+        </body>
+    </worldbody>
+
+    <actuator>
+        <motor joint="ballx" ctrlrange="-1 1" ctrllimited="true"/>
+        <motor joint="bally" ctrlrange="-1 1" ctrllimited="true"/>
+    </actuator>
+</mujoco>

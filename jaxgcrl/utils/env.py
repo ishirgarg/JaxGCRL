@@ -31,6 +31,7 @@ from jaxgcrl.envs.manipulation.arm_push_easy import ArmPushEasy
 from jaxgcrl.envs.manipulation.arm_push_hard import ArmPushHard
 from jaxgcrl.envs.manipulation.arm_reach import ArmReach
 from jaxgcrl.envs.manipulation.cube_single import CubeSingle
+from jaxgcrl.envs.pointmaze_ogbench_teleport import PointMazeOGBenchTeleport
 from jaxgcrl.envs.pusher import Pusher, PusherReacher
 from jaxgcrl.envs.pusher2 import Pusher2
 from jaxgcrl.envs.reacher import Reacher
@@ -79,6 +80,7 @@ legal_envs = (
     "ant_maze_ogbench_medium_navigate",
     "ant_maze_ogbench_medium_explore",
     "ant_maze_ogbench_medium_1g",
+    "pointmaze_ogbench_teleport",
     "ant_u_maze",
     "ant_u_maze_hard",
     "ant_big_maze",
@@ -188,6 +190,11 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
                 env = AntMaze(backend=backend or "spring", maze_layout_name=layout)
             else:
                 env = AntMaze(backend=backend or "spring", maze_layout_name=layout)
+        elif env_name == "pointmaze_ogbench_teleport":
+            # OGBench-aligned 2D point teleport maze. Defaults to mjx so the
+            # contact resolution after the qpos override matches OGBench's
+            # mj_step semantics that produced pointmaze-teleport-navigate-v0.
+            env = PointMazeOGBenchTeleport(backend=backend or "mjx")
         else:
             # Possible env_name = {'simple_u_maze', 'simple_big_maze', 'simple_hardest_maze'}
             env = SimpleMaze(backend=backend or "spring", maze_layout_name=env_name[7:])
