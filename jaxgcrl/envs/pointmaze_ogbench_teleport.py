@@ -264,6 +264,7 @@ class PointMazeOGBenchTeleport(PipelineEnv):
         metrics = {
             "x_position": zero,
             "y_position": zero,
+            "distance_from_origin": zero,
             "dist": zero,
             "success": zero,
             "success_easy": zero,
@@ -308,6 +309,7 @@ class PointMazeOGBenchTeleport(PipelineEnv):
         state.metrics.update(
             x_position=pipeline_state.q[0],
             y_position=pipeline_state.q[1],
+            distance_from_origin=jnp.linalg.norm(pipeline_state.q[:2]),
             dist=dist,
             success=success,
             success_easy=success_easy,
