@@ -261,9 +261,9 @@ class GoExploreSimple:
     train_step_multiplier: int = 1
     disable_entropy_actor: bool = False
 
-    max_replay_size: int = 500000
+    max_replay_size: int = 60000
     min_replay_size: int = 1000
-    unroll_length: int = 50
+    unroll_length: int = 100
     h_dim: int = 256
     n_hidden: int = 3
     skip_connections: int = 3
