@@ -845,7 +845,7 @@ class CRL:
             # process transitions for training
             batch_keys = jax.random.split(sampling_key, pre_her_transitions.observation.shape[0])
             transitions = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
-                (self.discounting, state_size, tuple(train_env.goal_indices)),
+                (self.discounting, state_size, goal_indices_tuple),
                 pre_her_transitions,
                 batch_keys,
             )
