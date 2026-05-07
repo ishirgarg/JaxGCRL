@@ -32,7 +32,7 @@ class EvalWrapper(Wrapper):
                 f'Incorrect type for state_metrics: {type(state_metrics)}'
             )
         del state.info['eval_metrics']
-        nstate = self.env.step(state, action, rng)
+        nstate = self.env.step(state, action)
         nstate.metrics['reward'] = nstate.reward
         episode_steps = jp.where(
             state_metrics.active_episodes,
