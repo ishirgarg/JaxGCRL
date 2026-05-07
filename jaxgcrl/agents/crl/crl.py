@@ -113,16 +113,22 @@ def flatten_batch(buffer_config, transition, sample_key):
     new_obs = jnp.concatenate([state, goal], axis=1)
     next_obs = jnp.concatenate([next_state, goal], axis=1)
 
+    state_extras_in = transition.extras["state_extras"]
+    state_extras_out = {
+        "truncation": jnp.squeeze(state_extras_in["truncation"][:-1]),
+        "traj_id": jnp.squeeze(state_extras_in["traj_id"][:-1]),
+        # is_online is the per-row mask routing online-only bonuses to
+        # online rows after the RLPD online/offline concat. Always present —
+        # set to ones for non-RLPD runs in training_step.
+        "is_online": jnp.squeeze(state_extras_in["is_online"][:-1]),
+    }
+    if "max_empowerment" in state_extras_in:
+        state_extras_out["max_empowerment"] = jnp.squeeze(
+            state_extras_in["max_empowerment"][:-1]
+        )
     extras = {
         "policy_extras": {},
-        "state_extras": {
-            "truncation": jnp.squeeze(transition.extras["state_extras"]["truncation"][:-1]),
-            "traj_id": jnp.squeeze(transition.extras["state_extras"]["traj_id"][:-1]),
-            # is_online is the per-row mask routing online-only bonuses to
-            # online rows after the RLPD online/offline concat. Always present —
-            # set to ones for non-RLPD runs in training_step.
-            "is_online": jnp.squeeze(transition.extras["state_extras"]["is_online"][:-1]),
-        },
+        "state_extras": state_extras_out,
         "state": state,
         "future_state": future_state,
         "future_action": future_action,
@@ -457,8 +463,63 @@ class CRL:
         exploration_bonus_state = None
         bonus_types_tuple = tuple(self.exploration_bonus_type or ())
         use_exploration_q = len(bonus_types_tuple) > 0
+        has_max_empowerment_bonus = "max_empowerment" in bonus_types_tuple
 
         goal_indices_tuple = tuple(int(i) for i in np.asarray(train_env.goal_indices))
+
+        # ── Offline empowerment scorer (shared with max_empowerment bonus) ───
+        # The ``max_empowerment`` bonus reads a precomputed cumulative-max
+        # empowerment field off each transition, so we need to score collected
+        # next_observations at experience-collection time. Load the scorer here
+        # and reuse it both for that scoring and for the bonus init (which only
+        # uses the scorer for the offline ``empowerment`` bonus, not for
+        # max_empowerment — the max_empowerment bonus_fn itself is a pure read).
+        offline_empowerment_scorer = None
+        if has_max_empowerment_bonus or "empowerment" in bonus_types_tuple:
+            from jaxgcrl.agents.go_explore.empowerment import (
+                infer_empowerment_override_indices_from_env,
+                load_offline_empowerment_agent,
+                make_empowerment_full_obs_builder,
+                make_empowerment_obs_builder,
+                make_offline_empowerment_scorer,
+            )
+
+            if self.empowerment_run_dir is None:
+                raise ValueError(
+                    "empowerment_run_dir must be set when exploration_bonus_type "
+                    f"includes empowerment or max_empowerment (got "
+                    f"exploration_bonus_type={bonus_types_tuple})."
+                )
+            key, empowerment_template_key = jax.random.split(key)
+            emp_agent, _ex_obs_dim, base_obs_template = load_offline_empowerment_agent(
+                run_dir=self.empowerment_run_dir,
+                jax_env=unwrapped_env,
+                template_rng=empowerment_template_key,
+                epoch=self.empowerment_epoch,
+                num_splus_samples=self.empowerment_num_splus_samples,
+                use_full_obs=self.use_full_empowerment,
+            )
+            if self.use_full_empowerment:
+                if state_size != int(_ex_obs_dim):
+                    raise ValueError(
+                        "use_full_empowerment=True requires state_size == ex_obs_dim; "
+                        f"got state_size={state_size}, ex_obs_dim={_ex_obs_dim}."
+                    )
+                obs_builder = make_empowerment_full_obs_builder()
+            else:
+                ogbench_obs_indices, jaxgcrl_state_indices = (
+                    infer_empowerment_override_indices_from_env(unwrapped_env)
+                )
+                obs_builder = make_empowerment_obs_builder(
+                    jnp.asarray(base_obs_template),
+                    ogbench_obs_indices,
+                    jaxgcrl_state_indices,
+                    state_size=state_size,
+                )
+            offline_empowerment_scorer = make_offline_empowerment_scorer(
+                emp_agent, obs_builder,
+                chunk_size=self.empowerment_score_chunk_size,
+            )
 
         if use_exploration_q:
             from jaxgcrl.agents.go_explore.algorithms import get_exploration_q_critic
@@ -499,6 +560,7 @@ class CRL:
                 empowerment_score_chunk_size=self.empowerment_score_chunk_size,
                 empowerment_mean=self.empowerment_bonus_mean,
                 empowerment_scale=self.empowerment_bonus_scale,
+                empowerment_precomputed_scorer=offline_empowerment_scorer,
                 empowerment_use_full_obs=self.use_full_empowerment,
                 rnd_feature_dim=self.rnd_feature_dim,
                 rnd_hidden_dim=self.rnd_hidden_dim,
@@ -593,18 +655,19 @@ class CRL:
         dummy_obs = jnp.zeros((obs_size,))
         dummy_action = jnp.zeros((action_size,))
 
+        state_extras_dummy = {
+            "truncation": 0.0,
+            "traj_id": 0.0,
+        }
+        if has_max_empowerment_bonus:
+            state_extras_dummy["max_empowerment"] = jnp.float32(0.0)
         dummy_transition = Transition(
             observation=dummy_obs,
             action=dummy_action,
             reward=0.0,
             discount=0.0,
             next_observation=dummy_obs,
-            extras={
-                "state_extras": {
-                    "truncation": 0.0,
-                    "traj_id": 0.0,
-                }
-            },
+            extras={"state_extras": state_extras_dummy},
         )
 
         def jit_wrap(buffer):
@@ -640,7 +703,7 @@ class CRL:
                 state_size=state_size,
                 agent_type="crl",
                 include_phase=False,
-                include_max_empowerment=False,
+                include_max_empowerment=has_max_empowerment_bonus,
             )
 
         def deterministic_actor_step(training_state, env, env_state, extra_fields):
@@ -678,6 +741,8 @@ class CRL:
 
         @jax.jit
         def get_experience(actor_state, env_state, buffer_state, key):
+            scan_key, scorer_key = jax.random.split(key)
+
             @jax.jit
             def f(carry, unused_t):
                 env_state, current_key = carry
@@ -691,7 +756,28 @@ class CRL:
                 )
                 return (env_state, next_key), transition
 
-            (env_state, _), data = jax.lax.scan(f, (env_state, key), (), length=self.unroll_length)
+            (env_state, _), data = jax.lax.scan(f, (env_state, scan_key), (), length=self.unroll_length)
+
+            # When max_empowerment bonus is configured, score each collected
+            # next_observation with the offline empowerment scorer and store
+            # the per-env cumulative max along the unroll axis on the
+            # transition's state_extras. The bonus_fn just reads it back at
+            # training time; scoring on next_observation matches the offline
+            # ``empowerment`` bonus convention (reward at s_{t+1}).
+            if has_max_empowerment_bonus:
+                batch_shape = data.observation.shape[:2]
+                states = data.next_observation[..., :state_size]
+                flat_states = states.reshape(-1, state_size)
+                raw = offline_empowerment_scorer(flat_states, scorer_key)
+                raw = raw.reshape(batch_shape).astype(jnp.float32)
+                max_emp_field = jax.lax.cummax(raw, axis=0)
+                new_state_extras = {
+                    **data.extras["state_extras"],
+                    "max_empowerment": max_emp_field,
+                }
+                data = data._replace(
+                    extras={**data.extras, "state_extras": new_state_extras}
+                )
 
             buffer_state = replay_buffer.insert(buffer_state, data)
             return env_state, buffer_state
