@@ -118,6 +118,10 @@ def flatten_batch(buffer_config, transition, sample_key):
         "state_extras": {
             "truncation": jnp.squeeze(transition.extras["state_extras"]["truncation"][:-1]),
             "traj_id": jnp.squeeze(transition.extras["state_extras"]["traj_id"][:-1]),
+            # is_online is the per-row mask routing online-only bonuses to
+            # online rows after the RLPD online/offline concat. Always present —
+            # set to ones for non-RLPD runs in training_step.
+            "is_online": jnp.squeeze(transition.extras["state_extras"]["is_online"][:-1]),
         },
         "state": state,
         "future_state": future_state,
@@ -182,7 +186,7 @@ class CRL:
 
     disable_entropy_actor: bool = False
 
-    max_replay_size: int = 10000
+    max_replay_size: int = 30000
     min_replay_size: int = 1000
     unroll_length: int = 62
     h_dim: int = 512
@@ -198,6 +202,16 @@ class CRL:
 
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
+
+    # ── RLPD (offline data mixing) ─────────────────────────────────────────
+    # When True, mix 50% offline OGBench data into each training batch. The
+    # online half is tagged is_online=1 in extras and the offline half with 0;
+    # the mask is forwarded to the exploration-bonus dispatcher so online-only
+    # bonuses (RND/MISC/ICM/EME/APT/online_empowerment/online_mine_empowerment/
+    # max_empowerment) zero out on offline rows. The offline buffer is loaded
+    # via ``load_and_prepare_offline_buffer`` so the env must have an OGBench
+    # mapping in ``JAXGCRL_TO_OGBENCH``.
+    use_rlpd: bool = False
 
     # ── Exploration bonus (added via a separate Q-critic on the bonus reward).
     # When ``exploration_bonus_type`` is set, a SAC-style Q-critic is trained
@@ -608,6 +622,26 @@ class CRL:
         )
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
+        # ── RLPD: offline buffer ─────────────────────────────────────────────
+        # Sampled per training step and concatenated with the online batch
+        # along axis 0 so HER/flatten_batch processes both online and offline
+        # trajectories. Each offline transition is tagged is_online=0 so
+        # online-only bonuses are masked off on those rows.
+        offline_buffer = None
+        if self.use_rlpd:
+            from jaxgcrl.utils.offline_buffer import load_and_prepare_offline_buffer
+            offline_buffer = load_and_prepare_offline_buffer(
+                env_name=config.env,
+                episode_length=config.episode_length,
+                num_slots=config.num_envs,
+                obs_size=obs_size,
+                action_size=action_size,
+                state_size=state_size,
+                agent_type="crl",
+                include_phase=False,
+                include_max_empowerment=False,
+            )
+
         def deterministic_actor_step(training_state, env, env_state, extra_fields):
             means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
             actions = nn.tanh(means)
@@ -750,7 +784,7 @@ class CRL:
 
         @jax.jit
         def training_step(training_state, env_state, buffer_state, exploration_bonus_state, key):
-            experience_key1, experience_key2, sampling_key, bonus_key, training_key = jax.random.split(key, 5)
+            experience_key1, experience_key2, sampling_key, bonus_key, training_key, offline_key = jax.random.split(key, 6)
 
             # update buffer
             env_state, buffer_state = get_experience(
@@ -767,11 +801,52 @@ class CRL:
             # sample actor-step worth of transitions
             buffer_state, online_transitions = replay_buffer.sample(buffer_state)
 
+            # Tag online rows so the exploration bonus can be masked to apply
+            # only to online data after concat+permute. flatten_batch reads
+            # this and carries it through to the post-HER batch.
+            online_transitions = online_transitions._replace(
+                extras={
+                    **online_transitions.extras,
+                    "state_extras": {
+                        **online_transitions.extras["state_extras"],
+                        "is_online": jnp.ones_like(online_transitions.reward),
+                    },
+                }
+            )
+
+            if self.use_rlpd:
+                # Mix 50% offline data: concatenate along the num_envs axis so
+                # flatten_batch sees one batched set of trajectories. The
+                # offline buffer's Transition is the go_explore.types one;
+                # rebuild it as the local NamedTuple for tree_map structural
+                # compatibility.
+                raw_offline = offline_buffer.sample(offline_key, config.num_envs)
+                offline_transitions = Transition(
+                    observation=raw_offline.observation,
+                    action=raw_offline.action,
+                    reward=raw_offline.reward,
+                    discount=raw_offline.discount,
+                    next_observation=raw_offline.next_observation,
+                    extras={
+                        **raw_offline.extras,
+                        "state_extras": {
+                            **raw_offline.extras["state_extras"],
+                            "is_online": jnp.zeros_like(raw_offline.reward),
+                        },
+                    },
+                )
+                pre_her_transitions = jax.tree_util.tree_map(
+                    lambda a, b: jnp.concatenate([a, b], axis=0),
+                    online_transitions, offline_transitions,
+                )
+            else:
+                pre_her_transitions = online_transitions
+
             # process transitions for training
-            batch_keys = jax.random.split(sampling_key, online_transitions.observation.shape[0])
+            batch_keys = jax.random.split(sampling_key, pre_her_transitions.observation.shape[0])
             transitions = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
                 (self.discounting, state_size, tuple(train_env.goal_indices)),
-                online_transitions,
+                pre_her_transitions,
                 batch_keys,
             )
             transitions = jax.tree_util.tree_map(
@@ -786,9 +861,22 @@ class CRL:
                 transitions,
             )
 
+            if self.use_rlpd:
+                # Slice to the original num_batches so the gradient-step count
+                # per env step stays the same as the online-only path. The
+                # permutation above already mixed online+offline ~50/50 within
+                # each batch, so the surviving slice still covers both.
+                num_batches = config.num_envs * (config.episode_length - 1) // self.batch_size
+                transitions = jax.tree_util.tree_map(
+                    lambda x: x[:num_batches], transitions
+                )
+
             # Compute per-transition exploration bonus across all configured
-            # bonuses; the weighted total is what Q_exp is trained on.
+            # bonuses; the weighted total is what Q_exp is trained on. The
+            # is_online mask routes online-only bonuses (RND, MISC, ICM, EME,
+            # APT, online_empowerment, ...) to online rows only inside compute().
             if use_exploration_q:
+                is_online = transitions.extras["state_extras"]["is_online"]
                 bonus_compute_kwargs = (
                     {"actor_params": training_state.actor_state.params}
                     if exploration_bonuses.requires_actor_params else {}
@@ -796,7 +884,7 @@ class CRL:
                 total_bonus, _, exploration_bonus_state, bonus_metrics = (
                     exploration_bonuses.compute(
                         exploration_bonus_state, transitions, bonus_key,
-                        is_online=jnp.ones_like(transitions.reward),
+                        is_online=is_online,
                         **bonus_compute_kwargs,
                     )
                 )
