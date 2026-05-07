@@ -251,7 +251,7 @@ class GoExploreSimple:
     agent_type: Literal["sac", "crl"] = "crl"
 
     policy_lr: float = 3e-4
-    critic_lr: float = 1e-4
+    critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
     batch_size: int = 256
 
@@ -261,7 +261,7 @@ class GoExploreSimple:
     train_step_multiplier: int = 1
     disable_entropy_actor: bool = False
 
-    max_replay_size: int = 30000
+    max_replay_size: int = 500000
     min_replay_size: int = 1000
     unroll_length: int = 50
     h_dim: int = 256
