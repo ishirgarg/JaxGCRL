@@ -458,6 +458,8 @@ class CRL:
         bonus_types_tuple = tuple(self.exploration_bonus_type or ())
         use_exploration_q = len(bonus_types_tuple) > 0
 
+        goal_indices_tuple = tuple(int(i) for i in np.asarray(train_env.goal_indices))
+
         if use_exploration_q:
             from jaxgcrl.agents.go_explore.algorithms import get_exploration_q_critic
             from jaxgcrl.agents.go_explore.exploration import create_exploration_bonuses
@@ -480,7 +482,6 @@ class CRL:
             )
             exploration_q_target_critic_params = exploration_q_critic_params
 
-            goal_indices_tuple = tuple(int(i) for i in np.asarray(train_env.goal_indices))
             controllable_indices_tuple = (
                 tuple(int(i) for i in np.asarray(unwrapped_env.controllable_indices))
                 if hasattr(unwrapped_env, "controllable_indices") else None
