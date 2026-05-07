@@ -171,8 +171,8 @@ def save_params(path: str, params: Any):
 class CRL:
     """Contrastive Reinforcement Learning (CRL) agent."""
 
-    policy_lr: float = 1e-4
-    critic_lr: float = 1e-4
+    policy_lr: float = 3e-5
+    critic_lr: float = 3e-5
     alpha_lr: float = 3e-4
     batch_size: int = 256
 
