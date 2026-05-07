@@ -21,7 +21,13 @@ from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
-from .losses import update_actor_and_alpha, update_critic
+from .losses import (
+    flatten_q_ensemble_params,
+    soft_update_q_ensemble_target,
+    update_actor_and_alpha,
+    update_critic,
+    update_exploration_q_critic,
+)
 from .networks import Actor, Encoder
 
 Metrics = types.Metrics
@@ -38,15 +44,26 @@ class TrainingState:
     actor_state: TrainState
     critic_state: TrainState
     alpha_state: TrainState
+    # Set when an exploration bonus is configured. ``exploration_q_critic_states``
+    # is a tuple of per-critic TrainStates (SAC-style ensemble); the target
+    # params hold the polyak-averaged copy used for the Bellman backup.
+    exploration_q_critic_states: Optional[Tuple[TrainState, ...]] = None
+    exploration_q_target_critic_params: Optional[Any] = None
 
 
 class Transition(NamedTuple):
-    """Container for a transition"""
+    """Container for a transition.
+
+    ``next_observation`` is populated unconditionally so the SAC-style
+    exploration Q-critic and bonus pipeline have access to s_{t+1}; CRL's
+    own contrastive critic and actor never read it.
+    """
 
     observation: jnp.ndarray
     action: jnp.ndarray
     reward: jnp.ndarray
     discount: jnp.ndarray
+    next_observation: jnp.ndarray = jnp.zeros(())
     extras: jnp.ndarray = ()
 
 
@@ -92,7 +109,9 @@ def flatten_batch(buffer_config, transition, sample_key):
     goal = future_state[:, goal_indices]
     future_state = future_state[:, :state_size]
     state = transition.observation[:-1, :state_size]  # all states are considered
+    next_state = transition.observation[1:, :state_size]
     new_obs = jnp.concatenate([state, goal], axis=1)
+    next_obs = jnp.concatenate([next_state, goal], axis=1)
 
     extras = {
         "policy_extras": {},
@@ -110,8 +129,26 @@ def flatten_batch(buffer_config, transition, sample_key):
         action=jnp.squeeze(transition.action[:-1]),
         reward=jnp.squeeze(transition.reward[:-1]),
         discount=jnp.squeeze(transition.discount[:-1]),
+        # Pair next_observation with the same HER goal as observation so
+        # the SAC-style exploration Q backup and any bonus that reads
+        # s_{t+1} (ICM, EME, APT, MISC, empowerment, online_empowerment)
+        # see a consistent (s, a, s') triple.
+        next_observation=jnp.squeeze(next_obs),
         extras=extras,
     )
+
+
+def _make_actor_sample_fn(actor):
+    """Build a ``(params, obs, key) -> sampled_action`` callable for the
+    online_mine_empowerment marginal-action sampler. The bonus calls this
+    with the agent's current actor params at each train step.
+    """
+    def sample_fn(params, obs, key):
+        means, log_stds = actor.apply(params, obs)
+        stds = jnp.exp(log_stds)
+        x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
+        return nn.tanh(x_ts)
+    return sample_fn
 
 
 def load_params(path: str):
@@ -130,8 +167,8 @@ def save_params(path: str, params: Any):
 class CRL:
     """Contrastive Reinforcement Learning (CRL) agent."""
 
-    policy_lr: float = 3e-4
-    critic_lr: float = 3e-4
+    policy_lr: float = 1e-4
+    critic_lr: float = 1e-4
     alpha_lr: float = 3e-4
     batch_size: int = 256
 
@@ -148,7 +185,7 @@ class CRL:
     max_replay_size: int = 10000
     min_replay_size: int = 1000
     unroll_length: int = 62
-    h_dim: int = 256
+    h_dim: int = 512
     n_hidden: int = 4
     skip_connections: int = 4
     use_relu: bool = False
@@ -161,6 +198,107 @@ class CRL:
 
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
+
+    # ── Exploration bonus (added via a separate Q-critic on the bonus reward).
+    # When ``exploration_bonus_type`` is set, a SAC-style Q-critic is trained
+    # on the per-transition weighted bonus (per-bonus weight baked into the
+    # Bellman target) and ``-min_i Q_exp_i(obs, action)`` is added to the CRL
+    # actor loss. Mirrors the GoExploreSimple wiring for CRL with bonus.
+    exploration_bonus_type: Optional[Tuple[str, ...]] = None
+    exploration_bonus_weight: Tuple[float, ...] = (0.1,)
+    bonus_grad_steps_per_env_step: Tuple[int, ...] = (1,)
+
+    # Exploration Q-critic: SAC-style ensemble; tau is the target soft-update
+    # rate; n_exp_critics is the ensemble size.
+    tau: float = 0.005
+    n_exp_critics: int = 2
+
+    # ── RND ────────────────────────────────────────────────────────────────
+    rnd_feature_dim: int = 64
+    rnd_hidden_dim: int = 256
+    rnd_num_hidden: int = 3
+    rnd_learning_rate: float = 1e-4
+    rnd_obs_clip: float = 5.0
+    rnd_train_batch_size: int = 512
+    use_goal_for_rnd: bool = False
+
+    # ── MISC ───────────────────────────────────────────────────────────────
+    misc_hidden_dim: int = 256
+    misc_num_hidden: int = 3
+    misc_learning_rate: float = 1e-3
+    misc_alpha: float = 5000.0
+
+    # ── ICM (Pathak et al., 2017) ──────────────────────────────────────────
+    icm_feature_dim: int = 64
+    icm_encoder_hidden_dim: int = 128
+    icm_encoder_num_hidden: int = 2
+    icm_inverse_hidden_dim: int = 128
+    icm_inverse_num_hidden: int = 1
+    icm_forward_hidden_dim: int = 128
+    icm_forward_num_hidden: int = 1
+    icm_learning_rate: float = 1e-3
+    icm_beta: float = 0.2
+    icm_eta: float = 1.0
+    icm_obs_clip: float = 5.0
+    icm_train_batch_size: int = 512
+
+    # ── EME (Wang et al., 2024) ────────────────────────────────────────────
+    eme_metric_hidden_dim: int = 256
+    eme_metric_num_hidden: int = 2
+    eme_reward_hidden_dim: int = 256
+    eme_reward_num_hidden: int = 2
+    eme_metric_learning_rate: float = 1e-3
+    eme_reward_learning_rate: float = 1e-3
+    eme_ensemble_size: int = 6
+    eme_max_reward_scaling: float = 10.0
+    eme_bootstrap_keep_prob: float = 0.8
+
+    # ── APT (Liu & Abbeel, 2021) ───────────────────────────────────────────
+    apt_repr_dim: int = 16
+    apt_encoder_hidden_dim: int = 256
+    apt_encoder_num_hidden: int = 2
+    apt_projection_hidden_dim: int = 256
+    apt_projection_num_hidden: int = 1
+    apt_learning_rate: float = 1e-3
+    apt_temperature: float = 0.1
+    apt_knn_k: int = 3
+    apt_knn_c: float = 1.0
+    apt_aug_noise_std: float = 0.1
+    apt_train_batch_size: int = 256
+
+    # ── Offline empowerment scorer (loaded from disk) ──────────────────────
+    empowerment_run_dir: Optional[str] = None
+    empowerment_epoch: Optional[int] = None
+    empowerment_num_splus_samples: int = 12
+    empowerment_score_chunk_size: int = 32
+    empowerment_bonus_mean: float = 1.3
+    empowerment_bonus_scale: float = 0.2
+    use_full_empowerment: bool = True
+
+    # ── Online empowerment ────────────────────────────────────────────────
+    online_empowerment_lr: float = 3e-4
+    online_empowerment_value_hidden_dims: Tuple[int, ...] = (256, 256, 256)
+    online_empowerment_actor_hidden_dims: Tuple[int, ...] = (256, 256, 256)
+    online_empowerment_value_latent_dim: int = 128
+    online_empowerment_num_skills: int = 5
+    online_empowerment_num_splus_samples: int = 32
+    online_empowerment_discount: float = 0.99
+    online_empowerment_tau: float = 0.005
+    online_empowerment_separate_qv: bool = False
+    online_empowerment_use_self_q_loss: bool = True
+    online_empowerment_layer_norm: bool = True
+    online_empowerment_bc_alpha: float = 0.01
+    online_empowerment_bonus_mean: float = 0.0
+    online_empowerment_bonus_scale: float = 1.0
+
+    # ── Online MINE empowerment ───────────────────────────────────────────
+    online_mine_empowerment_lr_dyn: float = 1e-3
+    online_mine_empowerment_lr_t: float = 3e-4
+    online_mine_empowerment_dyn_hidden_dims: Tuple[int, ...] = (256, 256, 256)
+    online_mine_empowerment_t_hidden_dims: Tuple[int, ...] = (256, 256, 256)
+    online_mine_empowerment_layer_norm: bool = True
+    online_mine_empowerment_bonus_mean: float = 0.0
+    online_mine_empowerment_bonus_scale: float = 1.0
 
     def check_config(self, config):
         """
@@ -290,6 +428,141 @@ class CRL:
             tx=optax.adam(learning_rate=self.alpha_lr),
         )
 
+        # ── Exploration bonus + Q-critic ─────────────────────────────────────
+        # When ``exploration_bonus_type`` is set, build:
+        #   1. A SAC-style Q-critic ensemble that takes (obs, action) and is
+        #      trained on the per-transition weighted bonus reward.
+        #   2. The exploration-bonus bundle (RND, ICM, EME, APT, MISC,
+        #      empowerment, online_empowerment, online_mine_empowerment, ...)
+        #      that produces the per-transition bonus on each training step.
+        # The bonus is *not* added to the env reward — instead the actor loss
+        # subtracts ``min_i Q_exp_i(obs, action)``. This mirrors how
+        # GoExploreSimple handles bonuses for CRL agents.
+        exploration_q_critic = None
+        exploration_bonuses = None
+        exploration_bonus_state = None
+        bonus_types_tuple = tuple(self.exploration_bonus_type or ())
+        use_exploration_q = len(bonus_types_tuple) > 0
+
+        if use_exploration_q:
+            from jaxgcrl.agents.go_explore.algorithms import get_exploration_q_critic
+            from jaxgcrl.agents.go_explore.exploration import create_exploration_bonuses
+
+            key, exp_q_key, bonus_init_key = jax.random.split(key, 3)
+            exploration_q_critic = get_exploration_q_critic(
+                obs_size=obs_size,
+                action_size=action_size,
+                h_dim=self.h_dim,
+                n_hidden=self.n_hidden,
+                use_relu=self.use_relu,
+                use_ln=self.use_ln,
+                n_critics=self.n_exp_critics,
+            )
+            exploration_q_critic_params = exploration_q_critic.init(
+                exp_q_key, np.ones([1, obs_size])
+            )
+            exploration_q_critic_states = exploration_q_critic.create_critic_states(
+                exploration_q_critic_params, self.critic_lr,
+            )
+            exploration_q_target_critic_params = exploration_q_critic_params
+
+            goal_indices_tuple = tuple(int(i) for i in np.asarray(train_env.goal_indices))
+            controllable_indices_tuple = (
+                tuple(int(i) for i in np.asarray(unwrapped_env.controllable_indices))
+                if hasattr(unwrapped_env, "controllable_indices") else None
+            )
+            exploration_bonuses = create_exploration_bonuses(
+                self.exploration_bonus_type,
+                self.exploration_bonus_weight,
+                env=unwrapped_env,
+                state_size=state_size,
+                key=bonus_init_key,
+                discount=self.discounting,
+                empowerment_run_dir=self.empowerment_run_dir,
+                empowerment_epoch=self.empowerment_epoch,
+                empowerment_num_splus_samples=self.empowerment_num_splus_samples,
+                empowerment_score_chunk_size=self.empowerment_score_chunk_size,
+                empowerment_mean=self.empowerment_bonus_mean,
+                empowerment_scale=self.empowerment_bonus_scale,
+                empowerment_use_full_obs=self.use_full_empowerment,
+                rnd_feature_dim=self.rnd_feature_dim,
+                rnd_hidden_dim=self.rnd_hidden_dim,
+                rnd_num_hidden=self.rnd_num_hidden,
+                rnd_learning_rate=self.rnd_learning_rate,
+                rnd_obs_clip=self.rnd_obs_clip,
+                rnd_use_goal=self.use_goal_for_rnd,
+                rnd_train_batch_size=self.rnd_train_batch_size,
+                goal_indices=goal_indices_tuple,
+                controllable_indices=controllable_indices_tuple,
+                misc_hidden_dim=self.misc_hidden_dim,
+                misc_num_hidden=self.misc_num_hidden,
+                misc_learning_rate=self.misc_learning_rate,
+                misc_alpha=self.misc_alpha,
+                icm_feature_dim=self.icm_feature_dim,
+                icm_encoder_hidden_dim=self.icm_encoder_hidden_dim,
+                icm_encoder_num_hidden=self.icm_encoder_num_hidden,
+                icm_inverse_hidden_dim=self.icm_inverse_hidden_dim,
+                icm_inverse_num_hidden=self.icm_inverse_num_hidden,
+                icm_forward_hidden_dim=self.icm_forward_hidden_dim,
+                icm_forward_num_hidden=self.icm_forward_num_hidden,
+                icm_learning_rate=self.icm_learning_rate,
+                icm_beta=self.icm_beta,
+                icm_eta=self.icm_eta,
+                icm_obs_clip=self.icm_obs_clip,
+                icm_train_batch_size=self.icm_train_batch_size,
+                # EME's metric loss reads the actor's pre-tanh (mean, log_std)
+                # at arbitrary states for the closed-form Gaussian KL term.
+                eme_actor_dist_fn=(lambda params, obs: actor.apply(params, obs)),
+                eme_metric_hidden_dim=self.eme_metric_hidden_dim,
+                eme_metric_num_hidden=self.eme_metric_num_hidden,
+                eme_reward_hidden_dim=self.eme_reward_hidden_dim,
+                eme_reward_num_hidden=self.eme_reward_num_hidden,
+                eme_metric_learning_rate=self.eme_metric_learning_rate,
+                eme_reward_learning_rate=self.eme_reward_learning_rate,
+                eme_ensemble_size=self.eme_ensemble_size,
+                eme_max_reward_scaling=self.eme_max_reward_scaling,
+                eme_bootstrap_keep_prob=self.eme_bootstrap_keep_prob,
+                apt_repr_dim=self.apt_repr_dim,
+                apt_encoder_hidden_dim=self.apt_encoder_hidden_dim,
+                apt_encoder_num_hidden=self.apt_encoder_num_hidden,
+                apt_projection_hidden_dim=self.apt_projection_hidden_dim,
+                apt_projection_num_hidden=self.apt_projection_num_hidden,
+                apt_learning_rate=self.apt_learning_rate,
+                apt_temperature=self.apt_temperature,
+                apt_knn_k=self.apt_knn_k,
+                apt_knn_c=self.apt_knn_c,
+                apt_aug_noise_std=self.apt_aug_noise_std,
+                apt_train_batch_size=self.apt_train_batch_size,
+                online_empowerment_action_size=action_size,
+                online_empowerment_lr=self.online_empowerment_lr,
+                online_empowerment_value_hidden_dims=self.online_empowerment_value_hidden_dims,
+                online_empowerment_actor_hidden_dims=self.online_empowerment_actor_hidden_dims,
+                online_empowerment_value_latent_dim=self.online_empowerment_value_latent_dim,
+                online_empowerment_num_skills=self.online_empowerment_num_skills,
+                online_empowerment_num_splus_samples=self.online_empowerment_num_splus_samples,
+                online_empowerment_discount=self.online_empowerment_discount,
+                online_empowerment_tau=self.online_empowerment_tau,
+                online_empowerment_separate_qv=self.online_empowerment_separate_qv,
+                online_empowerment_use_self_q_loss=self.online_empowerment_use_self_q_loss,
+                online_empowerment_layer_norm=self.online_empowerment_layer_norm,
+                online_empowerment_bc_alpha=self.online_empowerment_bc_alpha,
+                online_empowerment_bonus_mean=self.online_empowerment_bonus_mean,
+                online_empowerment_bonus_scale=self.online_empowerment_bonus_scale,
+                online_mine_empowerment_action_size=action_size,
+                online_mine_empowerment_actor_sample_fn=_make_actor_sample_fn(actor),
+                online_mine_empowerment_lr_dyn=self.online_mine_empowerment_lr_dyn,
+                online_mine_empowerment_lr_t=self.online_mine_empowerment_lr_t,
+                online_mine_empowerment_dyn_hidden_dims=self.online_mine_empowerment_dyn_hidden_dims,
+                online_mine_empowerment_t_hidden_dims=self.online_mine_empowerment_t_hidden_dims,
+                online_mine_empowerment_layer_norm=self.online_mine_empowerment_layer_norm,
+                online_mine_empowerment_bonus_mean=self.online_mine_empowerment_bonus_mean,
+                online_mine_empowerment_bonus_scale=self.online_mine_empowerment_bonus_scale,
+            )
+            exploration_bonus_state = exploration_bonuses.initial_state
+        else:
+            exploration_q_critic_states = None
+            exploration_q_target_critic_params = None
+
         # Trainstate
         training_state = TrainingState(
             env_steps=jnp.zeros(()),
@@ -297,6 +570,8 @@ class CRL:
             actor_state=actor_state,
             critic_state=critic_state,
             alpha_state=alpha_state,
+            exploration_q_critic_states=exploration_q_critic_states,
+            exploration_q_target_critic_params=exploration_q_target_critic_params,
         )
 
         # Replay Buffer
@@ -308,6 +583,7 @@ class CRL:
             action=dummy_action,
             reward=0.0,
             discount=0.0,
+            next_observation=dummy_obs,
             extras={
                 "state_extras": {
                     "truncation": 0.0,
@@ -344,6 +620,7 @@ class CRL:
                 action=actions,
                 reward=nstate.reward,
                 discount=1 - nstate.done,
+                next_observation=nstate.obs,
                 extras={"state_extras": state_extras},
             )
 
@@ -360,6 +637,7 @@ class CRL:
                 action=actions,
                 reward=nstate.reward,
                 discount=1 - nstate.done,
+                next_observation=nstate.obs,
                 extras={"state_extras": state_extras},
             )
 
@@ -408,9 +686,10 @@ class CRL:
             )[0]
 
         @jax.jit
-        def update_networks(carry, transitions):
+        def update_networks(carry, xs):
+            transitions, exploration_reward = xs
             training_state, key = carry
-            key, critic_key, actor_key = jax.random.split(key, 3)
+            key, exp_q_key, critic_key, actor_key = jax.random.split(key, 4)
 
             context = dict(
                 **vars(self),
@@ -428,6 +707,20 @@ class CRL:
                 sa_encoder=sa_encoder,
                 g_encoder=g_encoder,
             )
+            if use_exploration_q:
+                networks["exploration_q_critic"] = exploration_q_critic
+
+            metrics = {}
+
+            # Train Q_exp first so the actor loss in the same step uses the
+            # freshly-updated values; Q_exp's Bellman target uses the *target*
+            # net so this is consistent.
+            if use_exploration_q:
+                training_state, exp_q_metrics = update_exploration_q_critic(
+                    context, networks, transitions, exploration_reward,
+                    training_state, exp_q_key,
+                )
+                metrics.update(exp_q_metrics)
 
             training_state, actor_metrics = update_actor_and_alpha(
                 context, networks, transitions, training_state, actor_key
@@ -435,9 +728,18 @@ class CRL:
             training_state, critic_metrics = update_critic(
                 context, networks, transitions, training_state, critic_key
             )
+
+            if use_exploration_q:
+                training_state = training_state.replace(
+                    exploration_q_target_critic_params=soft_update_q_ensemble_target(
+                        training_state.exploration_q_target_critic_params,
+                        training_state.exploration_q_critic_states,
+                        self.tau,
+                    ),
+                )
+
             training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
 
-            metrics = {}
             metrics.update(actor_metrics)
             metrics.update(critic_metrics)
 
@@ -447,8 +749,8 @@ class CRL:
             ), metrics
 
         @jax.jit
-        def training_step(training_state, env_state, buffer_state, key):
-            experience_key1, experience_key2, sampling_key, training_key = jax.random.split(key, 4)
+        def training_step(training_state, env_state, buffer_state, exploration_bonus_state, key):
+            experience_key1, experience_key2, sampling_key, bonus_key, training_key = jax.random.split(key, 5)
 
             # update buffer
             env_state, buffer_state = get_experience(
@@ -463,13 +765,13 @@ class CRL:
             )
 
             # sample actor-step worth of transitions
-            buffer_state, transitions = replay_buffer.sample(buffer_state)
+            buffer_state, online_transitions = replay_buffer.sample(buffer_state)
 
             # process transitions for training
-            batch_keys = jax.random.split(sampling_key, transitions.observation.shape[0])
+            batch_keys = jax.random.split(sampling_key, online_transitions.observation.shape[0])
             transitions = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
                 (self.discounting, state_size, tuple(train_env.goal_indices)),
-                transitions,
+                online_transitions,
                 batch_keys,
             )
             transitions = jax.tree_util.tree_map(
@@ -484,6 +786,25 @@ class CRL:
                 transitions,
             )
 
+            # Compute per-transition exploration bonus across all configured
+            # bonuses; the weighted total is what Q_exp is trained on.
+            if use_exploration_q:
+                bonus_compute_kwargs = (
+                    {"actor_params": training_state.actor_state.params}
+                    if exploration_bonuses.requires_actor_params else {}
+                )
+                total_bonus, _, exploration_bonus_state, bonus_metrics = (
+                    exploration_bonuses.compute(
+                        exploration_bonus_state, transitions, bonus_key,
+                        is_online=jnp.ones_like(transitions.reward),
+                        **bonus_compute_kwargs,
+                    )
+                )
+                exploration_reward_per_batch = total_bonus
+            else:
+                exploration_reward_per_batch = jnp.zeros_like(transitions.reward)
+                bonus_metrics = {}
+
             # take actor-step worth of training-step
             (
                 (
@@ -491,12 +812,39 @@ class CRL:
                     _,
                 ),
                 metrics,
-            ) = jax.lax.scan(update_networks, (training_state, training_key), transitions)
+            ) = jax.lax.scan(
+                update_networks,
+                (training_state, training_key),
+                (transitions, exploration_reward_per_batch),
+            )
+            metrics.update(bonus_metrics)
+
+            # Train bonus-side trainables (RND predictor, ICM/EME/APT
+            # encoders, online_empowerment networks, ...) on the online
+            # batch only — bonus *emission* above runs read-only on the full
+            # post-HER batch, but bonus *learning* must stay scoped to the
+            # agent's own visited states.
+            if use_exploration_q and exploration_bonuses.has_trainables:
+                # Per-bonus train_fns advance their own internal PRNG state,
+                # so no key needs to be threaded in here.
+                for i in range(len(exploration_bonuses.bonus_types)):
+                    if not exploration_bonuses.is_trainable(i):
+                        continue
+                    bonus_train_kwargs = (
+                        {"actor_params": training_state.actor_state.params}
+                        if exploration_bonuses.requires_actor_params_at(i) else {}
+                    )
+                    exploration_bonus_state, m_i = exploration_bonuses.train_one(
+                        exploration_bonus_state, i, online_transitions, 1,
+                        **bonus_train_kwargs,
+                    )
+                    metrics.update(m_i)
 
             return (
                 training_state,
                 env_state,
                 buffer_state,
+                exploration_bonus_state,
             ), metrics
 
         @jax.jit
@@ -504,37 +852,49 @@ class CRL:
             training_state,
             env_state,
             buffer_state,
+            exploration_bonus_state,
             key,
         ):
             @jax.jit
             def f(carry, unused_t):
-                ts, es, bs, k = carry
+                ts, es, bs, ebs, k = carry
                 k, train_key = jax.random.split(k, 2)
                 (
                     (
                         ts,
                         es,
                         bs,
+                        ebs,
                     ),
                     metrics,
-                ) = training_step(ts, es, bs, train_key)
-                return (ts, es, bs, k), metrics
+                ) = training_step(ts, es, bs, ebs, train_key)
+                return (ts, es, bs, ebs, k), metrics
 
-            (training_state, env_state, buffer_state, key), metrics = jax.lax.scan(
+            (training_state, env_state, buffer_state, exploration_bonus_state, key), metrics = jax.lax.scan(
                 f,
-                (training_state, env_state, buffer_state, key),
+                (training_state, env_state, buffer_state, exploration_bonus_state, key),
                 (),
                 length=num_training_steps_per_epoch,
             )
 
             metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
-            return training_state, env_state, buffer_state, metrics
+            return training_state, env_state, buffer_state, exploration_bonus_state, metrics
 
         key, prefill_key = jax.random.split(key, 2)
 
         training_state, env_state, buffer_state, _ = prefill_replay_buffer(
             training_state, env_state, buffer_state, prefill_key
         )
+
+        # Seed per-bonus observation-normalization statistics (e.g. RND's
+        # obs_mean / obs_std) from the post-prefill rollouts, per the RND
+        # paper's "step a random agent for a small number of steps" warm-up.
+        if use_exploration_q and not exploration_bonuses.is_empty:
+            buffer_state, seed_transitions = replay_buffer.sample(buffer_state)
+            seed_states = seed_transitions.observation[..., :state_size]
+            exploration_bonus_state = exploration_bonuses.init_from_states(
+                exploration_bonus_state, seed_states,
+            )
 
         """Setting up evaluator"""
         evaluator = ActorEvaluator(
@@ -552,8 +912,8 @@ class CRL:
 
             key, epoch_key = jax.random.split(key)
 
-            training_state, env_state, buffer_state, metrics = training_epoch(
-                training_state, env_state, buffer_state, epoch_key
+            training_state, env_state, buffer_state, exploration_bonus_state, metrics = training_epoch(
+                training_state, env_state, buffer_state, exploration_bonus_state, epoch_key
             )
 
             metrics = jax.tree_util.tree_map(jnp.mean, metrics)

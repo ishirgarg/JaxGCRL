@@ -102,11 +102,11 @@ class APTBonusState:
     Carries the trainable encoder ``f_theta`` and projection head
     ``h_phi`` (both as one shared pytree) used to map states into a
     representation space, their shared Adam optimizer state, a Welford
-    running mean of the raw intrinsic reward (used to keep the bonus on a
-    consistent scale as in the paper: "we normalize the intrinsic reward
-    by dividing it by a running estimate of the mean of the intrinsic
-    reward"), and a PRNG key advanced each train step (fresh Gaussian
-    augmentations per minibatch).
+    running mean / M2 of the raw intrinsic reward (used to derive a
+    running std for bonus normalization, matching the URLB reference
+    implementation; the paper text suggests normalizing by the running
+    mean, but the official code divides by std), and a PRNG key advanced
+    each train step (fresh Gaussian augmentations per minibatch).
 
     Per-transition reward (Eq. 5 of Liu & Abbeel, 2021):
       ``r(s, a, s') = log(c + (1/k) * sum_{z^{(j)} in N_k(f(s'))} ||f(s') - z^{(j)}||)``
@@ -121,6 +121,7 @@ class APTBonusState:
     predictor_params: Any
     opt_state: Any
     reward_mean: jnp.ndarray   # scalar (running mean of raw intrinsic reward)
+    reward_m2: jnp.ndarray     # scalar (Welford sum of squared deviations)
     reward_count: jnp.ndarray  # scalar
     key: jax.Array             # PRNG key for per-step training augmentations
 
@@ -1736,6 +1737,7 @@ def _create_apt_bonus(
         predictor_params=predictor_params0,
         opt_state=opt_state0,
         reward_mean=jnp.asarray(0.0, dtype=jnp.float32),
+        reward_m2=jnp.asarray(0.0, dtype=jnp.float32),
         reward_count=jnp.asarray(0.0, dtype=jnp.float32),
         key=state_key,
     )
@@ -1751,14 +1753,16 @@ def _create_apt_bonus(
     def _project(params, z):
         return projection.apply(params["projection"], z)
 
-    def _welford_update_mean(mean, count, batch_flat):
-        """Parallel Welford update for a running mean over a flat batch."""
+    def _welford_update(mean, m2, count, batch_flat):
+        """Parallel Welford update for running mean / M2 over a flat batch."""
         n = jnp.asarray(batch_flat.shape[0], dtype=jnp.float32)
         batch_mean = jnp.mean(batch_flat)
+        batch_m2 = jnp.sum((batch_flat - batch_mean) ** 2)
         new_count = count + n
         delta = batch_mean - mean
         new_mean = mean + delta * n / new_count
-        return new_mean, new_count
+        new_m2 = m2 + batch_m2 + (delta ** 2) * count * n / new_count
+        return new_mean, new_m2, new_count
 
     def _knn_avg_distance(z_flat):
         """Per-particle average L2 distance to its ``k`` nearest neighbors.
@@ -1815,16 +1819,19 @@ def _create_apt_bonus(
         raw_bonus = jnp.log(c_f + avg_dist)               # shape == ``shape``
         raw_bonus_flat = raw_bonus.reshape(-1)
 
-        # Update running mean *before* using it so the first batch produces
-        # a sensible scale (mean=1 fallback via reward_count<=0).
-        new_reward_mean, new_reward_count = _welford_update_mean(
-            state.reward_mean, state.reward_count, raw_bonus_flat
+        # Welford reward-stats update *before* using std so the first batch
+        # produces a sensible scale (std=1 fallback via reward_count<=1).
+        new_reward_mean, new_reward_m2, new_reward_count = _welford_update(
+            state.reward_mean, state.reward_m2, state.reward_count, raw_bonus_flat
         )
-        scale = jnp.where(new_reward_count > 0.0, jnp.abs(new_reward_mean), 1.0)
-        bonus = raw_bonus / jnp.maximum(scale, 1e-8)
+        reward_std = jnp.sqrt(
+            jnp.where(new_reward_count > 1.0, new_reward_m2 / new_reward_count, 1.0)
+        )
+        bonus = raw_bonus / jnp.maximum(reward_std, 1e-8)
 
         new_state = state.replace(
             reward_mean=new_reward_mean,
+            reward_m2=new_reward_m2,
             reward_count=new_reward_count,
         )
         metrics = {
@@ -1832,6 +1839,7 @@ def _create_apt_bonus(
             "apt_raw_bonus_mean": jnp.mean(raw_bonus_flat),
             "apt_bonus_mean": jnp.mean(bonus),
             "apt_reward_running_mean": new_reward_mean,
+            "apt_reward_running_std": reward_std,
         }
         return bonus, new_state, metrics
 
