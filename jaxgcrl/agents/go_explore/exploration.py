@@ -357,6 +357,12 @@ def create_exploration_bonus(
             use_full_obs=empowerment_use_full_obs,
         )
         return bonus_fn, st, init_fn, None, None, None, None, None
+    if bonus_type == "max_empowerment":
+        bonus_fn, st, init_fn = _create_max_empowerment_bonus(
+            mean=empowerment_mean,
+            scale=empowerment_scale,
+        )
+        return bonus_fn, st, init_fn, None, None, None, None, None
     if bonus_type == "rnd":
         bonus_fn, st, init_fn, novelty_fn, train_fn = _create_rnd_bonus(
             state_size=state_size,
@@ -610,6 +616,37 @@ def _create_empowerment_bonus(
         return bonus, state, metrics
 
     return empowerment_bonus, StatelessBonusState(), None
+
+
+def _create_max_empowerment_bonus(
+    *,
+    mean: float,
+    scale: float,
+) -> Tuple[BonusFn, StatelessBonusState, None]:
+    """Reads precomputed cumulative-max empowerment from transition extras.
+
+    Each transition carries a ``max_empowerment`` value in
+    ``extras["state_extras"]["max_empowerment"]`` that was computed at
+    collection time as the running max of empowerment over the unroll-length
+    sequence the transition came from. This bonus_fn just normalizes that
+    raw value as ``(raw - mean) / scale``, mirroring the offline
+    ``empowerment`` bonus, so the two bonuses can share ``empowerment_mean``
+    / ``empowerment_scale`` knobs.
+    """
+    mean_f = jnp.asarray(mean, dtype=jnp.float32)
+    scale_f = jnp.asarray(scale, dtype=jnp.float32)
+
+    def max_empowerment_bonus(state, transitions, bonus_key):
+        del bonus_key
+        raw = transitions.extras["state_extras"]["max_empowerment"].astype(jnp.float32)
+        bonus = (raw - mean_f) / scale_f
+        metrics = {
+            "max_empowerment_raw_mean": jnp.mean(raw),
+            "max_empowerment_shifted_mean": jnp.mean(bonus),
+        }
+        return bonus, state, metrics
+
+    return max_empowerment_bonus, StatelessBonusState(), None
 
 
 def _create_rnd_bonus(
@@ -1052,15 +1089,39 @@ def _create_icm_bonus(
         intrinsic reward updated on every ``bonus_fn`` call. The training
         path uses the same normalization (read-only on the running stats).
     """
+    import flax.linen as nn
     from .networks import Encoder
 
-    encoder = Encoder(
+    class _PhiNet(nn.Module):
+        """Encoder + output LayerNorm + Tanh, bounding phi(s) to [-1, 1]^d.
+
+        Without this, the encoder is shaped only by the inverse loss
+        (forward loss has stop_gradient on phi(s')), so phi is free to
+        drift to arbitrary magnitudes and the forward error grows
+        unboundedly across training. URLB's icm_apt trunk does the same:
+        Linear -> LayerNorm -> Tanh.
+        """
+        repr_dim: int
+        width: int
+        depth: int
+
+        @nn.compact
+        def __call__(self, x):
+            x = Encoder(
+                repr_dim=self.repr_dim,
+                network_width=self.width,
+                network_depth=self.depth,
+                skip_connections=0,
+                use_relu=True,
+                use_ln=False,
+            )(x)
+            x = nn.LayerNorm()(x)
+            return jnp.tanh(x)
+
+    encoder = _PhiNet(
         repr_dim=feature_dim,
-        network_width=encoder_hidden_dim,
-        network_depth=encoder_num_hidden,
-        skip_connections=0,
-        use_relu=True,
-        use_ln=False,
+        width=encoder_hidden_dim,
+        depth=encoder_num_hidden,
     )
     inverse_net = Encoder(
         repr_dim=action_size,
@@ -1165,7 +1226,7 @@ def _create_icm_bonus(
         phi_t = _encode(params, norm_s)
         phi_tp1 = _encode(params, norm_sp)
         phi_hat_tp1 = _predict_phi_next(params, phi_t, flat_a)
-        sq_err = jnp.sum((phi_hat_tp1 - phi_tp1) ** 2, axis=-1)
+        sq_err = jnp.mean((phi_hat_tp1 - phi_tp1) ** 2, axis=-1)
         raw_bonus_flat = 0.5 * eta_f * sq_err
 
         # Welford reward-stats update *before* using std so the first batch
@@ -1207,7 +1268,7 @@ def _create_icm_bonus(
 
         l_inverse = jnp.mean(jnp.sum((a_hat - actions) ** 2, axis=-1))
         l_forward = 0.5 * jnp.mean(
-            jnp.sum((phi_hat_tp1 - jax.lax.stop_gradient(phi_tp1)) ** 2, axis=-1)
+            (phi_hat_tp1 - jax.lax.stop_gradient(phi_tp1)) ** 2
         )
         loss = (1.0 - beta_f) * l_inverse + beta_f * l_forward
         return loss, (l_inverse, l_forward)
@@ -2033,7 +2094,8 @@ class ExplorationBonuses:
     # online data, so its empowerment estimate on offline-only states is
     # untrustworthy and out-of-distribution — same argument as MISC.
     _ONLINE_ONLY_BONUS_TYPES = frozenset(
-        {"rnd", "misc", "online_empowerment", "online_mine_empowerment", "icm", "eme", "apt"}
+        {"rnd", "misc", "online_empowerment", "online_mine_empowerment", "icm", "eme", "apt",
+         "max_empowerment"}
     )
 
     # Bonus types whose bonus_fn / train_fn require the agent's main actor

@@ -598,10 +598,21 @@ class GoExploreSimple:
         )
 
         # ── Optional offline-empowerment scorer for goal proposer ───────────
+        bonus_types_tuple = tuple(self.exploration_bonus_type or ())
+        has_max_empowerment_bonus = "max_empowerment" in bonus_types_tuple
+        needs_empowerment_scorer = (
+            self.goal_proposer_name in ("empowerment", "empowerment_density_ratio")
+            or "empowerment" in bonus_types_tuple
+            or has_max_empowerment_bonus
+        )
         offline_empowerment_scorer = None
-        if self.goal_proposer_name in ("empowerment", "empowerment_density_ratio"):
+        if needs_empowerment_scorer:
             if self.empowerment_run_dir is None:
-                raise ValueError(f"empowerment_run_dir must be set when goal_proposer_name='{self.goal_proposer_name}'.")
+                raise ValueError(
+                    "empowerment_run_dir must be set when goal_proposer_name or "
+                    f"exploration_bonus_type uses empowerment (got goal_proposer_name="
+                    f"'{self.goal_proposer_name}', exploration_bonus_type={bonus_types_tuple})."
+                )
             key, empowerment_template_key = jax.random.split(key)
             emp_agent, _ex_obs_dim, base_obs_template = load_offline_empowerment_agent(
                 run_dir=self.empowerment_run_dir,
@@ -670,6 +681,7 @@ class GoExploreSimple:
             action_size=action_size,
             agent_type=self.agent_type,
             include_phase=True,
+            include_max_empowerment=has_max_empowerment_bonus,
         )
 
         def jit_wrap(buffer):
@@ -695,6 +707,7 @@ class GoExploreSimple:
             action_size=action_size,
             agent_type=self.agent_type,
             include_phase=True,
+            include_max_empowerment=has_max_empowerment_bonus,
         )
         buffer_state = replay_buffer.insert(buffer_state, dummy_batch_transition)
 
@@ -705,6 +718,7 @@ class GoExploreSimple:
             action_size=action_size,
             agent_type=self.agent_type,
             include_phase=True,
+            include_max_empowerment=has_max_empowerment_bonus,
         )
         goal_proposer_state = GoalProposerState(
             transitions_sample=dummy_goal_proposer_transition,
@@ -725,6 +739,7 @@ class GoExploreSimple:
                 state_size=state_size,
                 agent_type=self.agent_type,
                 include_phase=True,
+                include_max_empowerment=has_max_empowerment_bonus,
             )
 
         # ── Exploration bonus(es) ─────────────────────────────────────────────
@@ -991,9 +1006,32 @@ class GoExploreSimple:
                 )
                 return (env_state, buffer_state, next_k), transition
 
+            rollout_key, scorer_key = jax.random.split(rollout_key)
             (env_state, buffer_state, _), data = jax.lax.scan(
                 f, (env_state, buffer_state, rollout_key), (), length=self.unroll_length
             )
+
+            # When max_empowerment bonus is configured, score every collected
+            # next_observation with the offline empowerment scorer and take a
+            # cumulative max along the unroll-length axis (per env). The
+            # resulting per-step value is stored on the transition so the
+            # bonus_fn just reads it back at training time. Scoring uses
+            # next_observation[..., :state_size] to match the existing offline
+            # ``empowerment`` bonus convention (reward at s_{t+1}).
+            if has_max_empowerment_bonus:
+                batch_shape = data.observation.shape[:2]
+                states = data.next_observation[..., :state_size]
+                flat_states = states.reshape(-1, state_size)
+                raw = offline_empowerment_scorer(flat_states, scorer_key)
+                raw = raw.reshape(batch_shape).astype(jnp.float32)
+                max_emp_field = jax.lax.cummax(raw, axis=0)
+                new_state_extras = {
+                    **data.extras["state_extras"],
+                    "max_empowerment": max_emp_field,
+                }
+                data = data._replace(
+                    extras={**data.extras, "state_extras": new_state_extras}
+                )
             buffer_state = replay_buffer.insert(buffer_state, data)
 
             return env_state, buffer_state, updated_experience_count, updated_goal_proposer_state

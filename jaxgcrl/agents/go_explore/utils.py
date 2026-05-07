@@ -193,6 +193,7 @@ def _dummy_transition(
     action_size: int,
     agent_type: str,
     include_phase: bool,
+    include_max_empowerment: bool = False,
 ) -> Any:
     """Build a zero-filled ``Transition`` with leading shape ``prefix``.
 
@@ -213,6 +214,10 @@ def _dummy_transition(
     }
     if include_phase:
         state_extras["phase"] = jnp.zeros(prefix, dtype=jnp.int32)
+    if include_max_empowerment:
+        state_extras["max_empowerment"] = (
+            jnp.zeros(prefix, dtype=jnp.float32) if prefix else jnp.asarray(0.0)
+        )
     return Transition(
         observation=obs,
         action=action,
@@ -230,10 +235,12 @@ def create_dummy_transition_for_buffer(
     action_size: int,
     agent_type: str = "crl",
     include_phase: bool = False,
+    include_max_empowerment: bool = False,
 ) -> Any:
     """Dummy transition shaped ``(unroll_length, num_envs, ...)`` for buffer inserts."""
     return _dummy_transition(
         (unroll_length, num_envs), obs_size, action_size, agent_type, include_phase,
+        include_max_empowerment=include_max_empowerment,
     )
 
 
@@ -244,10 +251,12 @@ def create_dummy_transition_for_goal_proposer(
     action_size: int,
     agent_type: str = "crl",
     include_phase: bool = False,
+    include_max_empowerment: bool = False,
 ) -> Any:
     """Dummy transition shaped ``(num_envs, episode_length, ...)`` matching ``buffer.sample``."""
     return _dummy_transition(
         (num_envs, episode_length), obs_size, action_size, agent_type, include_phase,
+        include_max_empowerment=include_max_empowerment,
     )
 
 
@@ -256,9 +265,13 @@ def create_single_dummy_transition(
     action_size: int,
     agent_type: str = "crl",
     include_phase: bool = False,
+    include_max_empowerment: bool = False,
 ) -> Any:
     """Scalar dummy transition for replay-buffer initialization."""
-    return _dummy_transition((), obs_size, action_size, agent_type, include_phase)
+    return _dummy_transition(
+        (), obs_size, action_size, agent_type, include_phase,
+        include_max_empowerment=include_max_empowerment,
+    )
 
 
 def sample_trajectory_sequences(
