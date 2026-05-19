@@ -27,6 +27,10 @@ EMP_DIRS=(
 SEEDS=(0 1 2)
 ALPHAS=(1 3 10)
 TEMPS=(0 1 0.3 0.1 0.01)
+# Per-env episode partition (must satisfy episode_length - 1 == gcp + ep).
+EPISODE_LENGTHS=(501 1001)
+NUM_GCP_STEPS=(250 500)
+NUM_EP_STEPS=(250 500)
 
 GLOBAL_IDX=$((OFFSET + SLURM_ARRAY_TASK_ID))
 ENV_IDX=$((GLOBAL_IDX / 48))
@@ -37,6 +41,9 @@ CFG_IDX=$((REM % 16))
 ENV=${ENVS[$ENV_IDX]}
 EMP_DIR=${EMP_DIRS[$ENV_IDX]}
 SEED=${SEEDS[$SEED_IDX]}
+EP_LEN=${EPISODE_LENGTHS[$ENV_IDX]}
+GCP_STEPS=${NUM_GCP_STEPS[$ENV_IDX]}
+EP_STEPS=${NUM_EP_STEPS[$ENV_IDX]}
 
 if [ "$CFG_IDX" -eq 0 ]; then
   PROPOSER_ARGS="--goal_proposer_name mega"
@@ -59,7 +66,10 @@ echo "GLOBAL_IDX=$GLOBAL_IDX  ENV=$ENV  SEED=$SEED  CFG_IDX=$CFG_IDX  EXP=$EXP_N
 python run.py go-explore-simple \
         --env $ENV \
         --total_env_steps 80000000 \
-        --episode_length 801 \
+        --episode_length $EP_LEN \
+        --num_gcp_steps $GCP_STEPS \
+        --num_ep_steps $EP_STEPS \
+        --n_critics 1 \
         --seed $SEED \
         $PROPOSER_ARGS \
         --exp_name $EXP_NAME \
