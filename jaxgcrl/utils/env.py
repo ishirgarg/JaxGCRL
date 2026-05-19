@@ -69,6 +69,7 @@ legal_envs = (
     "ant_ball_4d_ogbench_small_easy_square",
     "ant_ball_4d_ogbench_small_easy_square_stitch",
     "ant_ball_4d_ogbench_small_easy_square_1g",
+    "ant_ball_4d_ogbench_small_square_1g_stitch",
     "ant_ball_4d_ogbench_small_square_1g",
     "ant_ball_4d_ogbench_arena",
     "ant_ball_ogbench_arena_stitch",

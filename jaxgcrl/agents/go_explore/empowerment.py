@@ -346,15 +346,24 @@ def make_offline_empowerment_scorer(
     obs_builder: Callable[[jnp.ndarray], jnp.ndarray],
     *,
     chunk_size: int = 32,
+    mean: float = 0.0,
+    scale: float = 1.0,
 ) -> Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Returns scorer(states, rng) -> empowerment score per state row.
 
     Runs ``emp_agent.empowerment`` on batches of at most ``chunk_size`` rows so peak
     activation memory scales with ``chunk_size`` instead of ``states.shape[0]`` (e.g. all
     ``num_candidates`` at once). Uses ``lax.fori_loop`` so the trace stays JIT-friendly.
+
+    When ``mean``/``scale`` differ from the defaults, the returned scorer emits
+    ``(raw_empowerment - mean) / scale``, giving callers a single source of truth
+    for the normalization rather than reapplying it at every site.
     """
     if chunk_size < 1:
         raise ValueError("chunk_size must be >= 1.")
+
+    mean_f = jnp.asarray(mean, dtype=jnp.float32)
+    scale_f = jnp.asarray(scale, dtype=jnp.float32)
 
     def _score(states: jnp.ndarray, rng: jnp.ndarray) -> jnp.ndarray:
         n = states.shape[0]
@@ -375,6 +384,6 @@ def make_offline_empowerment_scorer(
             return jax.lax.dynamic_update_slice(acc, s, (i * chunk_size,))
 
         acc = jax.lax.fori_loop(0, n_chunks, body, acc0)
-        return acc[:n]
+        return (acc[:n] - mean_f) / scale_f
 
     return _score

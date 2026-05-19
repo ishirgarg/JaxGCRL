@@ -284,6 +284,7 @@ class GoExploreSimple:
     goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega", "empowerment", "empowerment_density_ratio"] = "random_env_goals"
     num_candidates: int = 512
     goal_proposer_temperature: float = 0.0
+    empowerment_alpha: float = 1.0
     empowerment_run_dir: Optional[str] = None
     empowerment_epoch: Optional[int] = None
     empowerment_num_splus_samples: int = 12
@@ -447,6 +448,7 @@ class GoExploreSimple:
     num_ep_steps: int = 250        # steps in explore phase before reset to go
     deterministic_go_phase: bool = False  # if True, go phase uses policy mode
     eps_random_action: float = 0.1        # probability of uniform random action in explore phase
+    reset_on_explore_goal_reached: bool = True  # if False, explore phase runs to completion regardless of goal reach
 
     def check_config(self, config):
         assert config.episode_length - 1 == self.num_gcp_steps + self.num_ep_steps, (
@@ -492,6 +494,7 @@ class GoExploreSimple:
             state_size=state_size,
             goal_size=goal_size,
             goal_indices=unwrapped_env.goal_indices,
+            reset_on_explore_goal_reached=self.reset_on_explore_goal_reached,
         )
 
         # ── Step count bookkeeping ────────────────────────────────────────────
@@ -643,6 +646,8 @@ class GoExploreSimple:
                 emp_agent,
                 obs_builder,
                 chunk_size=self.empowerment_score_chunk_size,
+                mean=self.empowerment_bonus_mean,
+                scale=self.empowerment_bonus_scale,
             )
 
         # ── Goal proposer ────────────────────────────────────────────────────
@@ -658,6 +663,7 @@ class GoExploreSimple:
             discounting=self.discounting,
             offline_empowerment_scorer=offline_empowerment_scorer,
             goal_proposer_temperature=self.goal_proposer_temperature,
+            empowerment_alpha=self.empowerment_alpha,
         )
 
         # ── Env reset ────────────────────────────────────────────────────────
@@ -758,8 +764,11 @@ class GoExploreSimple:
             empowerment_epoch=self.empowerment_epoch,
             empowerment_num_splus_samples=self.empowerment_num_splus_samples,
             empowerment_score_chunk_size=self.empowerment_score_chunk_size,
-            empowerment_mean=self.empowerment_bonus_mean,
-            empowerment_scale=self.empowerment_bonus_scale,
+            # Normalization is baked into ``offline_empowerment_scorer`` above
+            # via mean=self.empowerment_bonus_mean, scale=self.empowerment_bonus_scale,
+            # so the bonus path emits the scorer output unchanged.
+            empowerment_mean=0.0,
+            empowerment_scale=1.0,
             empowerment_precomputed_scorer=offline_empowerment_scorer,
             empowerment_use_full_obs=self.use_full_empowerment,
             rnd_feature_dim=self.rnd_feature_dim,

@@ -519,6 +519,8 @@ class CRL:
             offline_empowerment_scorer = make_offline_empowerment_scorer(
                 emp_agent, obs_builder,
                 chunk_size=self.empowerment_score_chunk_size,
+                mean=self.empowerment_bonus_mean,
+                scale=self.empowerment_bonus_scale,
             )
 
         if use_exploration_q:
@@ -558,8 +560,11 @@ class CRL:
                 empowerment_epoch=self.empowerment_epoch,
                 empowerment_num_splus_samples=self.empowerment_num_splus_samples,
                 empowerment_score_chunk_size=self.empowerment_score_chunk_size,
-                empowerment_mean=self.empowerment_bonus_mean,
-                empowerment_scale=self.empowerment_bonus_scale,
+                # Normalization is baked into ``offline_empowerment_scorer`` above
+                # via mean=self.empowerment_bonus_mean, scale=self.empowerment_bonus_scale,
+                # so the bonus path emits the scorer output unchanged.
+                empowerment_mean=0.0,
+                empowerment_scale=1.0,
                 empowerment_precomputed_scorer=offline_empowerment_scorer,
                 empowerment_use_full_obs=self.use_full_empowerment,
                 rnd_feature_dim=self.rnd_feature_dim,

@@ -247,7 +247,8 @@ class GoExploreWrapper(Wrapper):
     """
 
     def __init__(self, env: Env, num_gcp_steps: int, num_ep_steps: int,
-                 state_size: int, goal_size: int, goal_indices=None):
+                 state_size: int, goal_size: int, goal_indices=None,
+                 reset_on_explore_goal_reached: bool = True):
         super().__init__(env)
         self.num_gcp_steps = num_gcp_steps
         self.num_ep_steps = num_ep_steps
@@ -256,6 +257,7 @@ class GoExploreWrapper(Wrapper):
         # Indices into the state portion of obs that select the (x, y) position
         # used as the ant's start position (passed to env.reset(start=...)).
         self.goal_indices = goal_indices
+        self.reset_on_explore_goal_reached = reset_on_explore_goal_reached
 
     # ------------------------------------------------------------------
     # reset
@@ -319,7 +321,8 @@ class GoExploreWrapper(Wrapper):
         # Bug 3 fix: ep_done takes priority — mask it out of go→explore so a
         # simultaneous episode termination always routes through should_reset (go phase).
         should_go_to_explore = in_go & (goal_reached | ((phase_step + 1) >= self.num_gcp_steps)) & ~ep_done
-        should_explore_to_go = in_explore & (goal_reached | ((phase_step + 1) >= self.num_ep_steps))
+        explore_goal_trigger = goal_reached if self.reset_on_explore_goal_reached else jnp.zeros_like(goal_reached)
+        should_explore_to_go = in_explore & (explore_goal_trigger | ((phase_step + 1) >= self.num_ep_steps))
 
         # Any condition that resets to the go-phase start state
         should_reset = should_explore_to_go | ep_done

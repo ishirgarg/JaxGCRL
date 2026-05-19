@@ -23,6 +23,7 @@ def create_goal_proposer(
     discounting: float=0.99,
     offline_empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
     goal_proposer_temperature: float = 0.0,
+    empowerment_alpha: float = 1.0,
 ) -> Callable:
     """
     Factory function to create a goal proposer function.
@@ -88,6 +89,7 @@ def create_goal_proposer(
             goal_indices,
             offline_empowerment_scorer,
             temperature=goal_proposer_temperature,
+            alpha=empowerment_alpha,
         )
     elif goal_proposer_name == "empowerment_density_ratio":
         return create_empowerment_density_ratio_goal_proposer(
@@ -475,22 +477,25 @@ def create_empowerment_goal_proposer(
     goal_indices: Optional[tuple] = None,
     offline_empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
     temperature: float = 0.0,
+    alpha: float = 1.0,
     kde_bandwidth: float = 0.1,
     kde_eps: float = 1e-8,
 ) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
-    """Replay-buffer candidates scored by offline empowerment minus KDE log-density (MEGA-style).
+    """Replay-buffer candidates scored by ``alpha * empowerment - log_density`` (MEGA-style).
 
-    Selection: ``softmax((empowerment - log_density) / T)`` when ``T > 0``, else
-    ``argmax(empowerment - log_density)``.
+    Selection: ``softmax((alpha * empowerment - log_density) / T)`` when ``T > 0``,
+    else ``argmax(alpha * empowerment - log_density)`` (greedy when ``T == 0``).
     """
     if offline_empowerment_scorer is None:
         raise ValueError("offline_empowerment_scorer must be provided for empowerment proposer.")
 
     goal_idx_array = jnp.array(goal_indices)
+    alpha_f = jnp.asarray(alpha, dtype=jnp.float32)
 
     def propose_goal(rng: jax.Array, start_obs: jnp.ndarray, goal_proposer_state: GoalProposerState):
         transitions_sample = goal_proposer_state.transitions_sample
         obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
+        # Slice off the appended goal-conditioning so density / empowerment see state only.
         states = obs_flat[:, :state_size]  # (N, state_size)
         all_goals = states[:, goal_idx_array]  # (N_buf, goal_dim) — same KDE reference as MEGA
 
@@ -504,7 +509,7 @@ def create_empowerment_goal_proposer(
         log_density = jnp.log(densities + kde_eps)
 
         emp_scores = offline_empowerment_scorer(candidate_states, emp_rng)  # (num_candidates,)
-        logits = emp_scores - log_density
+        logits = alpha_f * emp_scores - log_density
         best_idx = _sample_idx_from_temperature_logits(select_rng, logits, temperature)
         selected_state = candidate_states[best_idx]
         selected_goal = selected_state[goal_idx_array]

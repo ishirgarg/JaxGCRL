@@ -61,7 +61,7 @@ OGBENCH_ARENA = [
 OGBENCH_MEDIUM_NAVIGATE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
     [1, R, G, 1, 1, G, G, 1],
-    [1, R, G, 1, G, G, G, 1],
+    [1, G, G, 1, G, G, G, 1],
     [1, 1, G, G, G, 1, 1, 1],
     [1, G, G, 1, G, G, G, 1],
     [1, G, 1, G, G, 1, G, 1],

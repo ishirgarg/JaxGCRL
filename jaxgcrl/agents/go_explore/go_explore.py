@@ -117,6 +117,9 @@ class GoExplore:
     empowerment_epoch: Optional[int] = None
     empowerment_num_splus_samples: int = 128
     empowerment_score_chunk_size: int = 32
+    empowerment_alpha: float = 1.0
+    empowerment_mean: float = 0.0
+    empowerment_scale: float = 1.0
     # If True, feed the full state (obs with goal sliced off) to the
     # empowerment network instead of overwriting a few indices of a cached
     # OGBench template. Requires state_size == checkpoint ex_obs_dim.
@@ -314,6 +317,8 @@ class GoExplore:
                 emp_agent,
                 obs_builder,
                 chunk_size=self.empowerment_score_chunk_size,
+                mean=self.empowerment_mean,
+                scale=self.empowerment_scale,
             )
 
         # ── Goal proposer ────────────────────────────────────────────────────
@@ -329,6 +334,7 @@ class GoExplore:
             discounting=self.discounting,
             offline_empowerment_scorer=offline_empowerment_scorer,
             goal_proposer_temperature=self.goal_proposer_temperature,
+            empowerment_alpha=self.empowerment_alpha,
         )
         
         # ── Explore reward factory ───────────────────────────────────────────
