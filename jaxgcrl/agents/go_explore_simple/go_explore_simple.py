@@ -447,8 +447,8 @@ class GoExploreSimple:
     num_gcp_steps: int = 250      # max steps in go phase before forcing explore
     num_ep_steps: int = 250        # steps in explore phase before reset to go
     deterministic_go_phase: bool = False  # if True, go phase uses policy mode
-    eps_random_action: float = 0.1        # probability of uniform random action in explore phase
-    reset_on_explore_goal_reached: bool = True  # if False, explore phase runs to completion regardless of goal reach
+    eps_random_action: float = 0.2        # probability of uniform random action in explore phase
+    reset_on_explore_goal_reached: bool = False  # if False, explore phase runs to completion regardless of goal reach
 
     def check_config(self, config):
         assert config.episode_length - 1 == self.num_gcp_steps + self.num_ep_steps, (
