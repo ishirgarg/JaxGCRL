@@ -863,7 +863,7 @@ class GoExplore:
             logging.info("step: %d", current_step)
 
             # Visualize trajectories every 1M steps
-            if current_step // 1_000_000 > last_visualization_step // 1_000_000:
+            if current_step // 2_000_000 > last_visualization_step // 2_000_000:
                 key, viz_key = jax.random.split(key)
                 buffer_state = all_visualizations(
                     replay_buffer=replay_buffer,

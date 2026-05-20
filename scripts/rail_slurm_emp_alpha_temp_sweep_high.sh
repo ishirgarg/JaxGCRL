@@ -80,6 +80,7 @@ python run.py go-explore-simple \
         --num_gcp_steps $GCP_STEPS \
         --num_ep_steps $EP_STEPS \
         --n_critics 1 \
+        --no_use_rlpd \
         --seed $SEED \
         $PROPOSER_ARGS \
         --exp_name $EXP_NAME \

@@ -540,7 +540,7 @@ def handle_goal_proposer_visualization(
     
     # For go_explore: only visualize if env_steps is provided and it's been >= 1M steps since last viz
     if env_steps >= 0:
-        if _last_viz_env_steps >= 0 and (env_steps - _last_viz_env_steps) < 1_000_000:
+        if _last_viz_env_steps >= 0 and (env_steps - _last_viz_env_steps) < 2_000_000:
             return
         _last_viz_env_steps = env_steps
 
