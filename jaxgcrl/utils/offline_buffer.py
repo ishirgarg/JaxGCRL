@@ -121,7 +121,6 @@ class OfflineTrajectoryBuffer:
         state_size: int,
         agent_type: str = "crl",
         include_phase: bool = False,
-        include_max_empowerment: bool = False,
     ):
         # Goal dim is whatever remains after the env's true state_size. For the
         # default 2D-goal envs this is 2; for ant_ball_4d_ogbench it is 4.
@@ -202,8 +201,6 @@ class OfflineTrajectoryBuffer:
         }
         if include_phase:
             state_extras["phase"] = jnp.zeros((), dtype=jnp.int32)
-        if include_max_empowerment:
-            state_extras["max_empowerment"] = jnp.float32(0.0)
         dummy_transition = Transition(
             observation=jnp.zeros(obs_size),
             action=jnp.zeros(action_size),
@@ -226,10 +223,6 @@ class OfflineTrajectoryBuffer:
         }
         if include_phase:
             slot_state_extras["phase"] = jnp.array(phase_arr)
-        if include_max_empowerment:
-            slot_state_extras["max_empowerment"] = jnp.zeros_like(
-                jnp.array(slot_truncation), dtype=jnp.float32
-            )
 
         slot_transitions = Transition(
             observation=jnp.array(slot_obs),
@@ -300,7 +293,6 @@ def load_and_prepare_offline_buffer(
     state_size: int,
     agent_type: str = "crl",
     include_phase: bool = False,
-    include_max_empowerment: bool = False,
 ) -> OfflineTrajectoryBuffer:
     """Load OGBench data and create an offline trajectory buffer.
 
@@ -353,5 +345,4 @@ def load_and_prepare_offline_buffer(
         state_size=state_size,
         agent_type=agent_type,
         include_phase=include_phase,
-        include_max_empowerment=include_max_empowerment,
     )

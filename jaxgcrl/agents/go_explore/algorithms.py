@@ -473,27 +473,6 @@ def get_explore_policy(explore_policy_type: str, action_size: int, state_size: i
         raise ValueError(f"Unknown explore_policy_type: {explore_policy_type}")
 
 
-def get_exploration_q_critic(obs_size: int, action_size: int,
-                             h_dim: int = 256, n_hidden: int = 4,
-                             use_relu: bool = False, use_ln: bool = True,
-                             n_critics: int = 2) -> "SACCritic":
-    """Q-critic trained on the exploration bonus only.
-
-    Same shape as the main SAC critic (takes full [state, goal] obs) so
-    ``update_critic_sac`` can be reused verbatim; the exploration bonus does
-    not depend on the goal, so the critic learns to ignore the goal dims.
-    """
-    return SACCritic(
-        obs_size=obs_size,
-        action_size=action_size,
-        network_width=h_dim,
-        network_depth=n_hidden,
-        use_relu=use_relu,
-        use_ln=use_ln,
-        n_critics=n_critics,
-    )
-
-
 def get_algorithm(agent_type: str, **kwargs):
     """Factory function to get algorithm components."""
     if agent_type == "crl":

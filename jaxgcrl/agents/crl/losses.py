@@ -3,25 +3,6 @@ import jax
 import jax.numpy as jnp
 
 
-def flatten_q_ensemble_params(critic_states):
-    """Flatten per-critic TrainStates into the ``critic_{i}_{layer}`` layout
-    expected by the SAC-style ``QNetwork`` ensemble used for the exploration Q.
-    """
-    return {
-        f"critic_{i}_{lname}": lparams
-        for i, cs in enumerate(critic_states)
-        for lname, lparams in cs.params.items()
-    }
-
-
-def soft_update_q_ensemble_target(target_params, critic_states, tau: float):
-    """Polyak-average the exploration-Q target params toward the current ensemble."""
-    live = flatten_q_ensemble_params(critic_states)
-    return jax.tree_util.tree_map(
-        lambda x, y: x * (1 - tau) + y * tau, target_params, live,
-    )
-
-
 def energy_fn(name, x, y):
     if name == "norm":
         return -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1) + 1e-6)
@@ -52,23 +33,8 @@ def contrastive_loss_fn(name, logits):
 
 
 def update_actor_and_alpha(config, networks, transitions, training_state, key):
-    """CRL actor + alpha update.
-
-    If ``networks["exploration_q_critic"]`` is provided and the training state
-    has ``exploration_q_critic_states`` set, the actor loss also subtracts
-    ``min_i Q_exp_i(obs, action)`` so the policy is biased toward actions with
-    high exploration Q. The exploration Q is trained on the *weighted* bonus,
-    so per-bonus weights are already baked in.
-    """
-    exploration_q_critic = networks.get("exploration_q_critic")
-    exploration_q_states = getattr(
-        training_state, "exploration_q_critic_states", None,
-    )
-    use_exploration_q = (
-        exploration_q_critic is not None and exploration_q_states is not None
-    )
-
-    def actor_loss(actor_params, critic_params, log_alpha, exp_q_params, transitions, key):
+    """CRL actor + alpha update."""
+    def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
         obs = transitions.observation  # expected_shape = self.batch_size, obs_size + goal_size
         state = obs[:, : config["state_size"]]
         future_state = transitions.extras["future_state"]
@@ -94,11 +60,6 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
 
         actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - qf_pi)
 
-        if use_exploration_q:
-            exp_q_values = exploration_q_critic.apply(exp_q_params, observation, action)
-            exp_q = jnp.min(exp_q_values, axis=-1)
-            actor_loss = actor_loss - jnp.mean(exp_q)
-
         return actor_loss, log_prob
 
     def alpha_loss(alpha_params, log_prob):
@@ -106,17 +67,10 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
         alpha_loss = alpha * jnp.mean(jax.lax.stop_gradient(-log_prob - config["target_entropy"]))
         return jnp.mean(alpha_loss)
 
-    exp_q_full_params = None
-    if use_exploration_q:
-        exp_q_full_params = jax.lax.stop_gradient(
-            flatten_q_ensemble_params(exploration_q_states)
-        )
-
     (actor_loss, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
         training_state.actor_state.params,
         training_state.critic_state.params,
         training_state.alpha_state.params["log_alpha"],
-        exp_q_full_params,
         transitions,
         key,
     )
@@ -182,64 +136,3 @@ def update_critic(config, networks, transitions, training_state, key):
     }
 
     return training_state, metrics
-
-
-def update_exploration_q_critic(
-    config, networks, transitions, exploration_reward, training_state, key,
-):
-    """SAC-style Bellman backup of an exploration Q-critic on the bonus reward.
-
-    ``exploration_reward`` is the per-transition weighted bonus (per-bonus
-    weight already applied) and replaces the env reward inside the Bellman
-    target. The CRL contrastive critic and CRL actor never read reward, so
-    overwriting reward here is purely scoped to this call.
-    """
-    actor = networks["actor"]
-    exploration_q_critic = networks["exploration_q_critic"]
-
-    obs = transitions.observation
-    next_obs = transitions.next_observation
-    actions = transitions.action
-    discounts = transitions.discount
-
-    next_means, next_log_stds = actor.apply(
-        training_state.actor_state.params, next_obs,
-    )
-    next_stds = jnp.exp(next_log_stds)
-    key, noise_key = jax.random.split(key)
-    next_x_ts = next_means + next_stds * jax.random.normal(
-        noise_key, shape=next_means.shape, dtype=next_means.dtype,
-    )
-    next_actions = nn.tanh(next_x_ts)
-
-    target_q_values = exploration_q_critic.apply(
-        training_state.exploration_q_target_critic_params, next_obs, next_actions,
-    )
-    target_q_value = jnp.min(target_q_values, axis=-1, keepdims=True)
-    target = exploration_reward[:, None] + config["discounting"] * discounts[:, None] * target_q_value
-
-    critic_states = training_state.exploration_q_critic_states
-    critic_params_tuple = tuple(cs.params for cs in critic_states)
-
-    def all_critics_loss(params_tuple):
-        full_params = {
-            f"critic_{i}_{lname}": lparams
-            for i, p in enumerate(params_tuple)
-            for lname, lparams in p.items()
-        }
-        q_values = exploration_q_critic.apply(full_params, obs, actions)
-        sq_err = (q_values - target) ** 2
-        per_critic_loss = jnp.mean(sq_err, axis=0)
-        return jnp.sum(per_critic_loss), per_critic_loss
-
-    (_, per_critic_loss), grads_tuple = jax.value_and_grad(
-        all_critics_loss, has_aux=True,
-    )(critic_params_tuple)
-
-    new_critic_states = tuple(
-        cs.apply_gradients(grads=g) for cs, g in zip(critic_states, grads_tuple)
-    )
-    training_state = training_state.replace(
-        exploration_q_critic_states=new_critic_states,
-    )
-    return training_state, {"exploration_q_critic_loss": jnp.mean(per_critic_loss)}

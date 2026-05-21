@@ -67,10 +67,6 @@ class TrainingState:
     explore_critic_states: Optional[Tuple[TrainState, ...]] = None
     explore_alpha_state: Optional[TrainState] = None
     explore_target_critic_params: Optional[Any] = None
-    # Exploration Q-critic (CRL + exploration bonus): SAC-style Bellman backup
-    # on the exploration bonus only; its Q is added to the CRL actor loss.
-    exploration_q_critic_states: Optional[Tuple[TrainState, ...]] = None
-    exploration_q_target_critic_params: Optional[Any] = None
 
 
 class Transition(NamedTuple):

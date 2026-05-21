@@ -630,39 +630,6 @@ def handle_goal_proposer_visualization(
     # Add more goal proposer visualizations here as needed
 
 
-def visualize_exploration_q_xy(
-    xs: np.ndarray,
-    ys: np.ndarray,
-    q_values: np.ndarray,
-    x_bounds: np.ndarray,
-    y_bounds: np.ndarray,
-    current_step: int,
-) -> None:
-    """Scatter min-over-ensemble Q_exp per buffer-sampled transition over xy.
-
-    ``xs``/``ys`` are the transitions' first two goal_indices columns, and
-    ``q_values`` is the corresponding min-over-ensemble ``Q_exp(obs, action)``;
-    all three arrays share shape ``(N,)``. Logged to wandb as
-    ``viz/exploration_q_xy`` keyed on ``current_step``.
-    """
-    xs = np.asarray(xs).reshape(-1)
-    ys = np.asarray(ys).reshape(-1)
-    q_values = np.asarray(q_values).reshape(-1)
-
-    fig, ax = plt.subplots(figsize=(5, 5))
-    sc = ax.scatter(xs, ys, c=q_values, cmap="viridis", s=8, linewidths=0)
-    ax.set_xlim(float(x_bounds[0]), float(x_bounds[1]))
-    ax.set_ylim(float(y_bounds[0]), float(y_bounds[1]))
-    ax.set_aspect("equal")
-    fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label="min Q_exp")
-    ax.set_xlabel("x (goal idx 0)")
-    ax.set_ylabel("y (goal idx 1)")
-    ax.set_title(f"Exploration Q over sampled states  step={current_step}")
-    fig.tight_layout()
-    wandb.log({"viz/exploration_q_xy": wandb.Image(fig)}, step=current_step)
-    plt.close(fig)
-
-
 def visualize_empowerment_candidates(
     candidate_goals: np.ndarray,
     first_obs_position: np.ndarray,

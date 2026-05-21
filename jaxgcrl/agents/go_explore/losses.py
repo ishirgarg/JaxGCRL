@@ -70,23 +70,8 @@ def contrastive_loss_fn(name, logits):
 
 def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
                            transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
-    """CRL actor and alpha update.
-
-    If ``networks["exploration_q_critic"]`` is provided and the training state
-    has ``exploration_q_critic_states`` set, the actor loss also includes
-    ``- min_i Q_exp_i(state, action)`` so the policy is biased toward actions
-    with high exploration Q. Q_exp is trained on the *weighted* exploration
-    bonus, so the per-bonus weight is already baked in and no additional
-    scaling is applied here.
-    """
-    exploration_q_critic = networks.get("exploration_q_critic")
-    exploration_q_states = training_state.exploration_q_critic_states
-    use_exploration_q = (
-        exploration_q_critic is not None
-        and exploration_q_states is not None
-    )
-
-    def actor_loss(actor_params, critic_params, log_alpha, exp_q_params, transitions, key):
+    """CRL actor and alpha update."""
+    def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
         obs = transitions.observation  # expected_shape = self.batch_size, obs_size + goal_size
         state = obs[:, : config["state_size"]]
         future_state = transitions.extras["future_state"]
@@ -114,14 +99,6 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
 
         actor_loss_val = jnp.mean(jnp.exp(log_alpha) * log_prob - qf_pi)
 
-        # Optional: bias actor toward high exploration Q using a non-goal-
-        # conditioned Q_exp(state, action). The exploration Q is trained with a
-        # SAC-style Bellman backup on the exploration bonus only (no env reward).
-        if use_exploration_q:
-            exp_q_values = exploration_q_critic.apply(exp_q_params, obs_with_goal, action)
-            exp_q = jnp.min(exp_q_values, axis=-1)  # min over ensemble for stability
-            actor_loss_val = actor_loss_val - jnp.mean(exp_q)
-
         return actor_loss_val, log_prob
 
     def alpha_loss(alpha_params, log_prob):
@@ -131,17 +108,10 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
 
     full_critic_params = flatten_crl_critic_params(training_state.critic_states)
 
-    exp_q_full_params = None
-    if use_exploration_q:
-        exp_q_full_params = jax.lax.stop_gradient(
-            flatten_sac_critic_params(exploration_q_states)
-        )
-
     (actor_loss_val, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
         training_state.actor_state.params,
         full_critic_params,
         training_state.alpha_state.params["log_alpha"],
-        exp_q_full_params,
         transitions,
         key,
     )
@@ -244,42 +214,6 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
     }
 
     return training_state, metrics
-
-
-def update_exploration_q_critic(
-    config: Dict[str, Any],
-    networks: Dict[str, Any],
-    transitions: Transition,
-    training_state: TrainingState,
-    key: jnp.ndarray,
-):
-    """SAC-style Bellman backup on the exploration bonus only (no entropy term).
-
-    Reuses ``update_critic_sac`` with a shim training-state whose
-    ``critic_states`` / ``target_critic_params`` point at the exploration Q
-    fields and whose ``alpha_state`` is ``None`` so ``alpha = 0`` zeroes the
-    entropy term. ``transitions.reward`` must already hold the weighted
-    per-transition exploration bonus (per-bonus weight baked in) — for CRL
-    this is safe because the contrastive critic/actor never read reward, so
-    the caller overwrites it with the bonus.
-    """
-    shim_ts = training_state.replace(
-        critic_states=training_state.exploration_q_critic_states,
-        target_critic_params=training_state.exploration_q_target_critic_params,
-        alpha_state=None,  # alpha=0 in update_critic_sac -> plain Bellman
-    )
-    shim_networks = {**networks, "critic": networks["exploration_q_critic"]}
-    # Use min over ensemble regardless of main critic's mean/min preference.
-    shim_config = {**config, "use_sac_critic_mean": False}
-
-    new_shim_ts, sac_metrics = update_critic_sac(
-        shim_config, shim_networks, transitions, shim_ts, key
-    )
-
-    training_state = training_state.replace(
-        exploration_q_critic_states=new_shim_ts.critic_states,
-    )
-    return training_state, {f"exploration_q_{k}": v for k, v in sac_metrics.items()}
 
 
 def update_alpha_sac(config: Dict[str, Any], networks: Dict[str, Any],
