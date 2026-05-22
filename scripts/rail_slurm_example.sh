@@ -8,8 +8,6 @@
 #SBATCH --time=120:00:00
 #SBATCH --array=0-4
 
-export WANDB_API_KEY='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'
-
 EMP_DIR_BALL="--empowerment_run_dir /global/home/users/ishirgarg/ogbench/impls/ckpts/antsoccer/sd000_s_33708849.0.20260423_043239"
 EMP_DIR_MAZE="--empowerment_run_dir /global/home/users/ishirgarg/ogbench/impls/ckpts/antmaze/sd000_s_33711690.0.20260423_095122"
 

@@ -22,8 +22,6 @@
 #   A_IDX = E_IDX / 5                    (0..2) → alpha
 #   T_IDX = E_IDX % 5                    (0..4) → temperature
 
-export WANDB_API_KEY='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'
-
 OFFSET=0
 
 ENVS=(
