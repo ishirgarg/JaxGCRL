@@ -22,6 +22,10 @@
 #   A_IDX = E_IDX / 5                    (0..2) → alpha
 #   T_IDX = E_IDX % 5                    (0..4) → temperature
 
+# Local wandb run data goes to BRC scratch (home quota is small).
+export WANDB_DIR=/global/scratch/users/ishirgarg/jaxgcrl
+mkdir -p "$WANDB_DIR"
+
 OFFSET=0
 
 ENVS=(

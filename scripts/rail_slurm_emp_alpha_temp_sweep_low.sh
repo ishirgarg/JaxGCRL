@@ -12,7 +12,9 @@
 # Companion scripts cover slices 0..47 (high) and 48..71 (normal).
 # See rail_slurm_emp_alpha_temp_sweep_high.sh for the index decoding.
 
-export WANDB_API_KEY='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'
+# Local wandb run data goes to BRC scratch (home quota is small).
+export WANDB_DIR=/global/scratch/users/ishirgarg/jaxgcrl
+mkdir -p "$WANDB_DIR"
 
 OFFSET=72
 
