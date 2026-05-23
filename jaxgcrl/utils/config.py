@@ -79,6 +79,9 @@ class RunConfig:
     max_devices_per_host: int = 1
     cuda: bool = True
 
+    # if True, skip writing per-run artifacts (runs/<exp>/args.pkl, final ckpt)
+    no_save: bool = True
+
 
 @dataclass
 class Config:

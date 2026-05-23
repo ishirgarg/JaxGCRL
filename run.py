@@ -61,13 +61,14 @@ def main(config: Config):
     else:
         eval_env = env
 
-    os.makedirs("./runs", exist_ok=True)
     run_dir = f"./runs/run_{config.run.exp_name}_s_{config.run.seed}"
     ckpt_dir = run_dir + "/ckpt"
-    os.makedirs(run_dir, exist_ok=True)
-    os.makedirs(ckpt_dir, exist_ok=True)
-    with open(run_dir + "/args.pkl", "wb") as f:
-        pickle.dump(vars(config), f)
+    if not config.run.no_save:
+        os.makedirs("./runs", exist_ok=True)
+        os.makedirs(run_dir, exist_ok=True)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        with open(run_dir + "/args.pkl", "wb") as f:
+            pickle.dump(vars(config), f)
 
     metrics_to_collect = [
         "eval/episode_dist",
@@ -126,7 +127,8 @@ def main(config: Config):
         config=config.run,
         progress_fn=metrics_recorder.progress,
     )
-    model.save_params(ckpt_dir + "/final", params)
+    if not config.run.no_save:
+        model.save_params(ckpt_dir + "/final", params)
 
 
 def cli():
