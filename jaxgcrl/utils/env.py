@@ -81,6 +81,7 @@ legal_envs = (
     "ant_maze_ogbench_medium_navigate",
     "ant_maze_ogbench_medium_explore",
     "ant_maze_ogbench_medium_1g",
+    "ant_maze_ogbench_u",
     "pointmaze_ogbench_teleport",
     "ant_u_maze",
     "ant_u_maze_hard",

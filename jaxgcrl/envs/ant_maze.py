@@ -200,6 +200,7 @@ OGBENCH_MAZE_LAYOUTS = {
     "maze_ogbench_arena",
     "maze_ogbench_medium_navigate",
     "maze_ogbench_medium_1g",
+    "maze_ogbench_u",
 }
 
 
@@ -221,6 +222,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
         maze_layout = OGBENCH_MEDIUM_NAVIGATE
     elif maze_layout_name == "maze_ogbench_medium_1g":
         maze_layout = OGBENCH_MEDIUM_1G
+    elif maze_layout_name == "maze_ogbench_u":
+        maze_layout = U_MAZE
     elif maze_layout_name == "big_maze":
         maze_layout = BIG_MAZE
     elif maze_layout_name == "big_maze_hard":
@@ -316,6 +319,8 @@ class AntMaze(PipelineEnv):
             maze_layout = OGBENCH_MEDIUM_NAVIGATE
         elif maze_layout_name == "maze_ogbench_medium_1g":
             maze_layout = OGBENCH_MEDIUM_1G
+        elif maze_layout_name == "maze_ogbench_u":
+            maze_layout = U_MAZE
         elif maze_layout_name == "big_maze":
             maze_layout = BIG_MAZE
         elif maze_layout_name == "big_maze_hard":
