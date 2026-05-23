@@ -331,6 +331,8 @@ class MetricsRecorder:
 
     def log_csv(self):
         run_dir = wandb.run.dir if wandb.run is not None else self.exp_dir
+        if run_dir is None:
+            return
         if self._csv_path is None:
             self._csv_path = os.path.join(run_dir, "metrics.csv")
             self._csv_columns = ["step"] + list(self.metrics_to_collect)
@@ -451,8 +453,9 @@ def render(make_policy, params, env, exp_dir, exp_name, num_steps):
             state = jit_env_reset(rng=subkey)
 
     url = html.render(env.sys.tree_replace({"opt.timestep": env.dt}), rollout, height=1024)
-    with open(os.path.join(exp_dir, f"{exp_name}_{num_steps}.html"), "w") as file:
-        file.write(url)
+    if exp_dir is not None:
+        with open(os.path.join(exp_dir, f"{exp_name}_{num_steps}.html"), "w") as file:
+            file.write(url)
     wandb.log({"render": wandb.Html(url)}, step=int(num_steps))
 
 
