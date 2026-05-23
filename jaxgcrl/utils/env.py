@@ -128,7 +128,7 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         # cell, ball spawns anywhere on the open medium maze, and the goal is
         # any open cell except the reset square. 4D goal = (ant_xy, ball_xy).
         env = AntBallOGBench(
-            backend=backend or "spring",
+            backend=backend or "mjx",
             maze_layout_name="medium_stitch",
             add_ant_to_goal=True,
         )
@@ -139,7 +139,7 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         if layout.endswith("_stitch"):
             layout = layout[: -len("_stitch")]
         env = AntBallOGBench(
-            backend=backend or "spring",
+            backend=backend or "mjx",
             maze_layout_name=layout,
             add_ant_to_goal=True,
         )
@@ -149,7 +149,7 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         # mirrors OGBench's antsoccer-arena tasks: 5 paired (agent, ball,
         # goal) tuples and ball-only success).
         layout = env_name[len("ant_ball_ogbench_"):]
-        env = AntBallOGBench(backend=backend or "spring", maze_layout_name=layout)
+        env = AntBallOGBench(backend=backend or "mjx", maze_layout_name=layout)
     elif env_name == "ant_push":
         # This is stable only in mjx backend
         assert backend == "mjx" or backend is None
@@ -166,13 +166,13 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
             #   'humanoidmaze_ogbench_giant_stitch'
             #     -> OGBench-aligned DMC humanoid + humanoid_maze_ogbench.xml,
             #        69-dim obs that matches the humanoidmaze-giant-stitch
-            #        dataset. Defaults to `spring` for memory; pass
-            #        `--backend mjx` for tighter parity with the OGBench
-            #        offline dataset (mujoco-based) at higher cost.
+            #        dataset. Defaults to `mjx` for parity with the OGBench
+            #        offline dataset (mujoco-based); pass `--backend spring`
+            #        if you need to trade dataset parity for memory.
             if env_name.startswith("humanoidmaze_"):
                 layout = env_name[len("humanoidmaze_"):]
                 env = HumanoidMaze(
-                    backend=backend or "spring", maze_layout_name=layout
+                    backend=backend or "mjx", maze_layout_name=layout
                 )
             else:
                 layout = env_name[len("humanoid_"):]
@@ -182,14 +182,14 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         elif "ant" in env_name:
             # Any "ogbench"-tagged layout loads the ogbench-aligned XML and
             # defaults to mjx so physics match the OGBench offline dataset
-            # (timestep=0.02, RK4, gear=30). Legacy layouts stay on spring.
+            # (timestep=0.02, gear=30). Legacy layouts stay on spring.
             layout = env_name[4:]
             # The "_explore" variant reuses the medium maze layout; only the
             # offline dataset differs (antmaze-medium-explore-v0).
             if layout == "maze_ogbench_medium_explore":
                 layout = "maze_ogbench_medium_navigate"
             if "ogbench" in layout:
-                env = AntMaze(backend=backend or "spring", maze_layout_name=layout)
+                env = AntMaze(backend=backend or "mjx", maze_layout_name=layout)
             else:
                 env = AntMaze(backend=backend or "spring", maze_layout_name=layout)
         elif env_name == "pointmaze_ogbench_teleport":
