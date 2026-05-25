@@ -63,6 +63,24 @@ TASK_PAIRS = [
     ((6, 6), (2, 6)),  # right R/G column
 ]
 
+# Single-goal variant: same maze geometry as TELEPORT_MAP but only the left
+# R/G column is retained as an annotated task; the right R/G cells become
+# plain open cells. Used by pointmaze_ogbench_teleport_1g.
+TELEPORT_MAP_1G = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1],
+    [1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1],
+    [1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1],
+    [1, G, 0, 0, 0, 1, T, 1, 0, 1, 0, 1],
+    [1, T, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+    [1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+    [1, R, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+]
+TASK_PAIRS_1G = [
+    ((7, 1), (4, 1)),  # left R/G column
+]
+
 MAZE_HEIGHT = 0.5
 DEFAULT_MAZE_SIZE_SCALING = 4.0
 
@@ -72,7 +90,12 @@ def _ij_to_xy(i, j, size_scaling, xy_offset):
     return (j * size_scaling - xy_offset, i * size_scaling - xy_offset)
 
 
-def _build_xml(maze_size_scaling: float) -> bytes:
+def _build_xml(
+    maze_size_scaling: float,
+    teleport_map,
+    teleport_in_ijs,
+    teleport_out_ijs,
+) -> bytes:
     xml_path = os.path.join(
         os.path.dirname(os.path.realpath(__file__)),
         "assets",
@@ -83,9 +106,9 @@ def _build_xml(maze_size_scaling: float) -> bytes:
     xy_offset = float(maze_size_scaling)
 
     # Walls.
-    for i in range(len(TELEPORT_MAP)):
-        for j in range(len(TELEPORT_MAP[0])):
-            if TELEPORT_MAP[i][j] == 1:
+    for i in range(len(teleport_map)):
+        for j in range(len(teleport_map[0])):
+            if teleport_map[i][j] == 1:
                 wall_x, wall_y = _ij_to_xy(i, j, maze_size_scaling, xy_offset)
                 ET.SubElement(
                     worldbody,
@@ -108,7 +131,7 @@ def _build_xml(maze_size_scaling: float) -> bytes:
                 )
 
     # Teleport markers (visualization only — non-colliding).
-    for idx, (i, j) in enumerate(TELEPORT_IN_IJS):
+    for idx, (i, j) in enumerate(teleport_in_ijs):
         x, y = _ij_to_xy(i, j, maze_size_scaling, xy_offset)
         ET.SubElement(
             worldbody, "geom",
@@ -119,7 +142,7 @@ def _build_xml(maze_size_scaling: float) -> bytes:
             material="teleport_in",
             contype="0", conaffinity="0",
         )
-    for idx, (i, j) in enumerate(TELEPORT_OUT_IJS):
+    for idx, (i, j) in enumerate(teleport_out_ijs):
         x, y = _ij_to_xy(i, j, maze_size_scaling, xy_offset)
         ET.SubElement(
             worldbody, "geom",
@@ -150,9 +173,24 @@ class PointMazeOGBenchTeleport(PipelineEnv):
         reset_noise_scale: float = 0.1,
         dense_reward: bool = False,
         action_scale: float = 0.2,
+        teleport_map=None,
+        task_pairs=None,
+        teleport_in_ijs=None,
+        teleport_out_ijs=None,
         **kwargs,
     ):
-        xml_string = _build_xml(maze_size_scaling)
+        if teleport_map is None:
+            teleport_map = TELEPORT_MAP
+        if task_pairs is None:
+            task_pairs = TASK_PAIRS
+        if teleport_in_ijs is None:
+            teleport_in_ijs = TELEPORT_IN_IJS
+        if teleport_out_ijs is None:
+            teleport_out_ijs = TELEPORT_OUT_IJS
+
+        xml_string = _build_xml(
+            maze_size_scaling, teleport_map, teleport_in_ijs, teleport_out_ijs
+        )
         sys = mjcf.loads(xml_string)
 
         # Match ant_maze_ogbench timing: timestep 0.02 * frame_skip 5 = 0.1 s.
@@ -188,22 +226,23 @@ class PointMazeOGBenchTeleport(PipelineEnv):
         self.goal_reach_thresh = 1.0
 
         xy_offset = float(maze_size_scaling)
+        active_pairs = task_pairs
         # Per-pair (start, goal) xy arrays — row k = the k-th task pair.
         # Reset draws ONE pair index and uses both its start and goal so
         # starts/goals never get mixed across pairs.
         self._pair_starts = jnp.array(
             [list(_ij_to_xy(i, j, maze_size_scaling, xy_offset))
-             for (i, j), _ in TASK_PAIRS]
+             for (i, j), _ in active_pairs]
         )
         self._pair_goals = jnp.array(
             [list(_ij_to_xy(i, j, maze_size_scaling, xy_offset))
-             for _, (i, j) in TASK_PAIRS]
+             for _, (i, j) in active_pairs]
         )
-        self._num_pairs = len(TASK_PAIRS)
+        self._num_pairs = len(active_pairs)
         # Backward-compat: unique start/goal cells exposed for go_explore
         # goal proposers that read env.possible_goals / env.possible_starts.
-        unique_starts = sorted({init for init, _ in TASK_PAIRS})
-        unique_goals = sorted({goal for _, goal in TASK_PAIRS})
+        unique_starts = sorted({init for init, _ in active_pairs})
+        unique_goals = sorted({goal for _, goal in active_pairs})
         self.possible_starts = jnp.array(
             [list(_ij_to_xy(i, j, maze_size_scaling, xy_offset)) for i, j in unique_starts]
         )
@@ -213,17 +252,17 @@ class PointMazeOGBenchTeleport(PipelineEnv):
 
         # Teleport metadata (jax arrays for jit compatibility).
         self._teleport_in_xys = jnp.array(
-            [list(_ij_to_xy(i, j, maze_size_scaling, xy_offset)) for i, j in TELEPORT_IN_IJS]
+            [list(_ij_to_xy(i, j, maze_size_scaling, xy_offset)) for i, j in teleport_in_ijs]
         )
         self._teleport_out_xys = jnp.array(
-            [list(_ij_to_xy(i, j, maze_size_scaling, xy_offset)) for i, j in TELEPORT_OUT_IJS]
+            [list(_ij_to_xy(i, j, maze_size_scaling, xy_offset)) for i, j in teleport_out_ijs]
         )
         self._teleport_radius = float(TELEPORT_RADIUS)
         self._teleport_threshold = self._teleport_radius * 1.5
 
         # Maze bounds for plotting / clipping (OGBench convention).
-        num_rows = len(TELEPORT_MAP)
-        num_cols = len(TELEPORT_MAP[0])
+        num_rows = len(teleport_map)
+        num_cols = len(teleport_map[0])
         half = 0.5 * maze_size_scaling
         self.x_bounds = jnp.array([
             -xy_offset - half,

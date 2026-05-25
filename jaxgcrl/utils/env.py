@@ -31,7 +31,11 @@ from jaxgcrl.envs.manipulation.arm_push_easy import ArmPushEasy
 from jaxgcrl.envs.manipulation.arm_push_hard import ArmPushHard
 from jaxgcrl.envs.manipulation.arm_reach import ArmReach
 from jaxgcrl.envs.manipulation.cube_single import CubeSingle
-from jaxgcrl.envs.pointmaze_ogbench_teleport import PointMazeOGBenchTeleport
+from jaxgcrl.envs.pointmaze_ogbench_teleport import (
+    PointMazeOGBenchTeleport,
+    TELEPORT_MAP_1G,
+    TASK_PAIRS_1G,
+)
 from jaxgcrl.envs.pusher import Pusher, PusherReacher
 from jaxgcrl.envs.pusher2 import Pusher2
 from jaxgcrl.envs.reacher import Reacher
@@ -83,6 +87,7 @@ legal_envs = (
     "ant_maze_ogbench_medium_1g",
     "ant_maze_ogbench_u",
     "pointmaze_ogbench_teleport",
+    "pointmaze_ogbench_teleport_1g",
     "ant_u_maze",
     "ant_u_maze_hard",
     "ant_big_maze",
@@ -197,6 +202,14 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
             # contact resolution after the qpos override matches OGBench's
             # mj_step semantics that produced pointmaze-teleport-navigate-v0.
             env = PointMazeOGBenchTeleport(backend=backend or "mjx")
+        elif env_name == "pointmaze_ogbench_teleport_1g":
+            # Same teleport maze geometry but with a dedicated 1-goal map and
+            # task-pair set (left R/G column only: start (7,1) -> goal (4,1)).
+            env = PointMazeOGBenchTeleport(
+                backend=backend or "mjx",
+                teleport_map=TELEPORT_MAP_1G,
+                task_pairs=TASK_PAIRS_1G,
+            )
         else:
             # Possible env_name = {'simple_u_maze', 'simple_big_maze', 'simple_hardest_maze'}
             env = SimpleMaze(backend=backend or "spring", maze_layout_name=env_name[7:])
