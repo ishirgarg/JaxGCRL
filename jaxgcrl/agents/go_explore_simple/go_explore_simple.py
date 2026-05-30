@@ -113,7 +113,7 @@ class GoExploreSimple:
     p_future_her_goal: float = 0.8
     use_sac_critic_mean: bool = False  # SAC: average critic ensemble instead of min
 
-    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega", "empowerment", "empowerment_density_ratio"] = "random_env_goals"
+    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega", "empowerment", "empowerment_density_ratio", "empowerment_density_product"] = "random_env_goals"
     num_candidates: int = 512
     goal_proposer_temperature: float = 0.0
     empowerment_alpha: float = 1.0
@@ -262,7 +262,7 @@ class GoExploreSimple:
 
         # ── Optional offline-empowerment scorer for goal proposer ───────────
         needs_empowerment_scorer = self.goal_proposer_name in (
-            "empowerment", "empowerment_density_ratio"
+            "empowerment", "empowerment_density_ratio", "empowerment_density_product"
         )
         offline_empowerment_scorer = None
         if needs_empowerment_scorer:

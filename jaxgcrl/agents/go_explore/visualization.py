@@ -627,6 +627,17 @@ def handle_goal_proposer_visualization(
             x_bounds=x_bounds,
             y_bounds=y_bounds,
         )
+    elif goal_proposer_name == "empowerment_density_product":
+        visualize_empowerment_density_product_candidates(
+            candidate_goals=_xy(log_data["candidate_goals"]),
+            first_obs_position=_xy(log_data["first_obs_position"]),
+            emp_alpha_scores=log_data["emp_alpha_scores"],
+            log_densities=log_data["log_densities"],
+            selection_logits=log_data["selection_logits"],
+            selected_goal=_xy(log_data["selected_goal"]),
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
+        )
     # Add more goal proposer visualizations here as needed
 
 
@@ -766,6 +777,75 @@ def visualize_empowerment_density_ratio_candidates(
     fig.suptitle("Empowerment / density ratio goal proposer", fontsize=13, y=1.02)
     plt.tight_layout()
     wandb.log({"goal_proposer/empowerment_density_ratio_candidates": wandb.Image(fig)})
+    plt.close(fig)
+
+
+def visualize_empowerment_density_product_candidates(
+    candidate_goals: np.ndarray,
+    first_obs_position: np.ndarray,
+    emp_alpha_scores: np.ndarray,
+    log_densities: np.ndarray,
+    selection_logits: np.ndarray,
+    selected_goal: np.ndarray,
+    x_bounds: np.ndarray,
+    y_bounds: np.ndarray,
+) -> None:
+    """Three panels: empowerment**alpha, negative log density, and their product."""
+    cg = np.asarray(candidate_goals, dtype=np.float64)
+    fo = np.asarray(first_obs_position, dtype=np.float64)
+    ea = np.asarray(emp_alpha_scores, dtype=np.float64).ravel()
+    ld = np.asarray(log_densities, dtype=np.float64).ravel()
+    prod = np.asarray(selection_logits, dtype=np.float64).ravel()
+    sg = np.asarray(selected_goal, dtype=np.float64)
+    neg_log_d = -ld
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5), sharex=True, sharey=True)
+    specs = [
+        (ea, "Empowerment^alpha", "empowerment**alpha"),
+        (neg_log_d, "Negative log density", "-log KDE density"),
+        (prod, "Product", "empowerment**alpha * (-log density)"),
+    ]
+    for ax, (values, title, cbar_label) in zip(axes, specs):
+        sc = ax.scatter(
+            cg[:, 0],
+            cg[:, 1],
+            c=values,
+            cmap="viridis",
+            s=18,
+            alpha=0.8,
+        )
+        ax.scatter(
+            fo[0],
+            fo[1],
+            c="red",
+            s=100,
+            marker="x",
+            linewidths=2,
+            label="start",
+            zorder=5,
+        )
+        ax.scatter(
+            sg[0],
+            sg[1],
+            c="gold",
+            s=120,
+            marker="*",
+            edgecolors="black",
+            linewidths=0.8,
+            label="selected",
+            zorder=5,
+        )
+        ax.set_xlim(float(x_bounds[0]), float(x_bounds[1]))
+        ax.set_ylim(float(y_bounds[0]), float(y_bounds[1]))
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_title(title)
+        ax.grid(True, alpha=0.25)
+        plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label=cbar_label)
+    axes[0].legend(loc="best", fontsize=8)
+    fig.suptitle("Empowerment x density product goal proposer", fontsize=13, y=1.02)
+    plt.tight_layout()
+    wandb.log({"goal_proposer/empowerment_density_product_candidates": wandb.Image(fig)})
     plt.close(fig)
 
 
