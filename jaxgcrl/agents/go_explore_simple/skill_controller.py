@@ -25,6 +25,7 @@ from typing import Callable, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+import wandb
 
 from jaxgcrl.envs.wrappers import (
     EpisodeWrapper,
@@ -123,6 +124,58 @@ def make_skill_action_fn(emp_agent, skill_obs_builder, num_skills, *, determinis
         return jnp.clip(a, -1.0, 1.0)
 
     return skill_action_fn
+
+
+# ── Skill-colored trajectory plot ───────────────────────────────────────────────
+
+
+def _plot_skill_colored_trajectory(
+    xy, skills, num_skills, x_bounds, y_bounds, goal_xy=None, title=""
+):
+    """Plot a single 2D trajectory with each segment colored by the active skill.
+
+    ``xy``: (T, 2) positions of the tracked entity (goal_indices[:2]); ``skills``:
+    (T,) int skill index in effect at each step. Returns a matplotlib Figure.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+    from matplotlib.colors import BoundaryNorm
+    from matplotlib.cm import ScalarMappable
+
+    xy = np.asarray(xy, dtype=np.float32)
+    skills = np.asarray(skills).astype(int)
+    cmap = plt.get_cmap("tab20" if num_skills <= 20 else "gist_ncar", num_skills)
+    norm = BoundaryNorm(np.arange(-0.5, num_skills + 0.5, 1.0), num_skills)
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    points = xy.reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)  # (T-1, 2, 2)
+    lc = LineCollection(segments, cmap=cmap, norm=norm)
+    lc.set_array(skills[:-1])
+    lc.set_linewidth(2.0)
+    ax.add_collection(lc)
+
+    ax.scatter(xy[0, 0], xy[0, 1], c="black", marker="o", s=60, zorder=5, label="start")
+    ax.scatter(xy[-1, 0], xy[-1, 1], c="black", marker="s", s=60, zorder=5, label="end")
+    if goal_xy is not None:
+        goal_xy = np.asarray(goal_xy, dtype=np.float32)
+        ax.scatter(goal_xy[0], goal_xy[1], c="red", marker="*", s=220, zorder=6, label="goal")
+
+    ax.set_xlim(float(x_bounds[0]), float(x_bounds[1]))
+    ax.set_ylim(float(y_bounds[0]), float(y_bounds[1]))
+    ax.set_aspect("equal")
+    ax.set_title(title)
+    ax.legend(loc="upper right", fontsize=8)
+    cbar = fig.colorbar(
+        ScalarMappable(norm=norm, cmap=cmap), ax=ax,
+        ticks=np.arange(num_skills), fraction=0.046, pad=0.04,
+    )
+    cbar.set_label("skill")
+    fig.tight_layout()
+    return fig
 
 
 # ── Training routine ────────────────────────────────────────────────────────────
@@ -477,16 +530,16 @@ def train_skill_controller(
             # ever switched to stochastic skill actions, split a per-step key.
             a = skill_action_eval(state.obs[:, :state_size], skill, key)
             nstate = e_env.step(state, a)
-            return (nstate, skill), None
+            return (nstate, skill), skill
 
-        (state, _), _ = jax.lax.scan(
+        (state, _), skills = jax.lax.scan(
             body, (state, skill0), jnp.arange(episode_length)
         )
         eval_metrics = state.info["eval_metrics"]
-        return eval_metrics
+        return eval_metrics, skills  # skills: (episode_length, num_eval_envs)
 
-    def run_eval(controller_state, base_metrics, key):
-        eval_metrics = evaluate(controller_state, key)
+    def run_eval(controller_state, base_metrics, key, num_steps):
+        eval_metrics, skills = evaluate(controller_state, key)
         em = eval_metrics.episode_metrics
         out = dict(base_metrics)
         for name in ("reward", "success", "success_easy", "dist"):
@@ -495,7 +548,90 @@ def train_skill_controller(
         if "success" in em:
             out["eval/episode_success_any"] = float(np.mean(np.asarray(em["success"]) > 0.0))
         out["eval/avg_episode_length"] = float(np.mean(np.asarray(eval_metrics.episode_steps)))
+
+        # ── Skill-usage distribution (choices made at the reselection steps) ──
+        skills_np = np.asarray(skills)                 # (episode_length, num_eval_envs)
+        chosen = skills_np[0::k].reshape(-1).astype(int)  # i % k == 0 -> a skill choice
+        counts = np.bincount(chosen, minlength=num_skills).astype(np.float64)
+        fracs = counts / max(counts.sum(), 1.0)
+        nz = fracs > 0
+        out["eval/skill_entropy"] = float(-(fracs[nz] * np.log(fracs[nz])).sum())
+        out["eval/skill_max_frac"] = float(fracs.max())
+        out["eval/skill_active_count"] = float((counts > 0).sum())
+        if wandb.run is not None:
+            wandb.log(
+                {
+                    "eval/skill_usage_hist": wandb.Histogram(
+                        np_histogram=(counts, np.arange(num_skills + 1) - 0.5)
+                    )
+                },
+                step=int(num_steps),
+            )
         return out
+
+    # ── Render: faithful hierarchical rollout (controller + frozen skill) ────
+    # Single un-vmapped env, Python loop honoring the k-step commitment, logging
+    # (1) a brax 3D HTML render (proves the two-policy rollout works) and
+    # (2) a 2D trajectory whose segments are colored by the active skill.
+    prim_idx = np.asarray(unwrapped_env.goal_indices)[:2]  # tracked entity xy
+
+    def render_skill_controller(controller_state, key, num_steps):
+        from brax.io import html
+
+        actor_params = controller_state.actor_state.params
+
+        @jax.jit
+        def pick(obs_b):
+            logits = actor_net.apply(actor_params, obs_b)
+            return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+        @jax.jit
+        def act(state_b, skill_b, akey):
+            return skill_action_eval(state_b, skill_b, akey)
+
+        jit_reset = jax.jit(eval_env_base.reset)
+        jit_step = jax.jit(eval_env_base.step)
+
+        key, rk = jax.random.split(key)
+        state = jit_reset(rk)
+        rollout, xy_list, skill_list = [], [], []
+        skill = jnp.zeros((1,), dtype=jnp.int32)
+        for i in range(episode_length):
+            rollout.append(state.pipeline_state)
+            obs_b = state.obs[None]
+            if i % k == 0:
+                skill = pick(obs_b)
+            key, ak = jax.random.split(key)
+            a = act(obs_b[:, :state_size], skill, ak)
+            obs_np = np.asarray(state.obs)
+            xy_list.append(obs_np[prim_idx])
+            skill_list.append(int(skill[0]))
+            state = jit_step(state, a[0])
+
+        xy = np.stack(xy_list)
+        skills = np.asarray(skill_list)
+        goal_xy = np.asarray(state.obs)[state_size:][:2]
+
+        # (1) brax 3D HTML
+        try:
+            sys = eval_env_base.sys.tree_replace({"opt.timestep": eval_env_base.dt})
+            url = html.render(sys, rollout, height=1024)
+            wandb.log({"render/skill_html": wandb.Html(url)}, step=int(num_steps))
+        except Exception as e:  # rendering must never crash training
+            logging.warning("skill HTML render failed: %s", e)
+
+        # (2) skill-colored 2D trajectory
+        try:
+            fig = _plot_skill_colored_trajectory(
+                xy, skills, num_skills,
+                unwrapped_env.x_bounds, unwrapped_env.y_bounds,
+                goal_xy=goal_xy, title=f"skills over trajectory @ step {num_steps}",
+            )
+            wandb.log({"render/skill_trajectory": wandb.Image(fig)}, step=int(num_steps))
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+        except Exception as e:
+            logging.warning("skill trajectory plot failed: %s", e)
 
     # ── Prefill ──────────────────────────────────────────────────────────────
     rng, prefill_key = jax.random.split(rng)
@@ -544,7 +680,7 @@ def train_skill_controller(
         for name, value in raw_metrics.items():
             metrics[f"training/{name}"] = float(value)
 
-        metrics = run_eval(controller_state, metrics, eval_rng)
+        metrics = run_eval(controller_state, metrics, eval_rng, current_step)
         logging.info("step: %d", current_step)
 
         params = (
@@ -555,7 +691,16 @@ def train_skill_controller(
         if config.checkpoint_logdir:
             save_params(f"{config.checkpoint_logdir}/step_{current_step}.pkl", params)
 
-        # Rendering disabled for the hierarchical controller (do_render=False).
+        # Skill-colored trajectory + 3D HTML render, every visualization_interval
+        # evals. We drive the hierarchical (controller + frozen skill) rollout
+        # ourselves, so the generic progress_fn render stays disabled.
+        vis_interval = getattr(config, "visualization_interval", 0)
+        if vis_interval and (ne % vis_interval == 0):
+            rng, render_key = jax.random.split(rng)
+            try:
+                render_skill_controller(controller_state, render_key, current_step)
+            except Exception as e:  # never let rendering crash training
+                logging.warning("render_skill_controller failed: %s", e)
         progress_fn(current_step, metrics, make_policy, (controller_state.actor_state.params,),
                     unwrapped_env, do_render=False)
 

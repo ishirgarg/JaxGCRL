@@ -107,7 +107,7 @@ echo "GLOBAL_IDX=$GLOBAL_IDX  ENV=$ENV  CKPT=$CKPT  NUM_SKILLS=$NSKILLS  K=$K  S
 python run.py go-explore-simple \
         --agent_type sac_discrete \
         --env $ENV \
-        --total_env_steps 80000000 \
+        --total_env_steps 120000000 \
         --episode_length $EP_LEN \
         --num_gcp_steps $GCP \
         --num_ep_steps $EP \
