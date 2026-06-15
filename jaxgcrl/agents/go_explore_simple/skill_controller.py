@@ -70,6 +70,7 @@ def load_frozen_skill_policy(self, unwrapped_env, template_key):
         template_rng=template_key,
         epoch=self.skill_policy_epoch,
         use_full_obs=self.use_full_skill_obs,
+        ogbench_root=self.ogbench_root,
     )
 
     if self.use_full_skill_obs:

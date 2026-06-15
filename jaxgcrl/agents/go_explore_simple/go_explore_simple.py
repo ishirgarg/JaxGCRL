@@ -133,6 +133,13 @@ class GoExploreSimple:
     empowerment_bonus_mean: float = 0
     empowerment_bonus_scale: float = 1
 
+    # Explicit OGBench repo root (the dir containing impls/). If None it is
+    # inferred from the checkpoint run_dir, which only works when the ckpt lives
+    # under <root>/impls/...; set this when checkpoints are stored elsewhere
+    # (e.g. a scratch dir) so OGBench's agents/utils imports resolve. Applies to
+    # both empowerment_run_dir and skill_policy_run_dir loading.
+    ogbench_root: Optional[str] = None
+
     # ── RLPD (offline data mixing) ─────────────────────────────────────────
     use_rlpd: bool = False  # Mix 50% offline OGBench data into each training batch
 
@@ -327,6 +334,7 @@ class GoExploreSimple:
                 epoch=self.empowerment_epoch,
                 num_splus_samples=self.empowerment_num_splus_samples,
                 use_full_obs=self.use_full_empowerment,
+                ogbench_root=self.ogbench_root,
             )
             if self.use_full_empowerment:
                 if state_size != int(_ex_obs_dim):

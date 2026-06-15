@@ -221,6 +221,7 @@ def load_offline_empowerment_agent(
     num_splus_samples: int = 128,
     *,
     use_full_obs: bool = False,
+    ogbench_root: Optional[str] = None,
 ):
     """Loads an OGBench empowerment agent checkpoint for offline scoring.
 
@@ -240,7 +241,10 @@ def load_offline_empowerment_agent(
         ``emp_agent``, ``ex_obs_dim``, ``base_obs_template`` (numpy, shape
         (ex_obs_dim,), or ``None`` when ``use_full_obs`` is True).
     """
-    ogbench_root = infer_ogbench_root_from_run_dir(run_dir)
+    # Explicit override (e.g. checkpoints stored outside the OGBench tree); else
+    # infer the repo root (dir containing impls/) from the checkpoint run_dir.
+    if ogbench_root is None:
+        ogbench_root = infer_ogbench_root_from_run_dir(run_dir)
     agent_registry, make_env_and_datasets, restore_agent = _setup_external_imports(ogbench_root)
     flags_path = os.path.join(run_dir, "flags.json")
     with open(flags_path, "r") as f:

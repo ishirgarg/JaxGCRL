@@ -112,6 +112,7 @@ python run.py go-explore-simple \
         --num_gcp_steps $GCP \
         --num_ep_steps $EP \
         --skill_policy_run_dir $SKILL_DIR \
+        --ogbench_root /global/home/users/ishirgarg/ogbench \
         --num_skills $NSKILLS \
         --skill_commitment_k $K \
         --use_her \
