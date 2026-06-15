@@ -439,7 +439,7 @@ class PPO:
         if randomization_fn is not None:
             v_randomization_fn = functools.partial(
                 randomization_fn,
-                rng=jax.random.split(eval_key, self.num_eval_envs),
+                rng=jax.random.split(eval_key, config.num_eval_envs),
             )
 
         eval_env = TrajectoryIdWrapper(eval_env)

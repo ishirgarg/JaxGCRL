@@ -276,7 +276,7 @@ class TD3:
         if randomization_fn is not None:
             v_randomization_fn = functools.partial(
                 randomization_fn,
-                rng=jax.random.split(key, self.num_envs // jax.process_count() // local_devices_to_use),
+                rng=jax.random.split(key, config.num_envs // jax.process_count() // local_devices_to_use),
             )
         env = TrajectoryIdWrapper(env)
         env = wrap_for_training(
@@ -333,8 +333,8 @@ class TD3:
             td3_network=td3_network,
             reward_scaling=self.reward_scaling,
             discounting=self.discounting,
-            smoothing=0.2,
-            noise_clip=0.5,
+            smoothing=self.smoothing_noise,
+            noise_clip=self.noise_clip,
         )
 
         critic_update = gradients.gradient_update_fn(  # pytype: disable=wrong-arg-types  # jax-ndarray
@@ -386,7 +386,7 @@ class TD3:
                     optimizer_state=training_state.policy_optimizer_state,
                 )
                 new_target_q_params = soft_update(training_state.target_q_params, q_params, self.tau)
-                new_target_policy_params = soft_update(training_state.policy_params, policy_params, self.tau)
+                new_target_policy_params = soft_update(training_state.target_policy_params, policy_params, self.tau)
                 return (
                     actor_loss,
                     policy_params,

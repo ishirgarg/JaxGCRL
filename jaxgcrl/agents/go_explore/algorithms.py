@@ -312,8 +312,8 @@ class SACActor(Actor):
                 relabeled_next_obs = jnp.concatenate([next_state, future_goals], axis=1)
 
                 dist = jnp.linalg.norm(
-                    relabeled_obs[:, state_size:]
-                    - relabeled_obs[:, jnp.array(goal_indices)],
+                    relabeled_next_obs[:, state_size:]
+                    - relabeled_next_obs[:, jnp.array(goal_indices)],
                     axis=1,
                 )
                 relabeled_reward = jnp.array(dist < goal_reach_thresh, dtype=jnp.float32)

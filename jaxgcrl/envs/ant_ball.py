@@ -188,7 +188,7 @@ class AntBall(PipelineEnv):
 
         ang_obj = jnp.pi * 2.0 * jax.random.uniform(rng2)
         obj_x_offset = jnp.cos(ang_obj)
-        obj_y_offset = jnp.sin(ang)
+        obj_y_offset = jnp.sin(ang_obj)
 
         target_pos = jnp.array([target_x, target_y])
         obj_pos = target_pos * 0.2 + jnp.array([obj_x_offset, obj_y_offset])

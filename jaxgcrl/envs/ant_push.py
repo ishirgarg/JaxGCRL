@@ -80,7 +80,7 @@ class AntPush(PipelineEnv):
 
         q = q.at[-2:].set(jnp.concatenate([target]))
 
-        qd = qd.at[-4:].set(0)
+        qd = qd.at[-5:].set(0)
 
         pipeline_state = self.pipeline_init(q, qd)
         obs = self._get_obs(pipeline_state)

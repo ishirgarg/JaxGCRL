@@ -9,7 +9,9 @@ def energy_fn(name, x, y):
     elif name == "dot":
         return jnp.sum(x * y, axis=-1)
     elif name == "cosine":
-        return jnp.sum(x * y, axis=-1) / (jnp.linalg.norm(x) * jnp.linalg.norm(y) + 1e-6)
+        return jnp.sum(x * y, axis=-1) / (
+            jnp.linalg.norm(x, axis=-1) * jnp.linalg.norm(y, axis=-1) + 1e-6
+        )
     elif name == "l2":
         return -jnp.sum((x - y) ** 2, axis=-1)
     else:
@@ -26,7 +28,10 @@ def contrastive_loss_fn(name, logits):
             2 * jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1) - jax.nn.logsumexp(logits, axis=0)
         )
     elif name == "binary_nce":
-        critic_loss = -jnp.mean(jax.nn.sigmoid(logits))
+        eye = jnp.eye(logits.shape[0])
+        critic_loss = -jnp.mean(
+            eye * jax.nn.log_sigmoid(logits) + (1.0 - eye) * jax.nn.log_sigmoid(-logits)
+        )
     else:
         raise ValueError(f"Unknown contrastive loss function: {name}")
     return critic_loss

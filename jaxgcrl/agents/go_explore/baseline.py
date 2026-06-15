@@ -322,11 +322,11 @@ class Baseline:
             nstate = env.step(env_state, actions, env_rng)
             state_extras = {x: nstate.info[x] for x in extra_fields}
             return nstate, Transition(
-                observation=env_state.obs, 
-                action=actions, 
-                reward=nstate.reward, 
+                observation=env_state.obs,
+                action=actions,
+                reward=nstate.reward,
                 discount=1 - nstate.done,
-                next_observation=nstate.obs if self.agent_type == "sac" else None,  # SAC needs next_observation
+                next_observation=nstate.obs,
                 extras={"state_extras": state_extras}
             )
 
@@ -394,12 +394,13 @@ class Baseline:
                 updated_experience_count = experience_count + 1
                 return env_state, info, updated_experience_count, goal_proposer_state
             
+            propose_key, rollout_key = jax.random.split(key)
             # Conditionally propose new goals
             env_state, info, updated_experience_count, updated_goal_proposer_state = jax.lax.cond(
                 new_experience_count >= reset_threshold,
                 propose_new_goals,
                 keep_existing_goals,
-                env_state, key, info, experience_count, goal_proposer_state
+                env_state, propose_key, info, experience_count, goal_proposer_state
             )
             
             env_state = env_state.replace(info=info)
@@ -421,7 +422,7 @@ class Baseline:
                 # from state.info and uses them for reset
                 return (env_state, buffer_state, next_key), transition
 
-            (env_state, buffer_state, _), data = jax.lax.scan(f, (env_state, buffer_state, key), (), length=self.unroll_length)
+            (env_state, buffer_state, _), data = jax.lax.scan(f, (env_state, buffer_state, rollout_key), (), length=self.unroll_length)
 
             # Goal proposing happens before the scan, so new goals are available during the scan
             # Auto reset wrapper will use proposed_goals from info when resets occur

@@ -83,7 +83,7 @@ class Pusher2(PipelineEnv):
 
         goal_pos2 = jnp.concatenate(
             [
-                jax.random.uniform(rng4, (1,), minval=-0.70, maxval=0.30),
+                jax.random.uniform(rng8, (1,), minval=-0.70, maxval=0.30),
                 jax.random.uniform(rng7, (1,), minval=0.375 + 1e-6, maxval=0.9),
             ]
         )

@@ -90,7 +90,7 @@ class Halfcheetah(PipelineEnv):
         success_easy = jnp.array(dist < 2.0, dtype=float)
 
         if self.dense_reward:
-            reward = ctrl_cost - dist
+            reward = -ctrl_cost - dist
         else:
             reward = success
 

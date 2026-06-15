@@ -120,14 +120,13 @@ class QNetwork(nn.Module):
         q_values = []
         for i in range(self.n_critics):
             q = hidden
-            # Full MLP for this critic
+            # Full MLP for this critic.
             for j in range(self.network_depth):
                 q = nn.Dense(self.network_width, kernel_init=lecun_uniform, bias_init=bias_init, name=f"critic_{i}_hidden_{j}")(q)
-                if j != self.network_depth - 1:  # Don't normalize/activate final layer
-                    if self.use_ln:
-                        q = nn.LayerNorm(name=f"critic_{i}_ln_{j}")(q)
-                    q = activation(q)
-            # Final output layer
+                if self.use_ln:
+                    q = nn.LayerNorm(name=f"critic_{i}_ln_{j}")(q)
+                q = activation(q)
+            # Final output layer (intentionally linear).
             q = nn.Dense(1, kernel_init=lecun_uniform, bias_init=bias_init, name=f"critic_{i}_output")(q)
             q_values.append(q)
         

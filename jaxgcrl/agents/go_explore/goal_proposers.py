@@ -650,7 +650,7 @@ def create_empowerment_density_product_goal_proposer(
         log_density = jnp.log(densities + kde_eps)  # negative: densities < 1
 
         emp_scores = offline_empowerment_scorer(candidate_states, emp_rng)
-        emp_alpha_scores = emp_scores ** alpha_f  # empowerment**alpha
+        emp_alpha_scores = jnp.sign(emp_scores) * (jnp.abs(emp_scores) ** alpha_f)  # empowerment**alpha
         # -(E**alpha) * log_density == (E**alpha) * (-log_density) == empowerment**alpha * novelty.
         logits = -emp_alpha_scores * log_density
         best_idx = _sample_idx_from_temperature_logits(select_rng, logits, temperature)

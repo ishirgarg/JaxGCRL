@@ -75,7 +75,7 @@ class ArmGrasp(ArmEnvs):
         cube_to_fingertip_midpoint_dist = jnp.linalg.norm(cube_pos - fingertip_midpoint)
 
         gripper_openness = obs[22]
-        goal_gripper_openness = goal[9]
+        goal_gripper_openness = goal[6]
         gripper_openness_difference = jnp.linalg.norm(gripper_openness - goal_gripper_openness)
 
         success = jnp.array(

@@ -79,8 +79,10 @@ class GoExploreSimple:
     uniform random actions with probability ``eps_random_action``.
     """
 
-    # Algorithm type for the goal-conditioned policy
-    agent_type: Literal["sac", "crl"] = "crl"
+    # Algorithm type for the goal-conditioned policy.
+    # "sac_discrete" branches into the hierarchical skill controller
+    # (see skill_controller.py / SKILL_CONTROLLER_DESIGN.md).
+    agent_type: Literal["sac", "crl", "sac_discrete"] = "crl"
 
     policy_lr: float = 3e-4
     critic_lr: float = 3e-4
@@ -141,13 +143,54 @@ class GoExploreSimple:
     eps_random_action: float = 0.2        # probability of uniform random action in explore phase
     reset_on_explore_goal_reached: bool = False  # if False, explore phase runs to completion regardless of goal reach
 
+    # ── Hierarchical skill controller (agent_type="sac_discrete") ───────────────
+    # Freeze a pretrained OGBench skill-conditioned policy π(a|s,z) and train an
+    # online SAC-discrete high-level controller that picks discrete skills.
+    skill_policy_run_dir: Optional[str] = None    # OGBench skill-agent checkpoint dir (flags.json + params_*.pkl)
+    skill_policy_epoch: Optional[int] = None       # None -> latest
+    num_skills: Optional[int] = None               # None -> infer from checkpoint config
+    skill_commitment_k: int = 10                   # fixed open-loop temporal commitment
+    use_full_skill_obs: bool = True                # full state row -> skill net (else override-index template)
+    deterministic_skill_actions: bool = True       # frozen policy uses dist.mode() (vs sample)
+    controller_target_entropy_scale: float = 0.98  # H̄ = scale * log(num_skills)
+    gamma_low: float = 1.0                          # intra-macro-step reward discount
+    controller_replay_size: int = 200000
+
     def check_config(self, config):
+        if self.agent_type == "sac_discrete":
+            assert self.skill_policy_run_dir is not None, (
+                "agent_type='sac_discrete' requires skill_policy_run_dir (OGBench skill checkpoint)."
+            )
+            assert self.skill_commitment_k > 0, "skill_commitment_k must be > 0"
+            assert config.episode_length % self.skill_commitment_k == 0, (
+                "episode_length must be divisible by skill_commitment_k so macro-steps "
+                "tile the episode exactly."
+            )
+            assert self.num_skills is None or self.num_skills > 1, (
+                "num_skills (if set) must be > 1 for a discrete controller."
+            )
+            assert config.num_evals > 0, "num_evals must be > 0"
+            return
+
         assert config.episode_length - 1 == self.num_gcp_steps + self.num_ep_steps, (
             "episode_length - 1 must be equal to num_gcp_steps + num_ep_steps"
         )
-        assert config.num_envs * (config.episode_length - 1) % self.batch_size == 0, (
-            "num_envs * (episode_length - 1) must be divisible by batch_size"
+        eff_len = config.episode_length if self.agent_type == "sac" else config.episode_length - 1
+        assert config.num_envs * eff_len % self.batch_size == 0, (
+            f"num_envs * effective_trajectory_length ({config.num_envs} * {eff_len}) "
+            f"must be divisible by batch_size ({self.batch_size}); effective length is "
+            "episode_length for SAC and episode_length-1 for CRL."
         )
+
+    def _train_skill_controller(self, config, train_env, eval_env, progress_fn):
+        """Hierarchical SAC-discrete controller over a frozen skill policy.
+
+        Thin wrapper; all logic lives in ``skill_controller.train_skill_controller``.
+        """
+        from jaxgcrl.agents.go_explore_simple.skill_controller import (
+            train_skill_controller,
+        )
+        return train_skill_controller(self, config, train_env, eval_env, progress_fn)
 
     def train_fn(
         self,
@@ -160,6 +203,11 @@ class GoExploreSimple:
         progress_fn: Callable[[int, Metrics], None] = lambda *args: None,
     ):
         self.check_config(config)
+
+        if self.agent_type == "sac_discrete":
+            return self._train_skill_controller(
+                config, train_env, eval_env, progress_fn
+            )
 
         unwrapped_env = train_env
 
@@ -647,7 +695,8 @@ class GoExploreSimple:
                 # The random permutation in process_transitions already mixed
                 # online+offline within each batch (~50/50), so the surviving
                 # slice still covers both offline and online transitions.
-                num_batches = config.num_envs * (config.episode_length - 1) // self.batch_size
+                eff_len = config.episode_length if self.agent_type == "sac" else config.episode_length - 1
+                num_batches = config.num_envs * eff_len // self.batch_size
                 transitions = jax.tree_util.tree_map(
                     lambda x: x[:num_batches], transitions
                 )
@@ -820,12 +869,9 @@ class GoExploreSimple:
                 last_visualization_step = current_step
 
             do_render = ne % config.visualization_interval == 0
-            if self.agent_type == "crl":
-                make_policy = lambda param: lambda obs, rng: gcp_actor.apply(param, obs)
-            else:
-                make_policy = lambda param: lambda obs, rng: (
-                    gcp_actor.sample_actions(param, obs, rng, is_deterministic=True), {}
-                )
+            make_policy = lambda param: lambda obs, rng: (
+                gcp_actor.sample_actions(param, obs, rng, is_deterministic=True), {}
+            )
 
             # Build full GCP critic params for checkpointing
             if self.agent_type == "crl":
