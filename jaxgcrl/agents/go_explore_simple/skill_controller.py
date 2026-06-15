@@ -17,6 +17,7 @@ See ``SKILL_CONTROLLER_DESIGN.md`` for the full spec. Key pieces:
 
 from __future__ import annotations
 
+import functools
 import logging
 import time
 from typing import Callable, Tuple
@@ -45,6 +46,7 @@ from jaxgcrl.agents.go_explore_simple.sac_discrete import (
     DiscreteActorNet,
     DiscreteQNet,
     create_controller_state,
+    her_relabel_sequence,
     init_controller_replay,
     insert_controller_replay,
     sample_controller_replay,
@@ -156,7 +158,10 @@ def train_skill_controller(
     emp_agent, num_skills, skill_obs_builder = load_frozen_skill_policy(
         self, unwrapped_env, skill_key
     )
-    logging.info("skill controller: num_skills=%d, k=%d", num_skills, k)
+    logging.info(
+        "skill controller: num_skills=%d, k=%d, use_her=%s, p_future_her_goal=%.3f",
+        num_skills, k, bool(self.use_her), float(self.p_future_her_goal),
+    )
     skill_action_train = make_skill_action_fn(
         emp_agent, skill_obs_builder, num_skills,
         deterministic=self.deterministic_skill_actions,
@@ -256,7 +261,12 @@ def train_skill_controller(
         return env_state, R, final_obs, done_any
 
     # ── Collect one macro-step of experience for all envs ────────────────────
-    def collect_macro(controller_state, env_state, replay_state, key):
+    def step_macro(controller_state, env_state, key):
+        """One macro-step for all envs; returns the (un-inserted) SMDP transition.
+
+        Captures the ``traj_id`` of the *starting* state so hindsight relabeling
+        can restrict future-goal sampling to the same episode.
+        """
         goal_key, z_key, roll_key = jax.random.split(key, 3)
 
         # Refresh task goals so any auto-reset this macro-step draws a fresh goal.
@@ -267,20 +277,27 @@ def train_skill_controller(
         env_state = env_state.replace(info=info)
 
         controller_obs = env_state.obs  # [state, goal]
+        traj_id = env_state.info["traj_id"]
         logits = actor_net.apply(controller_state.actor_state.params, controller_obs)
         z = jax.random.categorical(z_key, logits)  # stochastic during training
 
         env_state, R, next_obs, done = rollout_macro_step(
             env_state, z, roll_key, skill_action_train
         )
-        batch_in = {
+        step = {
             "obs": controller_obs,
             "skill": z,
             "reward": R,
             "next_obs": next_obs,
             "done": done,
+            "traj_id": traj_id,
         }
-        replay_state = insert_controller_replay(replay_state, batch_in)
+        return env_state, step, R, done
+
+    def collect_macro(controller_state, env_state, replay_state, key):
+        # insert_controller_replay ignores the extra "traj_id" key.
+        env_state, step, R, done = step_macro(controller_state, env_state, key)
+        replay_state = insert_controller_replay(replay_state, step)
         return env_state, replay_state, R, done
 
     # ── One training step: collect + N SAC-discrete updates ──────────────────
@@ -349,6 +366,92 @@ def train_skill_controller(
         )
         metrics = jax.tree_util.tree_map(jnp.mean, metrics)
         return controller_state, env_state, replay_state, metrics
+
+    # ── HER (hindsight relabel) variant ──────────────────────────────────────
+    # Collect a block of macro-steps, relabel each transition's goal with a
+    # uniformly-sampled *future* achieved state from the SAME episode (matched by
+    # traj_id), then feed the relabeled transitions through the SAME flat i.i.d.
+    # replay + SAC update path. The block holds one episode (episode_length / k
+    # macro-steps) but is capped at HER_MAX_WINDOW to bound the O(T^2) relabel
+    # matrices; traj_id masking keeps relabeling within-episode even when a capped
+    # block straddles an episode boundary.
+    HER_MAX_WINDOW = 512
+    use_her = bool(self.use_her)
+    her_window = min(config.episode_length // k, HER_MAX_WINDOW)  # macro-steps / block
+    # Match the non-HER total step budget: blocks/epoch * her_window ≈ macro_steps/epoch.
+    blocks_per_epoch = max(1, int(round(macro_steps_per_epoch / her_window)))
+    _goal_indices = jnp.asarray(
+        [int(i) for i in np.asarray(unwrapped_env.goal_indices)]
+    )
+    _goal_reach_thresh = float(unwrapped_env.goal_reach_thresh)
+    _relabel_seq = functools.partial(
+        her_relabel_sequence,
+        state_size=state_size,
+        goal_indices=_goal_indices,
+        goal_reach_thresh=_goal_reach_thresh,
+        p_future_her_goal=float(self.p_future_her_goal),
+    )
+
+    def collect_block(controller_state, env_state, key):
+        def f(carry, _):
+            es_, k_ = carry
+            k_, ck = jax.random.split(k_)
+            es_, step, _, _ = step_macro(controller_state, es_, ck)
+            return (es_, k_), step
+        (env_state, _), block = jax.lax.scan(
+            f, (env_state, key), (), length=her_window
+        )
+        return env_state, block  # block leaves: (her_window, num_envs, ...)
+
+    @jax.jit
+    def training_epoch_her(controller_state, env_state, replay_state, key):
+        def block_step(carry, _):
+            cs, es, rs, k_ = carry
+            k_, collect_key, relabel_key, train_key = jax.random.split(k_, 4)
+
+            es, block = collect_block(cs, es, collect_key)
+
+            # Relabel per env over its macro-step sequence, then flatten to i.i.d.
+            block_env_major = jax.tree_util.tree_map(
+                lambda x: jnp.swapaxes(x, 0, 1), block
+            )  # (num_envs, her_window, ...)
+            rkeys = jax.random.split(relabel_key, num_envs)
+            relabeled = jax.vmap(_relabel_seq)(block_env_major, rkeys)
+            flat = jax.tree_util.tree_map(
+                lambda x: x.reshape((num_envs * her_window,) + x.shape[2:]), relabeled
+            )
+            rs = insert_controller_replay(rs, flat)
+
+            def upd(carry2, _):
+                cs2, k2 = carry2
+                k2, sk, uk = jax.random.split(k2, 3)
+                batch = sample_controller_replay(rs, sk, self.batch_size)
+                cs2, m = sac_discrete_update(
+                    cs2, batch, uk,
+                    actor_net=actor_net, critic_net=critic_net,
+                    gamma=gamma_high, tau=self.tau, target_entropy=target_entropy,
+                )
+                return (cs2, k2), m
+
+            # Keep updates-per-collected-macro-step equal to the non-HER path.
+            (cs, _), m = jax.lax.scan(
+                upd, (cs, train_key), (), length=her_window * n_grad_steps
+            )
+            cs = cs.replace(env_steps=cs.env_steps + num_envs * k * her_window)
+            m = jax.tree_util.tree_map(jnp.mean, m)
+            m["macro_reward_mean"] = jnp.mean(block["reward"])
+            m["macro_done_mean"] = jnp.mean(block["done"])
+            return (cs, es, rs, k_), m
+
+        (controller_state, env_state, replay_state, _), metrics = jax.lax.scan(
+            block_step,
+            (controller_state, env_state, replay_state, key),
+            (), length=blocks_per_epoch,
+        )
+        metrics = jax.tree_util.tree_map(jnp.mean, metrics)
+        return controller_state, env_state, replay_state, metrics
+
+    training_epoch_fn = training_epoch_her if use_her else training_epoch
 
     # ── Dedicated eval: argmax controller + deterministic skill policy ───────
     num_eval_envs = config.num_eval_envs
@@ -422,7 +525,7 @@ def train_skill_controller(
     for ne in range(config.num_evals):
         t = time.time()
         rng, epoch_key, eval_rng = jax.random.split(rng, 3)
-        controller_state, env_state, replay_state, raw_metrics = training_epoch(
+        controller_state, env_state, replay_state, raw_metrics = training_epoch_fn(
             controller_state, env_state, replay_state, epoch_key
         )
         raw_metrics = jax.tree_util.tree_map(lambda x: x.block_until_ready(), raw_metrics)

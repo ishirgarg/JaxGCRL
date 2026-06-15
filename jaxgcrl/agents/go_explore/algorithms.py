@@ -274,9 +274,8 @@ class SACActor(Actor):
 
         When HER is enabled, each transition is independently relabeled with
         probability ``p_future_her_goal``: its goal is replaced by a future
-        state from the same trajectory, sampled with probability
-        proportional to ``discounting ** (t_future - t)`` (same geometric
-        scheme as CRL's ``flatten_batch``). With probability
+        state from the same trajectory, sampled **uniformly** over all valid
+        future timesteps in that trajectory. With probability
         ``1 - p_future_her_goal`` the transition's original goal is kept.
         """
         if use_her:
@@ -289,17 +288,15 @@ class SACActor(Actor):
                 is_future_mask = jnp.array(
                     arrangement[:, None] < arrangement[None], dtype=jnp.float32
                 )
-                discount = discounting ** jnp.array(
-                    arrangement[None] - arrangement[:, None], dtype=jnp.float32
-                )
                 traj_ids = transition.extras["state_extras"]["traj_id"]
                 row_ids = jnp.broadcast_to(traj_ids[jnp.newaxis, :], (seq_len, seq_len))
                 col_ids = jnp.broadcast_to(traj_ids[:, jnp.newaxis], (seq_len, seq_len))
                 same_traj = jnp.equal(row_ids, col_ids).astype(jnp.float32)
-                # eye * 1e-5 is a numerical-stability fallback so categorical
-                # still has positive mass when a row has no valid future
-                # (e.g. the last step in a trajectory).
-                probs = is_future_mask * discount * same_traj + jnp.eye(seq_len) * 1e-5
+                # Uniform over all valid future states in the same trajectory (no
+                # discount weighting). eye * 1e-5 is a numerical-stability fallback
+                # so categorical still has positive mass when a row has no valid
+                # future (e.g. the last step in a trajectory).
+                probs = is_future_mask * same_traj + jnp.eye(seq_len) * 1e-5
 
                 sample_key, bern_key = jax.random.split(key)
                 future_idx = jax.random.categorical(sample_key, jnp.log(probs))

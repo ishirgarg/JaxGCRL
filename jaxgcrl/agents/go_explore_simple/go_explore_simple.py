@@ -130,11 +130,11 @@ class GoExploreSimple:
 
     # Empowerment scorer global normalization for the empowerment goal
     # proposers: the scorer emits (raw_emp - mean) / scale.
-    empowerment_bonus_mean: float = 1.3
-    empowerment_bonus_scale: float = 0.2
+    empowerment_bonus_mean: float = 0
+    empowerment_bonus_scale: float = 1
 
     # ── RLPD (offline data mixing) ─────────────────────────────────────────
-    use_rlpd: bool = True  # Mix 50% offline OGBench data into each training batch
+    use_rlpd: bool = False  # Mix 50% offline OGBench data into each training batch
 
     # ── Go Explore specific parameters ──────────────────────────────────────
     num_gcp_steps: int = 250      # max steps in go phase before forcing explore
@@ -153,8 +153,8 @@ class GoExploreSimple:
     use_full_skill_obs: bool = True                # full state row -> skill net (else override-index template)
     deterministic_skill_actions: bool = True       # frozen policy uses dist.mode() (vs sample)
     controller_target_entropy_scale: float = 0.98  # H̄ = scale * log(num_skills)
-    gamma_low: float = 1.0                          # intra-macro-step reward discount
-    controller_replay_size: int = 200000
+    gamma_low: float = 1.0                          # intra-macro-step reward discount (within macro-step)
+    controller_replay_size: int = 50000
 
     def check_config(self, config):
         if self.agent_type == "sac_discrete":

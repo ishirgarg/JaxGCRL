@@ -210,6 +210,68 @@ def sample_controller_replay(state: ControllerReplay, key: jax.Array, batch_size
     }
 
 
+# ── HER (hindsight) relabeling for controller macro-transitions ─────────────────
+
+
+def her_relabel_sequence(
+    seq: Dict[str, jnp.ndarray],
+    key: jax.Array,
+    *,
+    state_size: int,
+    goal_indices: jnp.ndarray,
+    goal_reach_thresh: float,
+    p_future_her_goal: float,
+):
+    """Uniform-future HER relabel of one env's macro-step sequence.
+
+    ``seq`` holds the macro-transitions of a single env over one collected block,
+    each field shaped ``(T, ...)``: ``obs=[state, goal]``, ``skill``, ``reward``,
+    ``next_obs=[next_state, goal]``, ``done``, ``traj_id``. For each macro-step,
+    with probability ``p_future_her_goal`` the goal is replaced by the achieved
+    goal of a **uniformly** sampled *future* macro-step in the **same episode**
+    (matched by ``traj_id``), and the reward is recomputed as the window-end
+    goal-reach bit ``1[‖achieved − new_goal‖ < thresh]`` against the new goal.
+    Mirrors the flat agent's HER (``go_explore.algorithms``), at the SMDP level.
+
+    Returns the relabeled transition dict (``traj_id`` dropped) ready for the
+    flat controller replay.
+    """
+    T = seq["obs"].shape[0]
+    arrangement = jnp.arange(T)
+    is_future = (arrangement[:, None] < arrangement[None]).astype(jnp.float32)
+    tid = seq["traj_id"]
+    same_traj = (tid[None, :] == tid[:, None]).astype(jnp.float32)
+    # Uniform over same-episode future macro-steps; eye*1e-5 keeps positive mass
+    # for rows with no valid future (last step of an episode -> keeps own goal).
+    probs = is_future * same_traj + jnp.eye(T) * 1e-5
+
+    sample_key, bern_key = jax.random.split(key)
+    future_idx = jax.random.categorical(sample_key, jnp.log(probs))  # (T,)
+
+    gi = jnp.asarray(goal_indices)
+    future_next_state = seq["next_obs"][future_idx][:, :state_size]
+    new_goal = future_next_state[:, gi]                      # (T, goal_size)
+
+    state = seq["obs"][:, :state_size]
+    next_state = seq["next_obs"][:, :state_size]
+    relabeled_obs = jnp.concatenate([state, new_goal], axis=1)
+    relabeled_next_obs = jnp.concatenate([next_state, new_goal], axis=1)
+
+    achieved = next_state[:, gi]
+    dist = jnp.linalg.norm(achieved - new_goal, axis=1)
+    relabeled_reward = (dist < goal_reach_thresh).astype(jnp.float32)
+
+    use_future = jax.random.bernoulli(bern_key, p=p_future_her_goal, shape=(T,))
+    m = use_future[:, None]
+    return {
+        "obs": jnp.where(m, relabeled_obs, seq["obs"]),
+        "skill": seq["skill"],
+        "reward": jnp.where(use_future, relabeled_reward, seq["reward"]),
+        "next_obs": jnp.where(m, relabeled_next_obs, seq["next_obs"]),
+        "done": seq["done"],
+    }
+
+
 # ── SAC-discrete update ─────────────────────────────────────────────────────────
 
 
