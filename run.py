@@ -111,6 +111,25 @@ def main(config: Config):
         "training/emp_delta_min",
         "training/emp_delta_max",
         "training/emp_delta_scaled_mean",
+        # Hierarchical skill controller (agent_type="sac_discrete" / "crl_skill")
+        "training/controller_actor_loss",
+        "training/controller_critic_loss",
+        "training/controller_alpha",
+        "training/controller_alpha_loss",
+        "training/controller_entropy",
+        "training/controller_target_entropy",
+        "training/controller_reward_mean",
+        "training/controller_done_mean",
+        "training/macro_reward_mean",
+        "training/macro_done_mean",
+        # CRL contrastive-critic controller (agent_type="crl_skill")
+        "training/controller_categorical_accuracy",
+        "training/controller_logits_pos",
+        "training/controller_logits_neg",
+        "training/controller_logsumexp",
+        "eval/skill_entropy",
+        "eval/skill_max_frac",
+        "eval/skill_active_count",
     ]
 
     metrics_recorder = MetricsRecorder(

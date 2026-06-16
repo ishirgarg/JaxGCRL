@@ -333,11 +333,17 @@ class MetricsRecorder:
             self.y_data[key].append(value)
             self.y_data_err[key].append(metrics.get(f"{key}_std", 0))
 
-    def log_wandb(self):
+    def log_wandb(self, media=None):
         data_to_log = {}
         for key, value in self.y_data.items():
             data_to_log[key] = value[-1]
         data_to_log["step"] = self.x_data[-1]
+        # Non-scalar wandb objects (histograms / images / html) are merged into
+        # the SAME log call so we only ever emit one wandb.log per step. Logging
+        # them separately at the same step collides with wandb's monotonic-step
+        # semantics and silently drops this scalar row online.
+        if media:
+            data_to_log.update(media)
         wandb.log(data_to_log, step=self.x_data[-1])
 
         if self.mode == "offline":
@@ -396,6 +402,10 @@ class MetricsRecorder:
         logging.info(f"time to train: {self.times[-1] - self.times[1]}")
 
     def progress(self, num_steps, metrics, make_policy, params, env, do_render=True):
+        # Optional non-scalar wandb media (e.g. the skill controller's histogram /
+        # renders) ride along under a reserved key so they log in the single
+        # log_wandb call rather than a separate, step-colliding wandb.log.
+        media = metrics.pop("_wandb_media", None)
         for key in self.metrics_to_collect:
             self.ensure_metric(metrics, key)
 
@@ -406,7 +416,7 @@ class MetricsRecorder:
             num_steps,
             {key: value for key, value in metrics.items() if key in self.metrics_to_collect},
         )
-        self.log_wandb()
+        self.log_wandb(media)
         self.log_csv()
         self.print_progress()
 

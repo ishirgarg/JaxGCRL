@@ -1,18 +1,47 @@
-"""Hierarchical discrete-skill controller training routine.
+"""Hierarchical *contrastive* (CRL) skill controller training routine.
 
-Implements ``GoExploreSimple._train_skill_controller`` (``agent_type="sac_discrete"``):
-freeze a pretrained OGBench skill-conditioned policy ``π(a | s, z)`` and train an
-online SAC-discrete *high-level controller* that selects discrete skills ``z`` to
-maximize task reward, with fixed temporal commitment ``k``.
+Implements ``GoExploreSimple._train_crl_skill_controller``
+(``agent_type="crl_skill"``): freeze a pretrained OGBench skill-conditioned
+policy ``π(a | s, z)`` and train an online **CRL (contrastive RL)** *high-level
+controller* that selects discrete skills ``z`` over a Semi-MDP (SMDP) with fixed
+``k``-step temporal commitment.
 
-See ``SKILL_CONTROLLER_DESIGN.md`` for the full spec. Key pieces:
-  - ``load_frozen_skill_policy`` / ``make_skill_action_fn``: a generic adapter over
-    any OGBench skill-conditioned agent whose policy submodule has signature
-    ``policy(obs, skills_onehot)`` (true for ``empowerment_skill``).
-  - ``rollout_macro_step``: a ``lax.scan`` over ``k`` env steps under one fixed
-    per-env skill, producing one SMDP macro-transition ``(s_t, z, R, s_{t+k}, done)``.
-  - ``train_skill_controller``: prefill -> epochs of (collect macro-steps + SAC
-    updates) -> dedicated deterministic eval rollout.
+This is the contrastive sibling of ``skill_controller.train_skill_controller``
+(``agent_type="sac_discrete"``). Everything about the SMDP plumbing — the frozen
+skill adapter, the ``k``-step macro-step rollout, HER relabeling over
+macro-steps, the deterministic eval rollout, the skill-usage histogram, and the
+skill-colored trajectory + brax HTML render — is identical and reused from
+``skill_controller`` / ``sac_discrete``. The ONLY thing that changes is the
+high-level *learner*: instead of SAC-discrete we train a CRL contrastive critic
+plus a categorical actor with an auto-tuned entropy temperature ``α``, mirroring
+``crl/losses.py`` as closely as the discrete-skill setting allows.
+
+CRL high-level learner (mirrors ``crl/losses.py`` ``update_critic`` /
+``update_actor_and_alpha``):
+
+  - **Contrastive critic** ``φ(s, z), ψ(g)``: ``sa_encoder`` consumes
+    ``[state, one_hot(z)]`` (state = controller_obs state slice; ``one_hot(z)``
+    is the discrete skill — exactly how the frozen low-level policy consumes
+    skills); ``g_encoder`` consumes the goal (controller_obs goal slice). InfoNCE
+    over the in-batch goals via ``energy_fn`` + ``contrastive_loss_fn`` with the
+    same ``logsumexp_penalty_coeff``. HER (uniform-future relabel) supplies the
+    future-goal positives — the SMDP analogue of CRL's ``flatten_batch``.
+
+  - **Categorical actor** ``π(z | s, g)``: an MLP -> logits over ``num_skills``.
+    Actor loss is the exact-soft discrete analogue of CRL's actor loss
+    ``E[α·log π − Q]``:
+        ``J = E_s Σ_z π(z|s,g)·(α·log π(z|s,g) − Q(s,z,g))``,
+    with ``Q(s,z,g) = energy_fn(φ(state, one_hot(z)), ψ(goal))`` evaluated for
+    every skill ``z`` (batched over the ``num_skills`` one-hots).
+
+  - **Entropy / α term**: auto-tuned exactly as in CRL's ``alpha_loss``,
+    ``α·mean(stop_gradient(−log_prob − H̄))`` with ``−log_prob`` replaced by the
+    categorical entropy ``H(π) = −Σ π log π`` and
+    ``H̄ = controller_target_entropy_scale·log(num_skills)`` (the SAC-discrete
+    controller's convention).
+
+The critic is purely contrastive (goal-reaching InfoNCE over (s,z)->future-goal,
+no reward bootstrap / Bellman target) — faithful to ``crl/losses.py``.
 """
 
 from __future__ import annotations
@@ -20,12 +49,15 @@ from __future__ import annotations
 import functools
 import logging
 import time
-from typing import Callable, Tuple
+from typing import Any, Callable, Dict
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import wandb
+from flax.struct import dataclass
+from flax.training.train_state import TrainState
 
 from jaxgcrl.envs.wrappers import (
     EpisodeWrapper,
@@ -37,175 +69,254 @@ from jaxgcrl.envs.wrappers import (
 from jaxgcrl.utils.evaluator import EvalWrapper
 from jaxgcrl.agents.go_explore.utils import save_params
 from jaxgcrl.agents.go_explore.goal_proposers import create_random_env_goals_proposer
-from jaxgcrl.agents.go_explore.empowerment import (
-    infer_empowerment_override_indices_from_env,
-    load_offline_empowerment_agent,
-    make_empowerment_full_obs_builder,
-    make_empowerment_obs_builder,
+from jaxgcrl.agents.go_explore.networks import Encoder
+
+# Frozen-skill adapters + the skill-colored trajectory plot are shared verbatim
+# with the SAC-discrete controller; only the high-level learner differs.
+from jaxgcrl.agents.go_explore_simple.skill_controller import (
+    _plot_skill_colored_trajectory,
+    load_frozen_skill_policy,
+    make_skill_action_fn,
 )
 from jaxgcrl.agents.go_explore_simple.sac_discrete import (
     DiscreteActorNet,
-    DiscreteQNet,
-    create_controller_state,
     her_relabel_sequence,
     init_controller_replay,
     insert_controller_replay,
     sample_controller_replay,
-    sac_discrete_update,
 )
+from jaxgcrl.agents.crl.losses import contrastive_loss_fn, energy_fn
 
 
-# ── Frozen skill-policy adapter (generic over OGBench skill agents) ─────────────
+# ── CRL controller training state ───────────────────────────────────────────────
 
 
-def load_frozen_skill_policy(self, unwrapped_env, template_key):
-    """Load + freeze an OGBench skill-conditioned policy and resolve num_skills.
+@dataclass
+class CRLControllerState:
+    """Training state for the CRL high-level controller (no target critic)."""
 
-    Returns ``(emp_agent, num_skills, skill_obs_builder)``. The skill policy is
-    never differentiated; we only call its frozen ``policy`` submodule.
+    actor_state: TrainState     # categorical actor π(z | s, g)
+    critic_state: TrainState    # {"sa_encoder": ..., "g_encoder": ...}
+    alpha_state: TrainState     # {"log_alpha": ...}
+    env_steps: jnp.ndarray
+    gradient_steps: jnp.ndarray
+
+
+def create_crl_controller_state(
+    actor_net: DiscreteActorNet,
+    sa_encoder: Encoder,
+    g_encoder: Encoder,
+    *,
+    state_size: int,
+    goal_size: int,
+    num_skills: int,
+    policy_lr: float,
+    critic_lr: float,
+    alpha_lr: float,
+    actor_key: jax.Array,
+    sa_key: jax.Array,
+    g_key: jax.Array,
+) -> CRLControllerState:
+    """Initialize the categorical actor, contrastive critic, and α states.
+
+    Mirrors CRL's network/state setup: the critic is a single ``TrainState`` whose
+    params hold both encoders (``sa_encoder`` over ``[state, one_hot(z)]`` and
+    ``g_encoder`` over the goal); ``log_alpha`` starts at 0.
     """
-    state_size = int(unwrapped_env.state_dim)
-    emp_agent, ex_obs_dim, base_obs_template = load_offline_empowerment_agent(
-        run_dir=self.skill_policy_run_dir,
-        jax_env=unwrapped_env,
-        template_rng=template_key,
-        epoch=self.skill_policy_epoch,
-        use_full_obs=self.use_full_skill_obs,
-        ogbench_root=self.ogbench_root,
+    obs_size = state_size + goal_size
+    actor_params = actor_net.init(actor_key, jnp.ones((1, obs_size), dtype=jnp.float32))
+    sa_params = sa_encoder.init(sa_key, jnp.ones((1, state_size + num_skills), dtype=jnp.float32))
+    g_params = g_encoder.init(g_key, jnp.ones((1, goal_size), dtype=jnp.float32))
+
+    actor_state = TrainState.create(
+        apply_fn=actor_net.apply,
+        params=actor_params,
+        tx=optax.adam(learning_rate=policy_lr),
+    )
+    critic_state = TrainState.create(
+        apply_fn=None,
+        params={"sa_encoder": sa_params, "g_encoder": g_params},
+        tx=optax.adam(learning_rate=critic_lr),
+    )
+    alpha_state = TrainState.create(
+        apply_fn=None,
+        params={"log_alpha": jnp.asarray(0.0, dtype=jnp.float32)},
+        tx=optax.adam(learning_rate=alpha_lr),
+    )
+    return CRLControllerState(
+        actor_state=actor_state,
+        critic_state=critic_state,
+        alpha_state=alpha_state,
+        env_steps=jnp.zeros(()),
+        gradient_steps=jnp.zeros(()),
     )
 
-    if self.use_full_skill_obs:
-        if state_size != int(ex_obs_dim):
-            raise ValueError(
-                "use_full_skill_obs=True requires state_size == ex_obs_dim; "
-                f"got state_size={state_size}, ex_obs_dim={ex_obs_dim}."
-            )
-        skill_obs_builder = make_empowerment_full_obs_builder()
-    else:
-        ogbench_obs_indices, jaxgcrl_state_indices = (
-            infer_empowerment_override_indices_from_env(unwrapped_env)
-        )
-        skill_obs_builder = make_empowerment_obs_builder(
-            jnp.asarray(base_obs_template),
-            ogbench_obs_indices,
-            jaxgcrl_state_indices,
-            state_size=state_size,
-        )
 
-    # num_skills: explicit override, else inferred from the checkpoint config.
-    ckpt_num_skills = int(emp_agent.config["num_skills"])
-    if self.num_skills is not None:
-        num_skills = int(self.num_skills)
-        if num_skills != ckpt_num_skills:
-            raise ValueError(
-                f"num_skills override ({num_skills}) disagrees with the loaded skill "
-                f"checkpoint's num_skills ({ckpt_num_skills}); they must match."
-            )
-    else:
-        num_skills = ckpt_num_skills
-
-    return emp_agent, num_skills, skill_obs_builder
+# ── CRL contrastive update (mirrors crl/losses.py, discrete-skill adapted) ───────
 
 
-def make_skill_action_fn(emp_agent, skill_obs_builder, num_skills, *, deterministic):
-    """Adapter: (jaxgcrl states, discrete skill indices) -> low-level actions.
-
-    Generic over any OGBench skill-conditioned agent whose policy submodule has
-    signature ``policy(obs, skills_onehot)`` returning a ``distrax`` dist. The
-    frozen ``emp_agent`` params are captured by closure (no gradient ever flows
-    into them) — identical pattern to ``make_offline_empowerment_scorer``.
-    """
-
-    def skill_action_fn(states: jnp.ndarray, skill_indices: jnp.ndarray, key: jax.Array):
-        emp_obs = skill_obs_builder(states)                  # OGBench-mapped state
-        z_onehot = jax.nn.one_hot(skill_indices, num_skills)
-        dist = emp_agent.network.select("policy")(emp_obs, z_onehot)
-        a = dist.mode() if deterministic else dist.sample(seed=key)
-        return jnp.clip(a, -1.0, 1.0)
-
-    return skill_action_fn
-
-
-# ── Skill-colored trajectory plot ───────────────────────────────────────────────
-
-
-def _plot_skill_colored_trajectory(
-    xy, skills, num_skills, x_bounds, y_bounds, goal_xy=None, title=""
+def crl_controller_update(
+    controller_state: CRLControllerState,
+    batch: Dict[str, jnp.ndarray],
+    *,
+    actor_net: DiscreteActorNet,
+    sa_encoder: Encoder,
+    g_encoder: Encoder,
+    num_skills: int,
+    state_size: int,
+    energy_fn_name: str,
+    contrastive_loss_name: str,
+    logsumexp_penalty_coeff: float,
+    target_entropy: float,
 ):
-    """Plot a single 2D trajectory with each segment colored by the active skill.
+    """One CRL gradient step for the high-level controller.
 
-    ``xy``: (T, 2) positions of the tracked entity (goal_indices[:2]); ``skills``:
-    (T,) int skill index in effect at each step. Returns a matplotlib Figure.
+    Order follows ``crl.py``'s ``update_networks``: actor + α first, then the
+    contrastive critic. ``α`` uses the OLD (pre-update) value for the actor loss,
+    matching CRL. There is no Bellman target / Polyak averaging — the critic is
+    purely contrastive (InfoNCE over (state, one_hot(z)) -> future-goal positives,
+    with in-batch goals as negatives), exactly like ``update_critic``.
     """
-    import matplotlib
+    obs = batch["obs"]                       # (B, obs_size) = [state, goal]
+    skill = batch["skill"].astype(jnp.int32)
+    reward = batch["reward"]
+    done = batch["done"]
+    B = obs.shape[0]
+    state = obs[:, :state_size]              # (B, state_size)
+    goal = obs[:, state_size:]               # (B, goal_size)
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.collections import LineCollection
-    from matplotlib.colors import BoundaryNorm
-    from matplotlib.cm import ScalarMappable
+    actor_params = controller_state.actor_state.params
+    critic_params = controller_state.critic_state.params
+    old_alpha = jnp.exp(controller_state.alpha_state.params["log_alpha"])
 
-    xy = np.asarray(xy, dtype=np.float32)
-    skills = np.asarray(skills).astype(int)
-    cmap = plt.get_cmap("tab20" if num_skills <= 20 else "gist_ncar", num_skills)
-    norm = BoundaryNorm(np.arange(-0.5, num_skills + 0.5, 1.0), num_skills)
+    # ── Actor + α update (mirror crl ``update_actor_and_alpha``, categorical) ──
+    def actor_loss_fn(a_params):
+        logits = actor_net.apply(a_params, obs)            # (B, K)
+        log_pi = jax.nn.log_softmax(logits, axis=-1)       # (B, K)
+        pi = jnp.exp(log_pi)                               # (B, K)
+        entropy = -jnp.sum(pi * log_pi, axis=-1)           # (B,)  H(π)
 
-    fig, ax = plt.subplots(figsize=(6, 6))
-    points = xy.reshape(-1, 1, 2)
-    segments = np.concatenate([points[:-1], points[1:]], axis=1)  # (T-1, 2, 2)
-    lc = LineCollection(segments, cmap=cmap, norm=norm)
-    lc.set_array(skills[:-1])
-    lc.set_linewidth(2.0)
-    ax.add_collection(lc)
+        # Per-skill contrastive Q(s, z, g) for *every* z (batch the K one-hots).
+        sa_params = critic_params["sa_encoder"]
+        g_params = critic_params["g_encoder"]
+        onehots = jnp.eye(num_skills, dtype=state.dtype)               # (K, K)
+        state_b = jnp.broadcast_to(state[:, None, :], (B, num_skills, state_size))
+        onehot_b = jnp.broadcast_to(onehots[None, :, :], (B, num_skills, num_skills))
+        sa_in = jnp.concatenate([state_b, onehot_b], axis=-1)         # (B, K, state+K)
+        sa_repr = sa_encoder.apply(sa_params, sa_in)                  # (B, K, repr)
+        g_repr = g_encoder.apply(g_params, goal)                     # (B, repr)
+        q = energy_fn(energy_fn_name, sa_repr, g_repr[:, None, :])    # (B, K)
+        q = jax.lax.stop_gradient(q)
 
-    ax.scatter(xy[0, 0], xy[0, 1], c="black", marker="o", s=60, zorder=5, label="start")
-    ax.scatter(xy[-1, 0], xy[-1, 1], c="black", marker="s", s=60, zorder=5, label="end")
-    if goal_xy is not None:
-        goal_xy = np.asarray(goal_xy, dtype=np.float32)
-        ax.scatter(goal_xy[0], goal_xy[1], c="red", marker="*", s=220, zorder=6, label="goal")
+        # J = E_s Σ_z π(z|s,g)·(α·log π(z|s,g) − Q(s,z,g))
+        per_state = jnp.sum(pi * (old_alpha * log_pi - q), axis=-1)   # (B,)
+        return jnp.mean(per_state), entropy
 
-    ax.set_xlim(float(x_bounds[0]), float(x_bounds[1]))
-    ax.set_ylim(float(y_bounds[0]), float(y_bounds[1]))
-    ax.set_aspect("equal")
-    ax.set_title(title)
-    ax.legend(loc="upper right", fontsize=8)
-    cbar = fig.colorbar(
-        ScalarMappable(norm=norm, cmap=cmap), ax=ax,
-        ticks=np.arange(num_skills), fraction=0.046, pad=0.04,
+    (actor_loss_val, entropy), actor_grad = jax.value_and_grad(
+        actor_loss_fn, has_aux=True
+    )(actor_params)
+    new_actor_state = controller_state.actor_state.apply_gradients(grads=actor_grad)
+
+    def alpha_loss_fn(alpha_params):
+        alpha = jnp.exp(alpha_params["log_alpha"])
+        # crl alpha_loss: α·mean(stop_gradient(−log_prob − H̄)); discrete
+        # substitution −log_prob -> entropy H(π)  =>  α·mean(sg(H − H̄)).
+        return alpha * jnp.mean(jax.lax.stop_gradient(entropy - target_entropy))
+
+    alpha_loss_val, alpha_grad = jax.value_and_grad(alpha_loss_fn)(
+        controller_state.alpha_state.params
     )
-    cbar.set_label("skill")
-    fig.tight_layout()
-    return fig
+    new_alpha_state = controller_state.alpha_state.apply_gradients(grads=alpha_grad)
+
+    # ── Critic update (mirror crl ``update_critic`` exactly) ─────────────────
+    z_onehot = jax.nn.one_hot(skill, num_skills)           # (B, K)
+
+    def critic_loss_fn(c_params):
+        sa_params = c_params["sa_encoder"]
+        g_params = c_params["g_encoder"]
+        sa_repr = sa_encoder.apply(sa_params, jnp.concatenate([state, z_onehot], axis=-1))
+        g_repr = g_encoder.apply(g_params, goal)
+
+        # InfoNCE over the in-batch goals.
+        logits = energy_fn(energy_fn_name, sa_repr[:, None, :], g_repr[None, :, :])
+        loss = contrastive_loss_fn(contrastive_loss_name, logits)
+
+        # logsumexp regularisation (identical to update_critic).
+        logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
+        loss += logsumexp_penalty_coeff * jnp.mean(logsumexp**2)
+
+        I = jnp.eye(logits.shape[0])
+        correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
+        logits_pos = jnp.sum(logits * I) / jnp.sum(I)
+        logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
+        return loss, (logsumexp, correct, logits_pos, logits_neg)
+
+    (critic_loss_val, (logsumexp, correct, logits_pos, logits_neg)), critic_grad = (
+        jax.value_and_grad(critic_loss_fn, has_aux=True)(critic_params)
+    )
+    new_critic_state = controller_state.critic_state.apply_gradients(grads=critic_grad)
+
+    new_controller_state = controller_state.replace(
+        actor_state=new_actor_state,
+        critic_state=new_critic_state,
+        alpha_state=new_alpha_state,
+        gradient_steps=controller_state.gradient_steps + 1,
+    )
+
+    metrics = {
+        # Reuse the existing controller_* metric keys where they map cleanly.
+        "controller_actor_loss": actor_loss_val,
+        "controller_alpha": old_alpha,
+        "controller_alpha_loss": alpha_loss_val,
+        "controller_entropy": jnp.mean(entropy),
+        "controller_target_entropy": jnp.asarray(target_entropy, dtype=jnp.float32),
+        "controller_critic_loss": critic_loss_val,
+        # Contrastive-critic-specific metrics (mirror update_critic).
+        "controller_categorical_accuracy": jnp.mean(correct),
+        "controller_logits_pos": logits_pos,
+        "controller_logits_neg": logits_neg,
+        "controller_logsumexp": logsumexp.mean(),
+        "controller_reward_mean": jnp.mean(reward),
+        "controller_done_mean": jnp.mean(done),
+    }
+    return new_controller_state, metrics
 
 
 # ── Training routine ────────────────────────────────────────────────────────────
 
 
-def train_skill_controller(
+def train_crl_skill_controller(
     self,
     config,
     train_env,
     eval_env,
     progress_fn: Callable = lambda *a, **k: None,
 ):
-    """SAC-discrete high-level controller over a frozen skill set.
+    """CRL contrastive high-level controller over a frozen skill set.
 
-    ``self`` is the ``GoExploreSimple`` dataclass instance (config holder).
+    ``self`` is the ``GoExploreSimple`` dataclass instance (config holder). The
+    SMDP plumbing mirrors ``train_skill_controller``; the learner is CRL.
     """
+    # CRL fundamentally relies on future-goal positives (HER), so the contrastive
+    # controller requires the HER data path. Non-HER has no contrastive positives.
+    assert bool(self.use_her), (
+        "agent_type='crl_skill' requires use_her=True: the contrastive critic "
+        "is trained on HER future-goal positives (the SMDP analogue of CRL's "
+        "flatten_batch)."
+    )
+
     unwrapped_env = train_env
     eval_env_base = eval_env if eval_env is not None else train_env
 
-    action_size = int(unwrapped_env.action_size)
     state_size = int(unwrapped_env.state_dim)
     goal_size = len(unwrapped_env.goal_indices)
     obs_size = state_size + goal_size
     num_envs = config.num_envs
     k = self.skill_commitment_k
     gamma_low = self.gamma_low
-    gamma_high = self.discounting
 
     rng = jax.random.PRNGKey(config.seed)
-    rng, skill_key, actor_key, critic_key, buf_key, env_key, eval_key = jax.random.split(rng, 7)
+    rng, skill_key, actor_key, sa_key, g_key, env_key = jax.random.split(rng, 6)
     np.random.seed(config.seed)
 
     # ── Frozen skill policy + adapters ───────────────────────────────────────
@@ -213,7 +324,7 @@ def train_skill_controller(
         self, unwrapped_env, skill_key
     )
     logging.info(
-        "skill controller: num_skills=%d, k=%d, use_her=%s, p_future_her_goal=%.3f",
+        "crl skill controller: num_skills=%d, k=%d, use_her=%s, p_future_her_goal=%.3f",
         num_skills, k, bool(self.use_her), float(self.p_future_her_goal),
     )
     skill_action_train = make_skill_action_fn(
@@ -226,36 +337,43 @@ def train_skill_controller(
 
     target_entropy = float(self.controller_target_entropy_scale) * float(np.log(num_skills))
 
-    # ── Controller networks + state ──────────────────────────────────────────
+    # ── Controller networks + state (categorical actor + contrastive critic) ──
     actor_net = DiscreteActorNet(
         num_skills=num_skills, h_dim=self.h_dim, n_hidden=self.n_hidden,
         skip_connections=self.skip_connections, use_relu=self.use_relu, use_ln=self.use_ln,
     )
-    critic_net = DiscreteQNet(
-        num_skills=num_skills, n_critics=2, h_dim=self.h_dim, n_hidden=self.n_hidden,
+    sa_encoder = Encoder(
+        repr_dim=self.repr_dim, network_width=self.h_dim, network_depth=self.n_hidden,
         skip_connections=self.skip_connections, use_relu=self.use_relu, use_ln=self.use_ln,
     )
-    controller_state = create_controller_state(
-        actor_net, critic_net, obs_size,
+    g_encoder = Encoder(
+        repr_dim=self.repr_dim, network_width=self.h_dim, network_depth=self.n_hidden,
+        skip_connections=self.skip_connections, use_relu=self.use_relu, use_ln=self.use_ln,
+    )
+    controller_state = create_crl_controller_state(
+        actor_net, sa_encoder, g_encoder,
+        state_size=state_size, goal_size=goal_size, num_skills=num_skills,
         policy_lr=self.policy_lr, critic_lr=self.critic_lr, alpha_lr=self.alpha_lr,
-        actor_key=actor_key, critic_key=critic_key,
+        actor_key=actor_key, sa_key=sa_key, g_key=g_key,
     )
 
     replay_state = init_controller_replay(self.controller_replay_size, obs_size)
 
-    # ── Env stacks ───────────────────────────────────────────────────────────
-    # Training: TrajectoryIdWrapper -> VmapWrapper -> EpisodeWrapper -> TrainAutoResetWrapper.
-    # NOTE: no GoExploreWrapper and no goal proposers — task goals come from the
-    # env reset. TrainAutoResetWrapper auto-resets done envs to the goal stored
-    # in info['proposed_goals']; we refresh that field with a fresh task goal
-    # every macro-step so each auto-reset draws a new random env goal.
+    # Bound the per-skill kwargs so the update is a clean JIT-friendly closure.
+    _update = functools.partial(
+        crl_controller_update,
+        actor_net=actor_net, sa_encoder=sa_encoder, g_encoder=g_encoder,
+        num_skills=num_skills, state_size=state_size,
+        energy_fn_name=self.energy_fn, contrastive_loss_name=self.contrastive_loss_fn,
+        logsumexp_penalty_coeff=self.logsumexp_penalty_coeff, target_entropy=target_entropy,
+    )
+
+    # ── Env stacks (identical to the SAC-discrete controller) ────────────────
     t_env = TrajectoryIdWrapper(unwrapped_env)
     t_env = VmapWrapper(t_env)
     t_env = EpisodeWrapper(t_env, config.episode_length, config.action_repeat)
     t_env = TrainAutoResetWrapper(t_env)
 
-    # Eval: same stack as the rest of the repo (EvalAutoResetWrapper), wrapped in
-    # EvalWrapper for episode-metric accumulation.
     e_env = TrajectoryIdWrapper(eval_env_base)
     e_env = VmapWrapper(e_env)
     e_env = EpisodeWrapper(e_env, config.episode_length, config.action_repeat)
@@ -273,19 +391,12 @@ def train_skill_controller(
     def rollout_macro_step(env_state, z, key, skill_action_fn):
         """Execute skill ``z`` for ``k`` env steps; return SMDP transition fields.
 
-        R = Σ_{i<k} alive_i · γ_low^i · r_i  (accumulated only up to the first
-        in-window termination); done = any termination in the window; next_obs is
-        the obs at window end (frozen at the first termination via ``alive``).
-        Bootstrap is zeroed by (1−done) so the exact next_obs on done is moot.
-
-        NOTE: this assumes termination is *truncation-only* (episodes end at the
-        length limit, which — with the asserted ``episode_length % k == 0`` — lands
-        exactly on a macro boundary). If the env can terminate early (e.g.
-        ``terminate_when_unhealthy`` or success-terminating tasks), the auto-reset
-        happens mid-window and the same committed skill drives the first steps of
-        the next episode; those steps are masked out of this transition but are not
-        recorded as a fresh macro-step, mildly biasing the initial-state
-        distribution. Use truncation-only envs for the controller.
+        Identical to the SAC-discrete controller's macro-step: ``R`` accumulates
+        ``γ_low``-discounted reward up to the first in-window termination,
+        ``done`` is any termination in the window, ``next_obs`` is frozen at the
+        first termination. (The contrastive critic ignores ``R`` — it learns from
+        HER future-goal positives — but we keep the same transition fields so the
+        replay buffer + relabeling code is shared verbatim.)
         """
         R0 = jnp.zeros((num_envs,), dtype=jnp.float32)
         disc0 = jnp.ones((num_envs,), dtype=jnp.float32)
@@ -316,11 +427,7 @@ def train_skill_controller(
 
     # ── Collect one macro-step of experience for all envs ────────────────────
     def step_macro(controller_state, env_state, key):
-        """One macro-step for all envs; returns the (un-inserted) SMDP transition.
-
-        Captures the ``traj_id`` of the *starting* state so hindsight relabeling
-        can restrict future-goal sampling to the same episode.
-        """
+        """One macro-step for all envs; returns the (un-inserted) SMDP transition."""
         goal_key, z_key, roll_key = jax.random.split(key, 3)
 
         # Refresh task goals so any auto-reset this macro-step draws a fresh goal.
@@ -349,43 +456,13 @@ def train_skill_controller(
         return env_state, step, R, done
 
     def collect_macro(controller_state, env_state, replay_state, key):
-        # insert_controller_replay ignores the extra "traj_id" key.
         env_state, step, R, done = step_macro(controller_state, env_state, key)
         replay_state = insert_controller_replay(replay_state, step)
         return env_state, replay_state, R, done
 
-    # ── One training step: collect + N SAC-discrete updates ──────────────────
     n_grad_steps = max(1, self.train_step_multiplier)
 
-    def training_step(controller_state, env_state, replay_state, key):
-        collect_key, train_key = jax.random.split(key)
-        env_state, replay_state, R, done = collect_macro(
-            controller_state, env_state, replay_state, collect_key
-        )
-
-        def upd(carry, _):
-            cs, k_ = carry
-            k_, sk, uk = jax.random.split(k_, 3)
-            batch = sample_controller_replay(replay_state, sk, self.batch_size)
-            cs, m = sac_discrete_update(
-                cs, batch, uk,
-                actor_net=actor_net, critic_net=critic_net,
-                gamma=gamma_high, tau=self.tau, target_entropy=target_entropy,
-            )
-            return (cs, k_), m
-
-        (controller_state, _), metrics = jax.lax.scan(
-            upd, (controller_state, train_key), (), length=n_grad_steps
-        )
-        controller_state = controller_state.replace(
-            env_steps=controller_state.env_steps + num_envs * k
-        )
-        metrics = jax.tree_util.tree_map(jnp.mean, metrics)
-        metrics["macro_reward_mean"] = jnp.mean(R)
-        metrics["macro_done_mean"] = jnp.mean(done)
-        return controller_state, env_state, replay_state, metrics
-
-    # ── Step bookkeeping ─────────────────────────────────────────────────────
+    # ── Step bookkeeping (identical accounting to the SAC-discrete path) ──────
     env_steps_per_macro = num_envs * k
     num_prefill_macro_steps = int(np.ceil(self.min_replay_size / num_envs))
     num_prefill_env_steps = num_prefill_macro_steps * env_steps_per_macro
@@ -393,8 +470,8 @@ def train_skill_controller(
     env_steps_per_epoch = available_env_steps // config.num_evals
     macro_steps_per_epoch = max(1, env_steps_per_epoch // env_steps_per_macro)
 
-    logging.info("controller num_prefill_macro_steps: %d", num_prefill_macro_steps)
-    logging.info("controller macro_steps_per_epoch:   %d", macro_steps_per_epoch)
+    logging.info("crl controller num_prefill_macro_steps: %d", num_prefill_macro_steps)
+    logging.info("crl controller macro_steps_per_epoch:   %d", macro_steps_per_epoch)
 
     @jax.jit
     def prefill(controller_state, env_state, replay_state, key):
@@ -408,31 +485,13 @@ def train_skill_controller(
         )
         return controller_state, env_state, replay_state
 
-    @jax.jit
-    def training_epoch(controller_state, env_state, replay_state, key):
-        def f(carry, _):
-            cs, es, rs, k_ = carry
-            k_, sk = jax.random.split(k_)
-            cs, es, rs, m = training_step(cs, es, rs, sk)
-            return (cs, es, rs, k_), m
-        (controller_state, env_state, replay_state, _), metrics = jax.lax.scan(
-            f, (controller_state, env_state, replay_state, key), (), length=macro_steps_per_epoch
-        )
-        metrics = jax.tree_util.tree_map(jnp.mean, metrics)
-        return controller_state, env_state, replay_state, metrics
-
-    # ── HER (hindsight relabel) variant ──────────────────────────────────────
+    # ── HER (hindsight relabel) — the contrastive data path ──────────────────
     # Collect a block of macro-steps, relabel each transition's goal with a
     # uniformly-sampled *future* achieved state from the SAME episode (matched by
-    # traj_id), then feed the relabeled transitions through the SAME flat i.i.d.
-    # replay + SAC update path. The block holds one episode (episode_length / k
-    # macro-steps) but is capped at HER_MAX_WINDOW to bound the O(T^2) relabel
-    # matrices; traj_id masking keeps relabeling within-episode even when a capped
-    # block straddles an episode boundary.
+    # traj_id), store in the flat replay, sample i.i.d. batches, and run the CRL
+    # contrastive update with in-batch goals as negatives.
     HER_MAX_WINDOW = 512
-    use_her = bool(self.use_her)
     her_window = min(config.episode_length // k, HER_MAX_WINDOW)  # macro-steps / block
-    # Match the non-HER total step budget: blocks/epoch * her_window ≈ macro_steps/epoch.
     blocks_per_epoch = max(1, int(round(macro_steps_per_epoch / her_window)))
     _goal_indices = jnp.asarray(
         [int(i) for i in np.asarray(unwrapped_env.goal_indices)]
@@ -478,16 +537,12 @@ def train_skill_controller(
 
             def upd(carry2, _):
                 cs2, k2 = carry2
-                k2, sk, uk = jax.random.split(k2, 3)
+                k2, sk = jax.random.split(k2)
                 batch = sample_controller_replay(rs, sk, self.batch_size)
-                cs2, m = sac_discrete_update(
-                    cs2, batch, uk,
-                    actor_net=actor_net, critic_net=critic_net,
-                    gamma=gamma_high, tau=self.tau, target_entropy=target_entropy,
-                )
+                cs2, m = _update(cs2, batch)
                 return (cs2, k2), m
 
-            # Keep updates-per-collected-macro-step equal to the non-HER path.
+            # Keep updates-per-collected-macro-step equal to the non-HER budget.
             (cs, _), m = jax.lax.scan(
                 upd, (cs, train_key), (), length=her_window * n_grad_steps
             )
@@ -504,8 +559,6 @@ def train_skill_controller(
         )
         metrics = jax.tree_util.tree_map(jnp.mean, metrics)
         return controller_state, env_state, replay_state, metrics
-
-    training_epoch_fn = training_epoch_her if use_her else training_epoch
 
     # ── Dedicated eval: argmax controller + deterministic skill policy ───────
     num_eval_envs = config.num_eval_envs
@@ -525,9 +578,6 @@ def train_skill_controller(
             new_skill = jnp.argmax(logits, axis=-1).astype(jnp.int32)
             reselect = (i % k) == 0
             skill = jnp.where(reselect, new_skill, skill)
-            # `key` is intentionally reused across steps: skill_action_eval is
-            # deterministic (dist.mode()), so the key is inert here. If eval is
-            # ever switched to stochastic skill actions, split a per-step key.
             a = skill_action_eval(state.obs[:, :state_size], skill, key)
             nstate = e_env.step(state, a)
             return (nstate, skill), skill
@@ -558,10 +608,10 @@ def train_skill_controller(
         out["eval/skill_entropy"] = float(-(fracs[nz] * np.log(fracs[nz])).sum())
         out["eval/skill_max_frac"] = float(fracs.max())
         out["eval/skill_active_count"] = float((counts > 0).sum())
-        # Stash the histogram under the reserved media key so progress_fn logs it
-        # in the SAME wandb.log call as the scalar metrics. A separate wandb.log
-        # at this step would establish the step first and (online) drop the later
-        # scalar row — which is why every controller_* metric read back as zero.
+        # Route the histogram through the single per-step log_wandb call (via the
+        # reserved "_wandb_media" key) instead of a separate same-step wandb.log,
+        # which the live server would treat as a step collision and drop the
+        # scalar metrics logged afterward (zeros in wandb). See utils/env.py.
         media = out.setdefault("_wandb_media", {})
         media["eval/skill_usage_hist"] = wandb.Histogram(
             np_histogram=(counts, np.arange(num_skills + 1) - 0.5)
@@ -569,17 +619,12 @@ def train_skill_controller(
         return out
 
     # ── Render: faithful hierarchical rollout (controller + frozen skill) ────
-    # Single un-vmapped env, Python loop honoring the k-step commitment, logging
-    # (1) a brax 3D HTML render (proves the two-policy rollout works) and
-    # (2) a 2D trajectory whose segments are colored by the active skill.
     prim_idx = np.asarray(unwrapped_env.goal_indices)[:2]  # tracked entity xy
 
     def render_skill_controller(controller_state, key, num_steps):
         from brax.io import html
 
-        # Returns a dict of wandb media objects to be logged via the shared
-        # log_wandb call (same single-wandb.log-per-step rationale as run_eval).
-        media = {}
+        media = {}  # accumulate renders; merged into the single per-step log_wandb
         actor_params = controller_state.actor_state.params
 
         @jax.jit
@@ -634,7 +679,6 @@ def train_skill_controller(
             plt.close(fig)
         except Exception as e:
             logging.warning("skill trajectory plot failed: %s", e)
-
         return media
 
     # ── Prefill ──────────────────────────────────────────────────────────────
@@ -645,8 +689,7 @@ def train_skill_controller(
 
     # ── Main loop ────────────────────────────────────────────────────────────
     def make_policy(params, deterministic: bool = True):
-        # Thin per-step hierarchical policy (re-selects each call; used only for
-        # optional rendering). params = (actor_params,).
+        # Thin per-step hierarchical policy (used only for optional rendering).
         actor_params = params[0]
 
         def policy(obs, rng_key):
@@ -661,12 +704,12 @@ def train_skill_controller(
     training_walltime = 0.0
     metrics = {}
     current_step = 0
-    logging.info("starting skill-controller training....")
+    logging.info("starting crl skill-controller training....")
 
     for ne in range(config.num_evals):
         t = time.time()
         rng, epoch_key, eval_rng = jax.random.split(rng, 3)
-        controller_state, env_state, replay_state, raw_metrics = training_epoch_fn(
+        controller_state, env_state, replay_state, raw_metrics = training_epoch_her(
             controller_state, env_state, replay_state, epoch_key
         )
         raw_metrics = jax.tree_util.tree_map(lambda x: x.block_until_ready(), raw_metrics)
@@ -695,15 +738,13 @@ def train_skill_controller(
         if config.checkpoint_logdir:
             save_params(f"{config.checkpoint_logdir}/step_{current_step}.pkl", params)
 
-        # Skill-colored trajectory + 3D HTML render, every visualization_interval
-        # evals. We drive the hierarchical (controller + frozen skill) rollout
-        # ourselves, so the generic progress_fn render stays disabled.
         vis_interval = getattr(config, "visualization_interval", 0)
         if vis_interval and (ne % vis_interval == 0):
             rng, render_key = jax.random.split(rng)
             try:
                 render_media = render_skill_controller(controller_state, render_key, current_step)
-                metrics.setdefault("_wandb_media", {}).update(render_media)
+                if render_media:
+                    metrics.setdefault("_wandb_media", {}).update(render_media)
             except Exception as e:  # never let rendering crash training
                 logging.warning("render_skill_controller failed: %s", e)
         progress_fn(current_step, metrics, make_policy, (controller_state.actor_state.params,),

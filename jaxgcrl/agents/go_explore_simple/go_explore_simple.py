@@ -80,9 +80,10 @@ class GoExploreSimple:
     """
 
     # Algorithm type for the goal-conditioned policy.
-    # "sac_discrete" branches into the hierarchical skill controller
-    # (see skill_controller.py / SKILL_CONTROLLER_DESIGN.md).
-    agent_type: Literal["sac", "crl", "sac_discrete"] = "crl"
+    # "sac_discrete" branches into the hierarchical SAC-discrete skill controller;
+    # "crl_skill" branches into the hierarchical *contrastive* (CRL) skill
+    # controller (see skill_controller.py / crl_skill_controller.py).
+    agent_type: Literal["sac", "crl", "sac_discrete", "crl_skill"] = "crl"
 
     policy_lr: float = 3e-4
     critic_lr: float = 3e-4
@@ -164,9 +165,9 @@ class GoExploreSimple:
     controller_replay_size: int = 50000
 
     def check_config(self, config):
-        if self.agent_type == "sac_discrete":
+        if self.agent_type in ("sac_discrete", "crl_skill"):
             assert self.skill_policy_run_dir is not None, (
-                "agent_type='sac_discrete' requires skill_policy_run_dir (OGBench skill checkpoint)."
+                f"agent_type='{self.agent_type}' requires skill_policy_run_dir (OGBench skill checkpoint)."
             )
             assert self.skill_commitment_k > 0, "skill_commitment_k must be > 0"
             assert config.episode_length % self.skill_commitment_k == 0, (
@@ -177,6 +178,13 @@ class GoExploreSimple:
                 "num_skills (if set) must be > 1 for a discrete controller."
             )
             assert config.num_evals > 0, "num_evals must be > 0"
+            if self.agent_type == "crl_skill":
+                # The contrastive controller learns from HER future-goal positives
+                # (the SMDP analogue of CRL's flatten_batch); HER is mandatory.
+                assert bool(self.use_her), (
+                    "agent_type='crl_skill' requires use_her=True (contrastive critic "
+                    "trains on HER future-goal positives)."
+                )
             return
 
         assert config.episode_length - 1 == self.num_gcp_steps + self.num_ep_steps, (
@@ -199,6 +207,17 @@ class GoExploreSimple:
         )
         return train_skill_controller(self, config, train_env, eval_env, progress_fn)
 
+    def _train_crl_skill_controller(self, config, train_env, eval_env, progress_fn):
+        """Hierarchical *contrastive* (CRL) controller over a frozen skill policy.
+
+        Thin wrapper; all logic lives in
+        ``crl_skill_controller.train_crl_skill_controller``.
+        """
+        from jaxgcrl.agents.go_explore_simple.crl_skill_controller import (
+            train_crl_skill_controller,
+        )
+        return train_crl_skill_controller(self, config, train_env, eval_env, progress_fn)
+
     def train_fn(
         self,
         config: "RunConfig",
@@ -213,6 +232,11 @@ class GoExploreSimple:
 
         if self.agent_type == "sac_discrete":
             return self._train_skill_controller(
+                config, train_env, eval_env, progress_fn
+            )
+
+        if self.agent_type == "crl_skill":
+            return self._train_crl_skill_controller(
                 config, train_env, eval_env, progress_fn
             )
 
