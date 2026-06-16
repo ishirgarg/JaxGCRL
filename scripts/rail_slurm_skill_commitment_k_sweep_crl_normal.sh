@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=120:00:00
-#SBATCH --array=0-15
+#SBATCH --array=0-23
 
 # CRL (contrastive) hierarchical skill controller: sweep over the temporal
 # commitment k = {1, 5, 10, 20} AND the controller target-entropy scale
@@ -36,10 +36,10 @@
 #     --energy_fn, --contrastive_loss_fn, --logsumexp_penalty_coeff, --repr_dim.
 #
 # Full sweep = 6 base configs x 4 k-values x 3 entropy-scales x 1 seed = 72 runs,
-# split 16 (normal) / 16 (low) / 40 (lowest):
-#     normal : OFFSET=0  --array=0-15  -> CFG_IDX 0..15
-#     low    : OFFSET=16 --array=0-15  -> CFG_IDX 16..31
-#     lowest : OFFSET=32 --array=0-39  -> CFG_IDX 32..71
+# split 24 (normal) / 24 (low) / 24 (lowest):
+#     normal : OFFSET=0  --array=0-23  -> CFG_IDX 0..23
+#     low    : OFFSET=24 --array=0-23  -> CFG_IDX 24..47
+#     lowest : OFFSET=48 --array=0-23  -> CFG_IDX 48..71
 #
 #   Base configs (env, skill-policy ckpt, num_skills), indexed by BASE_IDX:
 #     0  ant_maze_ogbench_medium_navigate          34594838 (50)
