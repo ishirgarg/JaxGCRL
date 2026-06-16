@@ -6,12 +6,13 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=120:00:00
-#SBATCH --array=0-7
+#SBATCH --array=0-15
 
-# SAC-discrete hierarchical skill controller: sweep over the temporal
-# commitment k = {1, 5, 10, 20} on two OGBench env families, each with two
-# frozen skill-policy checkpoints (15- and 50-skill). HER (uniform-future
-# relabel) is ON for all runs (--use_her --p_future_her_goal 0.8). SINGLE SEED (0).
+# SAC-discrete hierarchical skill controller: sweep over the temporal commitment
+# k = {1, 5, 10, 20} AND the controller target-entropy scale {0.25, 0.5, 0.75}
+# (replacing the 0.98 default) on two OGBench env families, each with two frozen
+# skill-policy checkpoints (15- and 50-skill). HER (uniform-future relabel) is ON
+# for all runs (--use_her --p_future_her_goal 0.8). SINGLE SEED (0).
 #
 # agent_type=sac_discrete trains an online SAC-discrete high-level controller
 # that picks a discrete skill every k env steps over a FROZEN OGBench
@@ -24,14 +25,15 @@
 #     episode_length must be divisible by 20, so we use gcp+ep exactly (no +1):
 #       env1 (antmaze):   gcp 800 + ep 800 -> episode_length 1600  (1600 % 20 == 0)
 #       env2 (antsoccer): gcp 400 + ep 400 -> episode_length  800  ( 800 % 20 == 0)
-#   * --num_skills is passed explicitly per checkpoint (must match the ckpt;
-#     also makes the value show up in the wandb config rather than null).
+#   * --num_skills is passed explicitly per checkpoint (must match the ckpt).
+#   * --controller_target_entropy_scale sweeps the discrete-SAC target entropy
+#     H_bar = scale * log(num_skills).
 #
-# Full sweep = 6 base configs x 4 k-values x 1 seed = 24 runs, split across 3
-# priority tiers of 8 (8 configs each, all seed 0):
-#     normal : OFFSET=0  -> CFG_IDX 0..7   (base 0-1: antmaze)
-#     low    : OFFSET=8  -> CFG_IDX 8..15  (base 2-3: antsoccer sq1g)
-#     lowest : OFFSET=16 -> CFG_IDX 16..23 (base 4-5: antsoccer sq)
+# Full sweep = 6 base configs x 4 k-values x 3 entropy-scales x 1 seed = 72 runs,
+# split 16 (normal) / 16 (low) / 40 (lowest):
+#     normal : OFFSET=0  --array=0-15  -> CFG_IDX 0..15
+#     low    : OFFSET=16 --array=0-15  -> CFG_IDX 16..31
+#     lowest : OFFSET=32 --array=0-39  -> CFG_IDX 32..71
 #
 #   Base configs (env, skill-policy ckpt, num_skills), indexed by BASE_IDX:
 #     0  ant_maze_ogbench_medium_navigate          34594838 (50)
@@ -42,9 +44,10 @@
 #     5  ant_ball_ogbench_small_easy_square         34739255 (50)
 #
 # Index decoding:
-#   CFG_IDX  = OFFSET + SLURM_ARRAY_TASK_ID   (0..23)
-#   BASE_IDX = CFG_IDX / 4                     (0..5)
-#   K_IDX    = CFG_IDX % 4                     (0..3)
+#   CFG_IDX  = OFFSET + SLURM_ARRAY_TASK_ID   (0..71)
+#   ENT_IDX  = CFG_IDX % 3                     (0..2)
+#   K_IDX    = (CFG_IDX / 3) % 4               (0..3)
+#   BASE_IDX = CFG_IDX / 12                    (0..5)
 #   SEED     = 0 (fixed)
 
 # Local wandb run data goes to BRC scratch (home quota is small).
@@ -79,12 +82,14 @@ EP_STEPS=(800 800 400 400 400 400)
 SHORT=(am_medium am_medium asoc_sq1g asoc_sq1g asoc_sq asoc_sq)
 
 K_VALUES=(1 5 10 20)
+ENT_SCALES=(0.25 0.5 0.75)
 SEED=0
 
 # ── Decode this array task ──────────────────────────────────────────────────
 CFG_IDX=$((OFFSET + SLURM_ARRAY_TASK_ID))
-BASE_IDX=$((CFG_IDX / 4))
-K_IDX=$((CFG_IDX % 4))
+ENT_IDX=$((CFG_IDX % 3))
+K_IDX=$(((CFG_IDX / 3) % 4))
+BASE_IDX=$((CFG_IDX / 12))
 
 ENV=${ENVS[$BASE_IDX]}
 CKPT=${CKPTS[$BASE_IDX]}
@@ -94,11 +99,12 @@ GCP=${GCP_STEPS[$BASE_IDX]}
 EP=${EP_STEPS[$BASE_IDX]}
 TAG=${SHORT[$BASE_IDX]}
 K=${K_VALUES[$K_IDX]}
+ENT=${ENT_SCALES[$ENT_IDX]}
 
 SKILL_DIR="${CKPT_PREFIX}/${CKPT}"
-EXP_NAME="${TAG}__skilldisc_ns${NSKILLS}_k${K}__s${SEED}"
+EXP_NAME="${TAG}__skilldisc_ns${NSKILLS}_k${K}_ent${ENT}__s${SEED}"
 
-echo "CFG_IDX=$CFG_IDX  ENV=$ENV  CKPT=$CKPT  NUM_SKILLS=$NSKILLS  K=$K  SEED=$SEED  EXP=$EXP_NAME"
+echo "CFG_IDX=$CFG_IDX  ENV=$ENV  CKPT=$CKPT  NUM_SKILLS=$NSKILLS  K=$K  ENT=$ENT  SEED=$SEED  EXP=$EXP_NAME"
 
 python run.py go-explore-simple \
         --agent_type sac_discrete \
@@ -111,6 +117,7 @@ python run.py go-explore-simple \
         --ogbench_root /global/home/users/ishirgarg/ogbench \
         --num_skills $NSKILLS \
         --skill_commitment_k $K \
+        --controller_target_entropy_scale $ENT \
         --use_her \
         --p_future_her_goal 0.8 \
         --seed $SEED \
