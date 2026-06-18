@@ -128,7 +128,7 @@ class GoExploreSimple:
     empowerment_alpha: float = 1.0
     empowerment_run_dir: Optional[str] = None
     empowerment_epoch: Optional[int] = None
-    empowerment_num_splus_samples: int = 12
+    empowerment_num_splus_samples: int = 16
     empowerment_score_chunk_size: int = 32
     # If True, feed the full state (obs with goal sliced off) to the
     # empowerment network instead of overwriting a few indices of a cached
