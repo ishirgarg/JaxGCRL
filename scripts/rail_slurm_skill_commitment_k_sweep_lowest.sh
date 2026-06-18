@@ -119,6 +119,6 @@ python run.py go-explore-simple \
         --p_future_her_goal 0.8 \
         --seed $SEED \
         --exp_name $EXP_NAME \
-        --wandb_project_name jaxgcrl \
+        --wandb_project_name jaxgcrl_new \
         --wandb_group skill_commitment_k_sweep \
         --log_wandb

@@ -42,6 +42,6 @@ python run.py go-explore-simple \
         --num_gcp_steps $NUM_GCP_STEPS \
         --num_ep_steps $NUM_EP_STEPS \
         --exp_name umaze_mega__s${SEED} \
-        --wandb_project_name jaxgcrl \
+        --wandb_project_name jaxgcrl_new \
         --wandb_group umaze_mega \
         --log_wandb

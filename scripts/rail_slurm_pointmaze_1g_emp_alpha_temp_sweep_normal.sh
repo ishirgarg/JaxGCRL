@@ -63,6 +63,6 @@ python run.py go-explore-simple \
         --seed $SEED \
         $PROPOSER_ARGS \
         --exp_name $EXP_NAME \
-        --wandb_project_name jaxgcrl \
+        --wandb_project_name jaxgcrl_new \
         --wandb_group pointmaze_1g_emp_alpha_temp_sweep \
         --log_wandb
