@@ -17,8 +17,8 @@
 #
 # Two empowerment checkpoints (used by the empowerment / density_product
 # proposers; MEGA ignores them):
-#   34594770 : .../ckpts/antsoccer/sd000_s_34594770.0.20260527_234149
-#   34594769 : .../ckpts/antsoccer/sd000_s_34594769.0.20260527_234149
+#   34594770 : .../ckpts/antsoccer-arena-navigate/sd000_s_34594770.0.20260527_234149
+#   34594769 : .../ckpts/antsoccer-arena-navigate/sd000_s_34594769.0.20260527_234149
 #
 # Per-proposer sweeps (mimicking the existing scripts):
 #   * empowerment              — alpha∈{1,3,10} × temp∈{0,0.03,0.1,0.01} = 12
@@ -73,7 +73,7 @@ GCP_STEPS=300
 EP_STEPS=300
 
 # ── Empowerment checkpoints (indexed by CKPT_IDX) ───────────────────────────
-CKPT_PREFIX=/global/home/users/ishirgarg/ogbench/impls/ckpts/antsoccer
+CKPT_PREFIX=/global/home/users/ishirgarg/ogbench/impls/ckpts/antsoccer-arena-navigate
 EMP_DIRS=(
   "${CKPT_PREFIX}/sd000_s_34594770.0.20260527_234149"
   "${CKPT_PREFIX}/sd000_s_34594769.0.20260527_234149"
