@@ -252,40 +252,44 @@ def make_online_empowerment_train_fn(
 
 
 def make_online_empowerment_scorer(
-    *, mean: float = 0.0, scale: float = 1.0, num_score_samples: int = 1,
+    *, mean: float = 0.0, scale: float = 1.0, chunk_size: int = 32,
 ) -> Callable[[Any, jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Return ``score(agent, states, rng) -> normalized empowerment per state``.
 
-    Mirrors the offline scorer's normalization: emits ``(raw - mean) / scale``.
-    ``states`` is ``(B, state_size)``; the agent's MC empowerment estimate
-    ``I(Z; S+ | s)`` is evaluated per row.
+    Mirrors the offline scorer (:func:`empowerment.make_offline_empowerment_scorer`):
+    emits ``(raw - mean) / scale`` and evaluates ``agent.empowerment`` on
+    candidate rows in batches of at most ``chunk_size`` via ``lax.fori_loop``, so
+    peak activation memory scales with ``chunk_size`` instead of the full
+    candidate count. This matters because the proposer runs the scorer under a
+    ``vmap`` over environments — without chunking, ``num_candidates`` × ``num_envs``
+    × K skills × N MC samples can OOM.
 
-    ``num_score_samples`` averages that many independent ``agent.empowerment``
-    evaluations (each an N=``num_splus_samples`` MC draw over all skills). Since
-    the estimator averages over skill/ψ samples, averaging M calls is equivalent
-    to an M·N-sample estimate — this lowers the variance of the *scores used for
-    goal selection* WITHOUT changing training (the agent still trains with its
-    configured ``num_splus_samples``). It mirrors the offline proposer, which
-    loaded its checkpoint with a high ``num_splus_samples`` purely for scoring.
-    The accumulation uses ``lax.fori_loop`` so peak memory stays at one eval.
+    Variance of the per-state estimate is governed by the agent's own
+    ``num_splus_samples`` (the MC draws inside ``empowerment``); no extra
+    call-averaging is done here.
     """
-    if int(num_score_samples) < 1:
-        raise ValueError(f"num_score_samples must be >= 1, got {num_score_samples}.")
+    if int(chunk_size) < 1:
+        raise ValueError(f"chunk_size must be >= 1, got {chunk_size}.")
     mean_f = jnp.asarray(mean, dtype=jnp.float32)
     scale_f = jnp.asarray(scale, dtype=jnp.float32)
-    M = int(num_score_samples)
+    cs = int(chunk_size)
 
     def score(agent, states: jnp.ndarray, rng: jnp.ndarray) -> jnp.ndarray:
-        if M == 1:
-            raw = agent.empowerment(states, rng=rng).astype(jnp.float32)
-        else:
-            acc0 = jnp.zeros((states.shape[0],), dtype=jnp.float32)
+        n = states.shape[0]
+        pad = (cs - (n % cs)) % cs
+        states_pad = jnp.pad(states, ((0, pad), (0, 0)))
+        total = states_pad.shape[0]
+        n_chunks = total // cs
+        acc0 = jnp.zeros((total,), dtype=jnp.float32)
 
-            def body(i, acc):
-                ki = jax.random.fold_in(rng, i)
-                return acc + agent.empowerment(states, rng=ki).astype(jnp.float32)
+        def body(i, acc):
+            chunk = jax.lax.dynamic_slice_in_dim(states_pad, i * cs, cs, axis=0)
+            ki = jax.random.fold_in(rng, i)
+            s = agent.empowerment(chunk, rng=ki).astype(jnp.float32)
+            s = jnp.reshape(s, (cs,))
+            return jax.lax.dynamic_update_slice(acc, s, (i * cs,))
 
-            raw = jax.lax.fori_loop(0, M, body, acc0) / jnp.asarray(M, jnp.float32)
-        return (raw - mean_f) / scale_f
+        acc = jax.lax.fori_loop(0, n_chunks, body, acc0)
+        return (acc[:n] - mean_f) / scale_f
 
     return score

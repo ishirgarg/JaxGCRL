@@ -417,9 +417,10 @@ class GoExploreSimple:
             )
             online_empowerment_score_fn = make_online_empowerment_scorer(
                 mean=self.empowerment_bonus_mean, scale=self.empowerment_bonus_scale,
-                # Score with more MC samples than training (matches the offline
-                # proposer's high-sample scoring); does not affect training.
-                num_score_samples=self.empowerment_num_splus_samples,
+                # Chunk candidates (as the offline scorer does) to bound memory
+                # under the per-env vmap; variance comes from the agent's own
+                # num_splus_samples.
+                chunk_size=self.empowerment_score_chunk_size,
             )
             online_empowerment_train_fn = make_online_empowerment_train_fn(
                 state_size=state_size,
@@ -967,13 +968,13 @@ class GoExploreSimple:
             # under "training/".
             metrics_dict = {}
             for name, value in metrics.items():
-                key = name if name.startswith("online_empowerment/") else f"training/{name}"
+                metric_key = name if name.startswith("online_empowerment/") else f"training/{name}"
                 if hasattr(value, 'item'):
-                    metrics_dict[key] = float(value.item())
+                    metrics_dict[metric_key] = float(value.item())
                 elif hasattr(value, '__float__'):
-                    metrics_dict[key] = float(value)
+                    metrics_dict[metric_key] = float(value)
                 else:
-                    metrics_dict[key] = value
+                    metrics_dict[metric_key] = value
 
             metrics = {
                 "training/sps": sps,
