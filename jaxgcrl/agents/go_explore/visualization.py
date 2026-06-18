@@ -1512,3 +1512,50 @@ def visualize_omega_candidates(
         "omega_kl_div":     kl_div,
     })
     plt.close(fig)
+
+def log_online_empowerment_heatmap(
+    score_fn,
+    emp_agent,
+    states,
+    goal_indices: Tuple[int, ...],
+    x_bounds,
+    y_bounds,
+    rng,
+    current_step: int,
+    max_points: int = 4096,
+) -> None:
+    """Scatter a random sample of replay-buffer states colored by online empowerment.
+
+    ``score_fn`` is ``(emp_agent, states, rng) -> (N,)`` (the online empowerment
+    scorer). ``states`` is an ``(N, state_size)`` array sampled from the replay
+    buffer; the first two ``goal_indices`` are treated as the xy coordinates.
+    Logged to wandb as ``online_empowerment_heatmap``.
+    """
+    states = np.asarray(states, dtype=np.float32)
+    if states.ndim != 2 or states.shape[0] == 0 or len(goal_indices) < 2:
+        return
+    if goal_indices[0] >= states.shape[1] or goal_indices[1] >= states.shape[1]:
+        return
+    if states.shape[0] > max_points:
+        states = states[:max_points]
+
+    scores = np.asarray(score_fn(emp_agent, jnp.asarray(states), rng)).reshape(-1)
+    xs = states[:, goal_indices[0]]
+    ys = states[:, goal_indices[1]]
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    sc = ax.scatter(xs, ys, c=scores, cmap="viridis", s=8, alpha=0.8)
+    fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label="Empowerment")
+    if x_bounds is not None:
+        ax.set_xlim(float(x_bounds[0]), float(x_bounds[1]))
+    if y_bounds is not None:
+        ax.set_ylim(float(y_bounds[0]), float(y_bounds[1]))
+    ax.set_xlabel(f"obs[{goal_indices[0]}] (x)")
+    ax.set_ylabel(f"obs[{goal_indices[1]}] (y)")
+    ax.set_title(f"online empowerment (replay states)  step={current_step}")
+    ax.set_aspect("equal", adjustable="box")
+    fig.tight_layout()
+
+    log_kwargs = {"step": current_step} if current_step >= 0 else {}
+    wandb.log({"online_empowerment_heatmap": wandb.Image(fig)}, **log_kwargs)
+    plt.close(fig)

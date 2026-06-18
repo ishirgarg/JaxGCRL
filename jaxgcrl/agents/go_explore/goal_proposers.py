@@ -22,6 +22,7 @@ def create_goal_proposer(
     critic: Optional[Any] = None,
     discounting: float=0.99,
     offline_empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
+    online_empowerment_score_fn: Optional[Callable[[Any, jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
     goal_proposer_temperature: float = 0.0,
     empowerment_alpha: float = 1.0,
 ) -> Callable:
@@ -40,11 +41,33 @@ def create_goal_proposer(
         discounting: Discount factor for geometric future-state sampling (ucgr only)
         goal_proposer_temperature: For ``mega``, ``omega`` (MEGA branch), and ``empowerment``:
             sample index from ``softmax(logits / T)``; ``T <= 0`` means greedy ``argmax(logits)``.
+        offline_empowerment_scorer: ``(states, rng) -> scores`` using a pretrained
+            empowerment checkpoint. Mutually exclusive with ``online_empowerment_score_fn``.
+        online_empowerment_score_fn: ``(empowerment_state, states, rng) -> scores`` using the
+            online empowerment agent carried in ``goal_proposer_state.empowerment_state``.
 
     Returns:
         A goal proposer function that takes (rng, start_obs, goal_proposer_state) and returns (goal, updated_state).
         The goal proposer state can be read from and written to.
     """
+    # Unify the offline (frozen checkpoint) and online (live agent) empowerment
+    # scorers behind a single ``(states, rng, goal_proposer_state) -> scores``
+    # closure so the proposer bodies are identical regardless of the source.
+    if offline_empowerment_scorer is not None and online_empowerment_score_fn is not None:
+        raise ValueError(
+            "Provide at most one of offline_empowerment_scorer / online_empowerment_score_fn."
+        )
+    if online_empowerment_score_fn is not None:
+        def _empowerment_scorer(states, rng, goal_proposer_state):
+            return online_empowerment_score_fn(
+                goal_proposer_state.empowerment_state, states, rng
+            )
+    elif offline_empowerment_scorer is not None:
+        def _empowerment_scorer(states, rng, goal_proposer_state):
+            return offline_empowerment_scorer(states, rng)
+    else:
+        _empowerment_scorer = None
+
     if goal_proposer_name == "random_env_goals":
         proposer_fn = create_random_env_goals_proposer(env, num_envs)
         # Wrap to take (rng, start_obs, goal_proposer_state) - start_obs and state ignored
@@ -87,7 +110,7 @@ def create_goal_proposer(
             num_candidates,
             state_size,
             goal_indices,
-            offline_empowerment_scorer,
+            _empowerment_scorer,
             temperature=goal_proposer_temperature,
             alpha=empowerment_alpha,
         )
@@ -98,7 +121,7 @@ def create_goal_proposer(
             num_candidates,
             state_size,
             goal_indices,
-            offline_empowerment_scorer,
+            _empowerment_scorer,
             temperature=goal_proposer_temperature,
         )
     elif goal_proposer_name == "empowerment_density_product":
@@ -108,7 +131,7 @@ def create_goal_proposer(
             num_candidates,
             state_size,
             goal_indices,
-            offline_empowerment_scorer,
+            _empowerment_scorer,
             temperature=goal_proposer_temperature,
             alpha=empowerment_alpha,
         )
@@ -486,7 +509,7 @@ def create_empowerment_goal_proposer(
     num_candidates: int,
     state_size: Optional[int] = None,
     goal_indices: Optional[tuple] = None,
-    offline_empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
+    empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray, GoalProposerState], jnp.ndarray]] = None,
     temperature: float = 0.0,
     alpha: float = 1.0,
     kde_bandwidth: float = 0.1,
@@ -496,9 +519,12 @@ def create_empowerment_goal_proposer(
 
     Selection: ``softmax((alpha * empowerment - log_density) / T)`` when ``T > 0``,
     else ``argmax(alpha * empowerment - log_density)`` (greedy when ``T == 0``).
+
+    ``empowerment_scorer`` is ``(states, rng, goal_proposer_state) -> scores`` and may be
+    backed by either a pretrained checkpoint (offline) or the live online agent.
     """
-    if offline_empowerment_scorer is None:
-        raise ValueError("offline_empowerment_scorer must be provided for empowerment proposer.")
+    if empowerment_scorer is None:
+        raise ValueError("empowerment_scorer must be provided for empowerment proposer.")
 
     goal_idx_array = jnp.array(goal_indices)
     alpha_f = jnp.asarray(alpha, dtype=jnp.float32)
@@ -519,7 +545,7 @@ def create_empowerment_goal_proposer(
         densities = _jax_gaussian_kde(candidate_goals, all_goals, kde_bandwidth)
         log_density = jnp.log(densities + kde_eps)
 
-        emp_scores = offline_empowerment_scorer(candidate_states, emp_rng)  # (num_candidates,)
+        emp_scores = empowerment_scorer(candidate_states, emp_rng, goal_proposer_state)  # (num_candidates,)
         logits = alpha_f * emp_scores - log_density
         best_idx = _sample_idx_from_temperature_logits(select_rng, logits, temperature)
         selected_state = candidate_states[best_idx]
@@ -548,7 +574,7 @@ def create_empowerment_density_ratio_goal_proposer(
     num_candidates: int,
     state_size: Optional[int] = None,
     goal_indices: Optional[tuple] = None,
-    offline_empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
+    empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray, GoalProposerState], jnp.ndarray]] = None,
     temperature: float = 0.0,
     kde_bandwidth: float = 0.1,
     kde_eps: float = 1e-8,
@@ -562,8 +588,8 @@ def create_empowerment_density_ratio_goal_proposer(
     Selection: ``softmax((empowerment / log_density) / T)`` when ``T > 0``, else
     ``argmax(empowerment / log_density)``.
     """
-    if offline_empowerment_scorer is None:
-        raise ValueError("offline_empowerment_scorer must be provided for empowerment_density_ratio proposer.")
+    if empowerment_scorer is None:
+        raise ValueError("empowerment_scorer must be provided for empowerment_density_ratio proposer.")
 
     goal_idx_array = jnp.array(goal_indices)
 
@@ -582,7 +608,7 @@ def create_empowerment_density_ratio_goal_proposer(
         densities = _jax_gaussian_kde(candidate_goals, all_goals, kde_bandwidth)
         log_density = jnp.log(densities + kde_eps)
 
-        emp_scores = offline_empowerment_scorer(candidate_states, emp_rng)
+        emp_scores = empowerment_scorer(candidate_states, emp_rng, goal_proposer_state)
         logits = emp_scores / log_density
         best_idx = _sample_idx_from_temperature_logits(select_rng, logits, temperature)
         selected_state = candidate_states[best_idx]
@@ -611,7 +637,7 @@ def create_empowerment_density_product_goal_proposer(
     num_candidates: int,
     state_size: Optional[int] = None,
     goal_indices: Optional[tuple] = None,
-    offline_empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]] = None,
+    empowerment_scorer: Optional[Callable[[jnp.ndarray, jnp.ndarray, GoalProposerState], jnp.ndarray]] = None,
     temperature: float = 0.0,
     alpha: float = 1.0,
     kde_bandwidth: float = 0.1,
@@ -628,8 +654,8 @@ def create_empowerment_density_product_goal_proposer(
     Selection: ``softmax((-(emp**alpha) * log_density) / T)`` when ``T > 0``, else
     ``argmax(-(emp**alpha) * log_density)``.
     """
-    if offline_empowerment_scorer is None:
-        raise ValueError("offline_empowerment_scorer must be provided for empowerment_density_product proposer.")
+    if empowerment_scorer is None:
+        raise ValueError("empowerment_scorer must be provided for empowerment_density_product proposer.")
 
     goal_idx_array = jnp.array(goal_indices)
     alpha_f = jnp.asarray(alpha, dtype=jnp.float32)
@@ -649,7 +675,7 @@ def create_empowerment_density_product_goal_proposer(
         densities = _jax_gaussian_kde(candidate_goals, all_goals, kde_bandwidth)
         log_density = jnp.log(densities + kde_eps)  # negative: densities < 1
 
-        emp_scores = offline_empowerment_scorer(candidate_states, emp_rng)
+        emp_scores = empowerment_scorer(candidate_states, emp_rng, goal_proposer_state)
         emp_alpha_scores = jnp.sign(emp_scores) * (jnp.abs(emp_scores) ** alpha_f)  # empowerment**alpha
         # -(E**alpha) * log_density == (E**alpha) * (-log_density) == empowerment**alpha * novelty.
         logits = -emp_alpha_scores * log_density

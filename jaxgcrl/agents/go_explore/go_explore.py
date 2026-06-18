@@ -61,6 +61,12 @@ from .empowerment import (
     make_empowerment_obs_builder,
     make_offline_empowerment_scorer,
 )
+from .online_empowerment import (
+    create_online_empowerment_agent,
+    make_online_empowerment_scorer,
+    make_online_empowerment_train_fn,
+)
+from .visualization import log_online_empowerment_heatmap
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
@@ -109,7 +115,7 @@ class GoExplore:
     use_her: bool = True
     p_future_her_goal: float = 0.8
 
-    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega", "empowerment"] = "random_env_goals"
+    goal_proposer_name: Literal["random_env_goals", "rb", "q_epistemic", "ucgr", "max_critic_to_env", "mega", "omega", "empowerment", "empowerment_density_ratio", "empowerment_density_product"] = "random_env_goals"
     ep_goal_proposer_name: Literal["nearest_env_goal_to_gcp_goal"] = "nearest_env_goal_to_gcp_goal"
     num_candidates: int = 512
     goal_proposer_temperature: float = 0.0
@@ -124,6 +130,37 @@ class GoExplore:
     # empowerment network instead of overwriting a few indices of a cached
     # OGBench template. Requires state_size == checkpoint ex_obs_dim.
     use_full_empowerment: bool = False
+
+    # ── Online empowerment ──────────────────────────────────────────────────
+    # When True, the empowerment goal proposer scores candidates with an
+    # OGBench ``empowerment_skill`` agent trained online (in lockstep with the
+    # main agent) instead of a pretrained checkpoint. The proposer logic is
+    # otherwise identical. Requires ``ogbench_root`` (the OGBench repo root
+    # containing ``impls/``) for importing the agent class.
+    online_empowerment: bool = False
+    ogbench_root: Optional[str] = None
+    # Gradient steps on the empowerment agent per training step (update loop).
+    online_empowerment_num_grad_steps: int = 1
+    # Hyperparameters — defaults transcribed from the reference flags.json.
+    online_empowerment_num_skills: int = 15
+    online_empowerment_num_splus_samples: int = 16
+    online_empowerment_value_latent_dim: int = 256
+    online_empowerment_separate_qv: bool = True
+    online_empowerment_use_self_q_loss: bool = True
+    online_empowerment_use_self_v_loss: bool = True
+    online_empowerment_no_target_q_for_policy: bool = True
+    online_empowerment_sample_z: bool = True
+    online_empowerment_discount: float = 0.99
+    online_empowerment_tau: float = 0.005
+    online_empowerment_lr: float = 3e-4
+    online_empowerment_batch_size: int = 1024
+    online_empowerment_layer_norm: bool = True
+    online_empowerment_const_std: bool = True
+    online_empowerment_bc_alpha: float = 0.01
+    online_empowerment_anneal_alpha: bool = False
+    online_empowerment_log_interval: int = 5000
+    # Heatmap: random replay-buffer states scored + scattered, logged each eval.
+    online_empowerment_heatmap_num_states: int = 512
 
     # ── Go Explore specific parameters ──────────────────────────────────────
     num_gcp_steps: int = 100      # max steps in go phase before forcing explore
@@ -283,11 +320,65 @@ class GoExplore:
             explore_target_critic_params=explore_target_critic_params,
         )
         
-        # ── Optional offline-empowerment scorer for goal proposer ───────────
+        # ── Empowerment scorer for goal proposer (offline ckpt or online) ────
+        empowerment_proposer_names = (
+            "empowerment", "empowerment_density_ratio", "empowerment_density_product",
+        )
+        needs_empowerment_scorer = self.goal_proposer_name in empowerment_proposer_names
         offline_empowerment_scorer = None
-        if self.goal_proposer_name == "empowerment":
+        online_empowerment_score_fn = None
+        online_empowerment_train_fn = None
+        if needs_empowerment_scorer and self.online_empowerment:
+            # ── Fully online empowerment: fresh OGBench empowerment_skill agent
+            # trained in lockstep, scored live. No checkpoint / dataset load.
+            if self.ogbench_root is None:
+                raise ValueError(
+                    "ogbench_root must be set when online_empowerment=True "
+                    "(the OGBench repo root containing impls/)."
+                )
+            emp_online_agent = create_online_empowerment_agent(
+                ogbench_root=self.ogbench_root,
+                state_size=state_size,
+                action_size=action_size,
+                seed=config.seed,
+                num_skills=self.online_empowerment_num_skills,
+                num_splus_samples=self.online_empowerment_num_splus_samples,
+                value_latent_dim=self.online_empowerment_value_latent_dim,
+                separate_qv=self.online_empowerment_separate_qv,
+                use_self_q_loss=self.online_empowerment_use_self_q_loss,
+                use_self_v_loss=self.online_empowerment_use_self_v_loss,
+                no_target_q_for_policy=self.online_empowerment_no_target_q_for_policy,
+                sample_z=self.online_empowerment_sample_z,
+                discount=self.online_empowerment_discount,
+                tau=self.online_empowerment_tau,
+                lr=self.online_empowerment_lr,
+                batch_size=self.online_empowerment_batch_size,
+                layer_norm=self.online_empowerment_layer_norm,
+                const_std=self.online_empowerment_const_std,
+                bc_alpha=self.online_empowerment_bc_alpha,
+                anneal_alpha=self.online_empowerment_anneal_alpha,
+                log_interval=self.online_empowerment_log_interval,
+            )
+            training_state = training_state.replace(
+                online_empowerment_agent=emp_online_agent
+            )
+            online_empowerment_score_fn = make_online_empowerment_scorer(
+                mean=self.empowerment_mean, scale=self.empowerment_scale,
+                # Score with more MC samples than training (matches the offline
+                # proposer's high-sample scoring); does not affect training.
+                num_score_samples=self.empowerment_num_splus_samples,
+            )
+            online_empowerment_train_fn = make_online_empowerment_train_fn(
+                state_size=state_size,
+                action_size=action_size,
+                batch_size=self.online_empowerment_batch_size,
+            )
+        elif needs_empowerment_scorer:
             if self.empowerment_run_dir is None:
-                raise ValueError("empowerment_run_dir must be set when goal_proposer_name='empowerment'.")
+                raise ValueError(
+                    f"empowerment_run_dir must be set when goal_proposer_name='{self.goal_proposer_name}' "
+                    "(or set online_empowerment=True)."
+                )
             key, empowerment_template_key = jax.random.split(key)
             emp_agent, _ex_obs_dim, base_obs_template = load_offline_empowerment_agent(
                 run_dir=self.empowerment_run_dir,
@@ -333,6 +424,7 @@ class GoExplore:
             critic=gcp_critic,
             discounting=self.discounting,
             offline_empowerment_scorer=offline_empowerment_scorer,
+            online_empowerment_score_fn=online_empowerment_score_fn,
             goal_proposer_temperature=self.goal_proposer_temperature,
             empowerment_alpha=self.empowerment_alpha,
         )
@@ -410,6 +502,7 @@ class GoExplore:
             transitions_sample=dummy_goal_proposer_transition,
             actor_params=gcp_actor_state.params,
             critic_params={i: cs.params for i, cs in enumerate(gcp_critic_states)},
+            empowerment_state=training_state.online_empowerment_agent,
         )
 
         # ── actor_step ───────────────────────────────────────────────────────
@@ -484,8 +577,10 @@ class GoExplore:
                 transitions_sample=transitions_sample,
                 actor_params=training_state.actor_state.params,
                 critic_params={i: cs.params for i, cs in enumerate(training_state.critic_states)},
+                # Refresh the empowerment snapshot to the latest online agent.
+                empowerment_state=training_state.online_empowerment_agent,
             )
-            
+
             num_envs_     = config.num_envs
             episode_length = config.episode_length
             info           = dict(env_state.info)
@@ -713,6 +808,9 @@ class GoExplore:
 
             # ── GCP update (all transitions) ──────────────────────────────────
             buffer_state, transitions = replay_buffer.sample(buffer_state)
+            # Keep the raw (pre-HER/pre-process) online sample for the online
+            # empowerment update below, matching go_explore_simple's reuse.
+            emp_raw_transitions = transitions
             transitions, _ = gcp_actor.process_transitions(
                 transitions, process_key, self.batch_size, self.discounting,
                 state_size, tuple(train_env.goal_indices),
@@ -738,6 +836,25 @@ class GoExplore:
             metrics = {}
             metrics.update(gcp_metrics)
             metrics.update(explore_metrics)
+
+            # ── Online empowerment update (when enabled) ──────────────────────
+            # Train the OGBench empowerment_skill agent on a fresh replay-buffer
+            # sample for ``online_empowerment_num_grad_steps`` gradient steps.
+            if online_empowerment_train_fn is not None:
+                emp_key = jax.random.fold_in(train_key, 1)
+                new_emp_agent, emp_metrics = online_empowerment_train_fn(
+                    training_state.online_empowerment_agent,
+                    emp_raw_transitions,
+                    emp_key,
+                    self.online_empowerment_num_grad_steps,
+                )
+                training_state = training_state.replace(
+                    online_empowerment_agent=new_emp_agent
+                )
+                metrics.update(
+                    {f"online_empowerment/{k}": v for k, v in emp_metrics.items()}
+                )
+
             return (training_state, env_state, buffer_state, updated_gps), metrics
 
         # ── training_epoch ───────────────────────────────────────────────────
@@ -841,15 +958,19 @@ class GoExplore:
 
             sps = (env_steps_per_actor_step * num_training_steps_per_epoch) / epoch_training_time
             
-            # Convert metrics to Python values for logging
+            # Convert metrics to Python values for logging. Online empowerment
+            # metrics keep their own top-level "online_empowerment/" prefix so
+            # they land in a dedicated wandb tab; everything else goes under
+            # "training/".
             metrics_dict = {}
             for name, value in metrics.items():
+                key = name if name.startswith("online_empowerment/") else f"training/{name}"
                 if hasattr(value, 'item'):
-                    metrics_dict[f"training/{name}"] = float(value.item())
+                    metrics_dict[key] = float(value.item())
                 elif hasattr(value, '__float__'):
-                    metrics_dict[f"training/{name}"] = float(value)
+                    metrics_dict[key] = float(value)
                 else:
-                    metrics_dict[f"training/{name}"] = value
+                    metrics_dict[key] = value
             
             metrics = {
                 "training/sps": sps,
@@ -885,6 +1006,28 @@ class GoExplore:
                     current_step=current_step,
                 )
                 last_visualization_step = current_step
+
+            # ── Online empowerment heatmap (periodic: every eval epoch) ───────
+            if online_empowerment_score_fn is not None:
+                key, emp_viz_key = jax.random.split(key)
+                # Discard the post-sample buffer_state so visualization sampling
+                # does not perturb the training trajectory (mirrors phase viz).
+                _, emp_viz_trans = replay_buffer.sample(buffer_state)
+                emp_states = jnp.reshape(
+                    emp_viz_trans.observation,
+                    (-1, emp_viz_trans.observation.shape[-1]),
+                )[:, :state_size]
+                log_online_empowerment_heatmap(
+                    online_empowerment_score_fn,
+                    training_state.online_empowerment_agent,
+                    emp_states,
+                    tuple(train_env.goal_indices),
+                    getattr(unwrapped_env, "x_bounds", None),
+                    getattr(unwrapped_env, "y_bounds", None),
+                    emp_viz_key,
+                    current_step,
+                    max_points=self.online_empowerment_heatmap_num_states,
+                )
 
             do_render = ne % config.visualization_interval == 0
             if self.agent_type == "crl":

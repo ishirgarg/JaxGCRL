@@ -67,6 +67,9 @@ class TrainingState:
     explore_critic_states: Optional[Tuple[TrainState, ...]] = None
     explore_alpha_state: Optional[TrainState] = None
     explore_target_critic_params: Optional[Any] = None
+    # Online empowerment agent (OGBench empowerment_skill) trained in lockstep
+    # with the main agent; used by the online empowerment goal proposers.
+    online_empowerment_agent: Optional[Any] = None
 
 
 class Transition(NamedTuple):
@@ -87,3 +90,5 @@ class GoalProposerState:
     transitions_sample: Any  # Transition sample from replay buffer
     actor_params: Optional[Any] = None  # Actor network parameters (for q_epistemic)
     critic_params: Optional[Any] = None  # Critic network parameters (for q_epistemic)
+    # Online empowerment agent snapshot (for the online empowerment proposers).
+    empowerment_state: Optional[Any] = None
