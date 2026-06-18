@@ -149,7 +149,7 @@ echo "GLOBAL_IDX=$GLOBAL_IDX  ENV=$ENV  RLPD=$RLPD_TAG  EXP=$EXP_NAME"
 
 python run.py go-explore-simple \
         --env $ENV \
-        --total_env_steps 80000000 \
+        --total_env_steps 100000000 \
         --episode_length $EP_LEN \
         --num_gcp_steps $GCP_STEPS \
         --num_ep_steps $EP_STEPS \
