@@ -45,6 +45,17 @@ ARENA = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
+ARENA_1G = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, R, 0, 0, 0, 1],
+    [1, 0, 0, 0, B, 0, 0, 1],
+    [1, 0, 0, 0, 0, G, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
 # Small square: ball in a quarter of the maze (ported from ant_ball_maze.py)
 SMALL_SQUARE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
@@ -183,6 +194,8 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
     """Build XML string with maze walls from the OGBench-compatible ball XML template."""
     if maze_layout_name == "arena":
         maze_layout = ARENA
+    elif maze_layout_name == "arena_1g":
+        maze_layout = ARENA_1G
     elif maze_layout_name == "arena_stitch":
         maze_layout = ARENA_STITCH
     elif maze_layout_name == "medium":
