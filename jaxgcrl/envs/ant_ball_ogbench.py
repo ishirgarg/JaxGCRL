@@ -156,6 +156,85 @@ SMALL_SQUARE_1G= [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
+# ── "scale2" variants ───────────────────────────────────────────────────────
+# These mirror ARENA_1G / SMALL_EASY_SQUARE_1G but on a 16x16 grid intended to
+# be built with maze_size_scaling=2.0 (half the default cell size) and the
+# OGBench-anchored offset from `_default_xy_offset` (= 5.0 at scaling 2). That
+# combination reproduces the *exact* same world frame as the scaling-4 8x8
+# originals — per-axis wall bounds [-6, 26] — because doubling the grid while
+# halving the scaling preserves the total physical extent (16*2 == 8*4 == 32).
+#
+# R/B/G remain ONE cell apart (same "distance in units" / cells as the
+# originals), so at scaling 2.0 the physical ant->ball->goal gaps are HALVED:
+# 2 units/axis instead of 4. Placements are chosen on the (odd-integer) scale2
+# lattice to sit in the same region as the originals:
+#   arena_1g:      orig R(8,8)  B(12,12) G(16,16) -> scale2 R(9,9)  B(11,11) G(13,13)
+#   small_easy_sq: orig R(0,0)  B(4,4)   G(8,8)   -> scale2 R(1,1)  B(3,3)   G(5,5)
+ARENA_1G_SCALE2 = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, R, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, B, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, G, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+SMALL_EASY_SQUARE_1G_SCALE2 = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, R, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, B, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, G, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+
+# Canonical OGBench antsoccer arena reference: an 8-cell grid at scaling 4 with
+# an offset of 4. Its outer wall low edge sits at -(offset + scaling/2) = -6,
+# giving per-axis world bounds [-6, 26].
+_REF_SCALING = 4.0
+_REF_OFFSET = 4.0
+_CANONICAL_LOW_EDGE = _REF_OFFSET + 0.5 * _REF_SCALING  # 6.0
+
+
+def _default_xy_offset(maze_size_scaling):
+    """OGBench-anchored coordinate offset, derived dynamically from scaling.
+
+    OGBench's locomaze maze.py uses a fixed offset of 4 at maze_unit=4, which
+    coincides with the legacy `offset == maze_size_scaling` convention used here
+    (4 == 4). To keep the maze anchored to that exact world frame when the cell
+    size changes, we instead hold the outer wall's LOW edge fixed at
+    -_CANONICAL_LOW_EDGE (= -6):
+
+        offset = _CANONICAL_LOW_EDGE - 0.5 * maze_size_scaling
+
+    At the canonical scaling of 4 this returns 4 (identical to legacy behaviour,
+    so every existing 8x8 env is byte-for-byte unchanged). At scaling 2 it
+    returns 5, which — together with a grid whose total extent stays 32 units
+    (e.g. 16 cells * 2) — reproduces the original [-6, 26] frame exactly.
+    """
+    return _CANONICAL_LOW_EDGE - 0.5 * float(maze_size_scaling)
+
 
 def _cell_xy(i, j, maze_size_scaling, xy_offset):
     # OGBench convention: columns map to x, rows map to y. See
@@ -166,7 +245,7 @@ def _cell_xy(i, j, maze_size_scaling, xy_offset):
 
 def _find_cells(maze_layout, maze_size_scaling, obj):
     """Return (x,y) positions of cells matching obj (or any marker if obj is a tuple/list)."""
-    xy_offset = float(maze_size_scaling)
+    xy_offset = _default_xy_offset(maze_size_scaling)
     if isinstance(obj, (tuple, list, set)):
         markers = set(obj)
     else:
@@ -181,7 +260,7 @@ def _find_cells(maze_layout, maze_size_scaling, obj):
 
 def _open_cells(maze_layout, maze_size_scaling):
     """Return (x,y) positions of all open cells (non-wall)."""
-    xy_offset = float(maze_size_scaling)
+    xy_offset = _default_xy_offset(maze_size_scaling)
     cells = []
     for i in range(len(maze_layout)):
         for j in range(len(maze_layout[0])):
@@ -212,12 +291,16 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
         maze_layout = SMALL_EASY_SQUARE_1G
     elif maze_layout_name == "small_square_1g":
         maze_layout = SMALL_SQUARE_1G
+    elif maze_layout_name == "arena_1g_scale2":
+        maze_layout = ARENA_1G_SCALE2
+    elif maze_layout_name == "small_easy_square_1g_scale2":
+        maze_layout = SMALL_EASY_SQUARE_1G_SCALE2
     else:
         raise ValueError(f"Unknown OGBench ball maze layout: {maze_layout_name}")
 
     xml_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                             "assets", "ant_ball_ogbench.xml")
-    xy_offset = float(maze_size_scaling)
+    xy_offset = _default_xy_offset(maze_size_scaling)
 
     # Check if the layout uses R/G/B/M markers for separate spawn regions.
     # M cells count as both an agent reset and a goal (used by arena_stitch

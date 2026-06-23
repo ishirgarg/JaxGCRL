@@ -79,6 +79,8 @@ legal_envs = (
     "ant_ball_4d_ogbench_arena",
     "ant_ball_ogbench_arena_1g",
     "ant_ball_4d_ogbench_arena_1g",
+    "ant_ball_4d_ogbench_arena_1g_scale2",
+    "ant_ball_4d_ogbench_small_easy_square_1g_scale2",
     "ant_ball_ogbench_arena_stitch",
     "ant_ball_4d_ogbench_medium",
     "ant_ball_4d_ogbench_small_square",
@@ -146,9 +148,15 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         layout = env_name[len("ant_ball_4d_ogbench_"):]
         if layout.endswith("_stitch"):
             layout = layout[: -len("_stitch")]
+        # "_scale2" layouts use a 16x16 grid at maze_size_scaling=2.0 (half the
+        # default cell size). The OGBench-anchored offset is computed inside
+        # AntBallOGBench from the scaling, so the world frame still matches the
+        # scaling-4 originals ([-6, 26]); only the ant->ball->goal gaps halve.
+        maze_size_scaling = 2.0 if layout.endswith("_scale2") else 4.0
         env = AntBallOGBench(
             backend=backend or "mjx",
             maze_layout_name=layout,
+            maze_size_scaling=maze_size_scaling,
             add_ant_to_goal=True,
         )
     elif env_name.startswith("ant_ball_ogbench_"):

@@ -37,6 +37,10 @@ JAXGCRL_TO_OGBENCH = {
     "ant_ball_4d_ogbench_arena": "antsoccer-arena-navigate-v0",
     "ant_ball_ogbench_arena_1g": "antsoccer-arena-navigate-v0",
     "ant_ball_4d_ogbench_arena_1g": "antsoccer-arena-navigate-v0",
+    # scale2 variants share the OGBench frame ([-6, 26]) with their base envs,
+    # so they reuse the same RLPD datasets.
+    "ant_ball_4d_ogbench_arena_1g_scale2": "antsoccer-arena-navigate-v0",
+    "ant_ball_4d_ogbench_small_easy_square_1g_scale2": "antsoccer-arena-stitch-v0",
     "ant_ball_4d_ogbench_small_easy_square": "antsoccer-arena-navigate-v0",
     "ant_ball_4d_ogbench_small_easy_square_stitch": "antsoccer-arena-stitch-v0",
     "ant_ball_ogbench_small_easy_square_1g": "antsoccer-arena-stitch-v0",
