@@ -1,4 +1,5 @@
 from .crl import CRL
+from .dads import DADS
 from .go_explore import Baseline, GoExplore
 from .ppo import PPO
 from .sac import SAC

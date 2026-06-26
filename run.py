@@ -165,6 +165,25 @@ def main(config: Config):
         "online_empowerment/v/v_min",
     ]
 
+    # DADS (skill-discovery) metrics. The empowerment heatmap + empowerment/*
+    # stats are logged directly to wandb from the agent; here we register the
+    # scalar training/eval metrics so MetricsRecorder forwards them.
+    if type(config.agent).__name__ == "DADS":
+        metrics_to_collect += [
+            "training/dynamics_loss",
+            "training/dads_reward",
+            "training/buffer_current_size",
+            "mean_training/dynamics_loss",
+            "mean_training/dads_reward",
+        ]
+        for i in range(getattr(config.agent, "num_skills", 0)):
+            metrics_to_collect += [
+                f"skill_{i}_training/dynamics_loss",
+                f"skill_{i}_training/dads_reward",
+                f"skill_{i}_eval/success",
+                f"skill_{i}_eval/success_easy",
+            ]
+
     metrics_recorder = MetricsRecorder(
         config.run.total_env_steps,
         metrics_to_collect,

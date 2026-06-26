@@ -81,6 +81,7 @@ legal_envs = (
     "ant_ball_4d_ogbench_arena_1g",
     "ant_ball_4d_ogbench_arena_1g_scale2",
     "ant_ball_4d_ogbench_small_easy_square_1g_scale2",
+    "ant_ball_4d_ogbench_arena_1g_scale1",
     "ant_ball_ogbench_arena_stitch",
     "ant_ball_4d_ogbench_medium",
     "ant_ball_4d_ogbench_small_square",
@@ -149,10 +150,18 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         if layout.endswith("_stitch"):
             layout = layout[: -len("_stitch")]
         # "_scale2" layouts use a 16x16 grid at maze_size_scaling=2.0 (half the
-        # default cell size). The OGBench-anchored offset is computed inside
-        # AntBallOGBench from the scaling, so the world frame still matches the
-        # scaling-4 originals ([-6, 26]); only the ant->ball->goal gaps halve.
-        maze_size_scaling = 2.0 if layout.endswith("_scale2") else 4.0
+        # default cell size). "_scale1" layouts use a 32x32 grid at
+        # maze_size_scaling=1.0 (quarter cell size) so the ant and ball start
+        # right next to each other. The OGBench-anchored offset is computed
+        # inside AntBallOGBench from the scaling, so the world frame still
+        # matches the scaling-4 originals ([-6, 26]); only the ant->ball->goal
+        # gaps shrink (4 units at scale4, 2 at scale2, 1 at scale1).
+        if layout.endswith("_scale2"):
+            maze_size_scaling = 2.0
+        elif layout.endswith("_scale1"):
+            maze_size_scaling = 1.0
+        else:
+            maze_size_scaling = 4.0
         env = AntBallOGBench(
             backend=backend or "mjx",
             maze_layout_name=layout,

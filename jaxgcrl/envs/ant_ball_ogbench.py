@@ -209,6 +209,34 @@ SMALL_EASY_SQUARE_1G_SCALE2 = [
 ]
 
 
+# ── "scale1" arena variant ──────────────────────────────────────────────────
+# A 32x32 grid built with maze_size_scaling=1.0 (quarter the default cell size)
+# and the OGBench-anchored offset from `_default_xy_offset` (= 5.5 at scaling 1).
+# A 32-cell grid at scaling 1.0 keeps the total physical extent at 32 units
+# (32*1 == 8*4 == 16*2), so the world frame is identical to the scaling-4 8x8
+# originals and the scaling-2 16x16 scale2 envs (per-axis wall bounds [-6, 26]).
+#
+# R/B/G are ONE cell apart (1 unit/axis at scaling 1.0), so the ant and ball
+# start RIGHT next to each other. Placements are chosen near the arena centre
+# to mirror the scale2 arena_1g region:
+#   scale2 R(9,9) B(11,11) -> scale1 R(9.5,9.5) B(10.5,9.5) G(11.5,9.5)
+#   (grid R(i=15,j=15) B(i=15,j=16) G(i=15,j=17); _cell_xy(i,j,1.0,5.5)=[j-5.5,i-5.5])
+def _build_arena_1g_scale1():
+    n = 32
+    grid = [
+        [1 if (i == 0 or i == n - 1 or j == 0 or j == n - 1) else 0
+         for j in range(n)]
+        for i in range(n)
+    ]
+    grid[15][15] = R   # ant start  -> world (9.5, 9.5)
+    grid[15][16] = B   # ball spawn -> world (10.5, 9.5)  (1 unit +x of ant)
+    grid[15][17] = G   # goal       -> world (11.5, 9.5)
+    return grid
+
+
+ARENA_1G_SCALE1 = _build_arena_1g_scale1()
+
+
 # Canonical OGBench antsoccer arena reference: an 8-cell grid at scaling 4 with
 # an offset of 4. Its outer wall low edge sits at -(offset + scaling/2) = -6,
 # giving per-axis world bounds [-6, 26].
@@ -295,6 +323,8 @@ def make_ball_maze(maze_layout_name, maze_size_scaling):
         maze_layout = ARENA_1G_SCALE2
     elif maze_layout_name == "small_easy_square_1g_scale2":
         maze_layout = SMALL_EASY_SQUARE_1G_SCALE2
+    elif maze_layout_name == "arena_1g_scale1":
+        maze_layout = ARENA_1G_SCALE1
     else:
         raise ValueError(f"Unknown OGBench ball maze layout: {maze_layout_name}")
 
