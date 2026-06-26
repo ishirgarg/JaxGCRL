@@ -62,8 +62,7 @@ echo "GLOBAL_IDX=$GLOBAL_IDX  ENV=$ENV  K=$K  SEED=$SEED  EXP=$EXP_NAME"
 #   minibatches per actor step. With these values that is 64*600/256 = 150.
 python run.py dads \
   --env "$ENV" \
-  --backend mjx \
-  --total_env_steps 80000000 \
+  --total_env_steps 100000000 \
   --episode_length 601 \
   --num_envs 64 \
   --num_eval_envs 64 \
