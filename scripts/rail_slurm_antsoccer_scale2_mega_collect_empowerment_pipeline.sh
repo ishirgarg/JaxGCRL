@@ -2,7 +2,7 @@
 #SBATCH --job-name=asoc_s2_mega_emp_pipeline
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_lowest
+#SBATCH --qos=rail_gpu4_normal
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
@@ -33,7 +33,7 @@
 set -euo pipefail
 
 # ── Repo + scratch locations (edit to match your cluster) ───────────────────
-JAXGCRL_ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"          # dir containing run.py (submit dir)
+JAXGCRL_ROOT=/global/home/users/ishirgarg/JaxGCRL         # dir containing run.py (submit dir)
 OGBENCH_ROOT=/global/home/users/ishirgarg/ogbench   # dir containing impls/
 SCRATCH_BASE=/global/scratch/users/ishirgarg/jaxgcrl
 
