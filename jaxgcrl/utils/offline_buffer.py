@@ -188,6 +188,13 @@ class OfflineTrajectoryBuffer:
         # Distribute across slots (like num_envs in the online buffer).
         # Truncate so each slot has the same length.
         steps_per_slot = total_steps // num_slots
+        if steps_per_slot <= episode_length:
+            raise ValueError(
+                f"offline buffer steps_per_slot ({steps_per_slot}) must be greater than "
+                f"episode_length ({episode_length}) so sampling has a valid start range; "
+                f"reduce num_slots ({num_slots}) or use a larger dataset "
+                f"(total_steps={total_steps})."
+            )
         usable = steps_per_slot * num_slots
 
         def to_slots(arr):

@@ -172,7 +172,6 @@ def main(config: Config):
         metrics_to_collect += [
             "training/dynamics_loss",
             "training/dads_reward",
-            "training/buffer_current_size",
             "mean_training/dynamics_loss",
             "mean_training/dads_reward",
         ]

@@ -173,6 +173,11 @@ class GoExplore:
         assert config.num_envs * (config.episode_length - 1) % self.batch_size == 0, (
             "num_envs * (episode_length - 1) must be divisible by batch_size"
         )
+        if self.agent_type == "sac":
+            assert config.num_envs * config.episode_length % self.batch_size == 0, (
+                "num_envs * episode_length must be divisible by batch_size "
+                "(the SAC GCP update reshapes full-length trajectories)"
+            )
 
     def train_fn(
         self,
@@ -387,6 +392,8 @@ class GoExplore:
                 template_rng=empowerment_template_key,
                 epoch=self.empowerment_epoch,
                 num_splus_samples=self.empowerment_num_splus_samples,
+                use_full_obs=self.use_full_empowerment,
+                ogbench_root=self.ogbench_root,
             )
             if self.use_full_empowerment:
                 if state_size != int(_ex_obs_dim):
@@ -558,7 +565,7 @@ class GoExplore:
 
             # Always store next_observation so the explore critic (SAC) can use it.
             # CRL GCP update ignores next_observation; storing it is harmless.
-            next_gcp_obs = jnp.concatenate([nstate.obs[:, :state_size], gcp_goal], axis=-1)
+            next_gcp_obs = jnp.concatenate([pre_reset_next_obs[:, :state_size], gcp_goal], axis=-1)
 
             return nstate, Transition(
                 observation=gcp_obs,
@@ -824,7 +831,6 @@ class GoExplore:
 
             # ── Explore update (explore-phase transitions, masked) ────────────
             buffer_state, explore_trans_raw = replay_buffer.sample(buffer_state)
-            # Simple reshape/permute (no HER, no flatten_batch) for explore transitions
             explore_trans, _ = explore_actor.process_transitions(
                 explore_trans_raw, process_key, self.batch_size, self.discounting,
                 state_size, tuple(train_env.goal_indices),

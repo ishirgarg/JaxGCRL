@@ -80,7 +80,7 @@ class Transition(NamedTuple):
     reward: jnp.ndarray
     discount: jnp.ndarray
     next_observation: Optional[jnp.ndarray] = None  # Required for SAC
-    extras: jnp.ndarray = ()
+    extras: Any = ()
 
 
 @dataclass

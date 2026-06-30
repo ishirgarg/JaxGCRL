@@ -1,10 +1,8 @@
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Any, Optional
 
 import jax
 import jax.numpy as jnp
 from jax import lax
-import numpy as np
-from jaxgcrl.agents.go_explore.utils import sample_trajectories_from_buffer, flatten_batch
 from jaxgcrl.agents.go_explore.algorithms_utils import reconstruct_full_critic_params
 from jaxgcrl.agents.go_explore.types import GoalProposerState
 from jaxgcrl.agents.go_explore.utils import geometric_sample_one_triple
@@ -189,16 +187,6 @@ def create_rb_goal_proposer(
     return propose_goal
 
 
-from typing import Callable, Dict, Any, Optional
-
-import jax
-import jax.numpy as jnp
-import numpy as np
-from jaxgcrl.agents.go_explore.utils import sample_trajectories_from_buffer
-from jaxgcrl.agents.go_explore.algorithms_utils import reconstruct_full_critic_params
-from jaxgcrl.agents.go_explore.types import GoalProposerState
-
-
 def create_ucgr_goal_proposer(
     env,
     num_envs: int,
@@ -339,8 +327,7 @@ def create_q_epistemic_goal_proposer(
         candidate_goals = positions[candidate_indices]  # (num_candidates, goal_dim)
     
         s0 = start_obs[:state_size]  # Shape: (state_size,)
-        goal_dim = len(goal_indices)
-        
+
         # Reconstruct full critic params using utility function
         full_critic_params = reconstruct_full_critic_params(critic_params)
         

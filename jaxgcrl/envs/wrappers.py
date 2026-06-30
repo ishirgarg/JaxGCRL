@@ -283,6 +283,7 @@ class GoExploreWrapper(Wrapper):
         state.info['explore_first_obs']   = state.obs
         state.info['pre_reset_obs']       = state.obs
         state.info['traj_id']             = jnp.zeros(num_envs, dtype=jnp.float32)
+        state.info['pending_traj_increment'] = jnp.zeros(num_envs, dtype=jnp.float32)
         state.info['proposed_goals']      = go_goal
         # Cumulative counters for Bug 2 (never reset within step, only in reset)
         state.info['go_completions_total']   = jnp.zeros(num_envs, dtype=jnp.float32)
@@ -350,12 +351,13 @@ class GoExploreWrapper(Wrapper):
         )
         # Bug 2 fix: cumulative counters — incremented only when a go phase
         # completes (should_go_to_explore), never reset within step().
+        counted_success = should_go_to_explore & go_success
         new_go_completions_total   = (state.info['go_completions_total']
                                       + should_go_to_explore.astype(jnp.float32))
         new_go_successes_total     = (state.info['go_successes_total']
-                                      + go_success.astype(jnp.float32))
+                                      + counted_success.astype(jnp.float32))
         new_go_success_steps_total = (state.info['go_success_steps_total']
-                                      + jnp.where(go_success,
+                                      + jnp.where(counted_success,
                                                    (phase_step + 1).astype(jnp.float32),
                                                    0.0))
 
@@ -372,9 +374,12 @@ class GoExploreWrapper(Wrapper):
         )
 
         # ── 7. Trajectory ID increments ───────────────────────────────────────────
-        traj_id = state.info['traj_id']
-        traj_id = traj_id + jnp.where(should_go_to_explore, 1.0, 0.0)
-        traj_id = traj_id + jnp.where(should_reset, 2.0, 0.0)
+        pending_traj_increment = state.info.get(
+            'pending_traj_increment', jnp.zeros_like(state.info['traj_id'])
+        )
+        traj_id = state.info['traj_id'] + pending_traj_increment
+        new_pending_traj_increment = (jnp.where(should_go_to_explore, 1.0, 0.0)
+                                      + jnp.where(should_reset, 2.0, 0.0))
 
         # ── 8. Update go_goal on new go phase ─────────────────────────────────────
         proposed_goals = state.info.get('proposed_goals', state.info['go_goal'])
@@ -425,6 +430,7 @@ class GoExploreWrapper(Wrapper):
         info['phase']                   = new_phase
         info['phase_step']              = new_phase_step
         info['traj_id']                 = traj_id
+        info['pending_traj_increment']  = new_pending_traj_increment
         info['go_goal']                 = new_go_goal
         info['go_phase_success']        = new_go_phase_success
         info['go_phase_steps']          = new_go_phase_steps

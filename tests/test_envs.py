@@ -74,7 +74,7 @@ class TestEnvironment:
 
         for _ in range(100):
             act_rng, rng = jax.random.split(rng)
-            act = jax.random.uniform(act_rng, (action_size,))
+            act = jax.random.uniform(act_rng, (action_size,), minval=-1.0, maxval=1.0)
             state = jit_env_step(state, act)
 
             assert not jax.numpy.isnan(state.obs).any()

@@ -432,7 +432,8 @@ class ExploreActor(Actor):
 
     def process_transitions(self, transitions, process_key, batch_size, discounting, state_size,
                             goal_indices, goal_reach_thresh, use_her, p_future_her_goal: float = 0.8):
-        """Process explore phase transitions: just reshape and permute (no HER, no flatten_batch)."""
+        """Drop each trajectory's last timestep (matching the CRL path), then reshape and permute (no HER)."""
+        transitions = jax.tree_util.tree_map(lambda x: x[:, :-1], transitions)
         return _reshape_and_permute_transitions(transitions, process_key, batch_size)
 
 

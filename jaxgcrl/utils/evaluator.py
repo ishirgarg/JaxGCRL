@@ -181,6 +181,7 @@ class ActorEvaluator:
                         "dist",
                         "distance_from_origin",
                     ]
+                    if name in eval_metrics.episode_metrics
                 }
             )
 

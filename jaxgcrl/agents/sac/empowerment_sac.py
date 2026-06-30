@@ -245,6 +245,12 @@ class EmpowermentSAC:
     num_splus_samples: int = 128
     ogbench_xy_offset: Optional[float] = None
 
+    def check_config(self, config):
+        assert config.num_envs * (config.episode_length - 1) % self.batch_size == 0, (
+            "num_envs * (episode_length - 1) must be divisible by batch_size "
+            "(process_transitions drops the last timestep of each trajectory)"
+        )
+
     def train_fn(
         self,
         config,
@@ -253,6 +259,7 @@ class EmpowermentSAC:
         randomization_fn: Optional[Callable] = None,
         progress_fn: Callable[[int, Metrics, Callable, Any, Any, bool], None] = lambda *args, **kwargs: None,
     ):
+        self.check_config(config)
         # ------------------------------------------------------------------
         # Load empowerment checkpoint
         # ------------------------------------------------------------------
@@ -581,7 +588,7 @@ class EmpowermentSAC:
 
         # ------------------------------------------------------------------
         # Offline empowerment labelling.  Reuses the chunked `empowerment_reward`
-        # entry point on flattened (num_envs * episode_length) batches, then
+        # entry point on the flattened (num_envs, episode_length) sample, then
         # replaces observation/next_observation with the goal-stripped policy
         # obs so shapes match the online buffer.
         # ------------------------------------------------------------------
