@@ -2,7 +2,7 @@
 #SBATCH --job-name=dads_asoc_scale
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_high
+#SBATCH --qos=rail_gpu4_lowest
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=120:00:00
@@ -54,7 +54,8 @@ echo "GLOBAL_IDX=$GLOBAL_IDX  ENV=$ENV  K=$K  SEED=$SEED  EXP=$EXP_NAME"
 
 # ── DADS hyperparameters ────────────────────────────────────────────────────
 #   num_skills in {15, 50}, future_discount=0.99 (s+ ~ Geom, ~100-step horizon).
-#   Full-state discriminator (no use_xy_prior).
+#   x-y prior discriminator (use_xy_prior): restricts skill dynamics to the
+#   goal_indices (x-y) deltas.
 #   Empowerment heatmap: 1/4-unit cells over the visited region, 16 s+ samples
 #   per (cell, skill), rollout horizon auto = ceil(3 / (1 - 0.99)) = 300.
 #
@@ -72,6 +73,7 @@ python run.py dads \
   --min_replay_size 1000 \
   --max_replay_size 20000 \
   --num_skills "$K" \
+  --use_xy_prior \
   --future_discount 0.99 \
   --discounting 0.99 \
   --learning_rate 3e-4 \
