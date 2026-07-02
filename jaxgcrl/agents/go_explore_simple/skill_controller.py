@@ -7,8 +7,13 @@ maximize task reward, with fixed temporal commitment ``k``.
 
 See ``SKILL_CONTROLLER_DESIGN.md`` for the full spec. Key pieces:
   - ``load_frozen_skill_policy`` / ``make_skill_action_fn``: a generic adapter over
-    any OGBench skill-conditioned agent whose policy submodule has signature
-    ``policy(obs, skills_onehot)`` (true for ``empowerment_skill``).
+    any OGBench skill-conditioned agent. Two skill parameterizations are
+    supported: (1) agents with a policy submodule of signature
+    ``policy(obs, skills_onehot)`` (e.g. ``empowerment_skill``), and (2) DDS
+    (``dds``, "Discrete Diffusion Skills"), whose discrete skill index selects a
+    VQ codebook embedding that a diffusion/categorical decoder turns into an
+    action. In both cases the controller selects a discrete skill in
+    ``[0, num_skills)`` and gets back a low-level action.
   - ``rollout_macro_step``: a ``lax.scan`` over ``k`` env steps under one fixed
     per-env skill, producing one SMDP macro-transition ``(s_t, z, R, s_{t+k}, done)``.
   - ``train_skill_controller``: prefill -> epochs of (collect macro-steps + SAC
@@ -104,17 +109,93 @@ def load_frozen_skill_policy(self, unwrapped_env, template_key):
     else:
         num_skills = ckpt_num_skills
 
+    # skill_policy_type: assert (never derive) the checkpoint's agent family so
+    # the wandb-logged config value is guaranteed to describe the real ckpt.
+    skill_policy_type = getattr(self, "skill_policy_type", None)
+    if skill_policy_type is not None:
+        expected_agent_name = _SKILL_POLICY_TYPE_TO_AGENT_NAME.get(skill_policy_type)
+        if expected_agent_name is None:
+            raise ValueError(
+                f"skill_policy_type={skill_policy_type!r} is not one of "
+                f"{sorted(_SKILL_POLICY_TYPE_TO_AGENT_NAME)}."
+            )
+        ckpt_agent_name = str(emp_agent.config.get("agent_name", ""))
+        if ckpt_agent_name != expected_agent_name:
+            raise ValueError(
+                f"skill_policy_type={skill_policy_type!r} expects checkpoint "
+                f"agent_name={expected_agent_name!r}, but the loaded skill "
+                f"checkpoint has agent_name={ckpt_agent_name!r}; they must match."
+            )
+
     return emp_agent, num_skills, skill_obs_builder
+
+
+# Maps the human-facing ``skill_policy_type`` config value to the OGBench
+# ``agent_name`` recorded in the checkpoint's flags.json. Used to ASSERT the
+# configured type against the loaded checkpoint (never to derive it).
+_SKILL_POLICY_TYPE_TO_AGENT_NAME = {"dds": "dds", "empowerment": "empowerment_skill"}
+
+
+def _is_dds_agent(emp_agent) -> bool:
+    """Whether ``emp_agent`` is a DDS ("Discrete Diffusion Skills") checkpoint.
+
+    DDS has no ``policy(obs, skills_onehot)`` submodule; it uses a VQ codebook +
+    decoder, so it needs the ``_make_dds_skill_action_fn`` adapter instead of the
+    default ``policy``-based one.
+    """
+    try:
+        if str(emp_agent.config.get("agent_name", "")) == "dds":
+            return True
+    except Exception:
+        pass
+    return "modules_codebook" in emp_agent.network.params
+
+
+def _make_dds_skill_action_fn(emp_agent, skill_obs_builder, *, deterministic):
+    """Adapter for a frozen DDS checkpoint (arXiv:2503.20176).
+
+    DDS has no ``policy(obs, skills_onehot)`` submodule. Instead each discrete
+    skill index ``z`` selects a VQ codebook embedding ``codebook[z]`` which the
+    frozen low-level decoder turns into an action:
+      - continuous-action envs: ancestral DDPM sampling from the diffusion
+        decoder. This is inherently stochastic — there is no closed-form mode —
+        so ``deterministic`` is best-effort here: we still sample, seeded by the
+        per-call key. (Feeding a fixed key would freeze the noise but not yield a
+        true mode; the controller reuses its eval key across steps anyway.)
+      - discrete-action envs: the categorical BC decoder, from which
+        ``deterministic`` takes the mode (argmax) and otherwise a sample.
+    The frozen ``emp_agent`` params are captured by closure (no gradient ever
+    flows into them).
+    """
+    discrete = bool(emp_agent.config["discrete"])
+
+    def skill_action_fn(states: jnp.ndarray, skill_indices: jnp.ndarray, key: jax.Array):
+        emp_obs = skill_obs_builder(states)                  # OGBench-mapped state
+        z = emp_agent._codebook_table()[skill_indices]        # [B, D_z] codebook lookup
+        if discrete:
+            dist = emp_agent.network.select("decoder")(emp_obs, z)
+            return dist.mode() if deterministic else dist.sample(seed=key)
+        a = emp_agent._ddpm_sample(emp_obs, z, key)
+        return jnp.clip(a, -1.0, 1.0)
+
+    return skill_action_fn
 
 
 def make_skill_action_fn(emp_agent, skill_obs_builder, num_skills, *, deterministic):
     """Adapter: (jaxgcrl states, discrete skill indices) -> low-level actions.
 
-    Generic over any OGBench skill-conditioned agent whose policy submodule has
-    signature ``policy(obs, skills_onehot)`` returning a ``distrax`` dist. The
-    frozen ``emp_agent`` params are captured by closure (no gradient ever flows
-    into them) — identical pattern to ``make_offline_empowerment_scorer``.
+    Generic over any OGBench skill-conditioned agent. For agents with a policy
+    submodule of signature ``policy(obs, skills_onehot)`` returning a ``distrax``
+    dist (e.g. ``empowerment_skill``) the skill index is one-hot fed to that
+    policy. For DDS checkpoints the index instead selects a VQ codebook embedding
+    decoded into an action (see ``_make_dds_skill_action_fn``). The frozen
+    ``emp_agent`` params are captured by closure (no gradient ever flows into
+    them) — identical pattern to ``make_offline_empowerment_scorer``.
     """
+    if _is_dds_agent(emp_agent):
+        return _make_dds_skill_action_fn(
+            emp_agent, skill_obs_builder, deterministic=deterministic
+        )
 
     def skill_action_fn(states: jnp.ndarray, skill_indices: jnp.ndarray, key: jax.Array):
         emp_obs = skill_obs_builder(states)                  # OGBench-mapped state
