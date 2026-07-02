@@ -63,7 +63,7 @@ echo "GLOBAL_IDX=$GLOBAL_IDX  ENV=$ENV  K=$K  SEED=$SEED  EXP=$EXP_NAME"
 #   minibatches per actor step. With these values that is 64*600/256 = 150.
 python run.py dads \
   --env "$ENV" \
-  --total_env_steps 100000000 \
+  --total_env_steps 200000000 \
   --episode_length 601 \
   --num_envs 64 \
   --num_eval_envs 64 \
@@ -71,7 +71,7 @@ python run.py dads \
   --unroll_length 50 \
   --batch_size 256 \
   --min_replay_size 1000 \
-  --max_replay_size 20000 \
+  --max_replay_size 10000 \
   --num_skills "$K" \
   --use_xy_prior \
   --future_discount 0.99 \
@@ -80,7 +80,7 @@ python run.py dads \
   --h_dim 256 --n_hidden 4 \
   --train_step_multiplier 1 \
   --visualization_interval 5 \
-  --emp_grid_spacing 0.25 \
+  --emp_grid_spacing 0.05 \
   --emp_num_future_samples 16 \
   --emp_rollout_horizon 0 \
   --emp_collect_envs 256 \
