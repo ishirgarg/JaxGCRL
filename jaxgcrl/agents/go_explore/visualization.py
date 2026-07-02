@@ -1,9 +1,7 @@
 """Visualization functions for trajectory analysis."""
 
-import logging
 from typing import Any, Tuple
 
-import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
@@ -92,7 +90,7 @@ def plot_positions_with_heatmap(
         Matplotlib axes
     """
     if ax is None:
-        fig, ax = plt.subplots(figsize=(10, 10))
+        _, ax = plt.subplots(figsize=(10, 10))
     
     # Create KDE heatmap
     X, Y, Z = create_kde_heatmap(positions, x_bounds, y_bounds, grid_resolution)
@@ -169,22 +167,6 @@ def _draw_trajectory_grid(axes, trajectory_states, trajectory_goals, x_bounds, y
         )
     for i in range(num_trajectories, 4):
         axes[i // 2, i % 2].axis('off')
-
-
-def plot_trajectory_sequences(
-    trajectory_states: np.ndarray,
-    trajectory_goals: np.ndarray,
-    x_bounds: jnp.ndarray,
-    y_bounds: jnp.ndarray,
-    fig: plt.Figure = None,
-) -> plt.Figure:
-    """Plot trajectory sequences in a 2x2 grid (start → intermediate → final + goal)."""
-    if fig is None:
-        fig, axes = plt.subplots(2, 2, figsize=(16, 16))
-    else:
-        axes = fig.subplots(2, 2) if len(fig.axes) == 0 else np.array(fig.axes).reshape(2, 2)
-    _draw_trajectory_grid(axes, trajectory_states, trajectory_goals, x_bounds, y_bounds)
-    return fig
 
 
 def visualize_trajectories(
@@ -285,7 +267,6 @@ def all_visualizations(
     env: Any,
     state_size: int,
     goal_indices: Tuple[int, ...],
-    rng_key: jax.Array,
     current_step: int = None,
 ) -> Any:
     """
@@ -300,8 +281,7 @@ def all_visualizations(
         env: Environment instance (must have x_bounds and y_bounds attributes)
         state_size: Size of state dimension
         goal_indices: Indices for x, y positions (typically [0, 1])
-        rng_key: Random key for sampling
-        
+
     Returns:
         Updated buffer_state after sampling operations
     """
@@ -319,16 +299,14 @@ def all_visualizations(
         buffer_state,
         state_size=state_size,
         goal_indices=goal_indices,
-        rng_key=rng_key,
     )
-    
+
     # Sample trajectory sequences for detailed plotting
     buffer_state, trajectory_states, trajectory_goals = sample_trajectory_sequences(
         replay_buffer,
         buffer_state,
         state_size=state_size,
         goal_indices=goal_indices,
-        rng_key=rng_key,
         num_trajectories=4,
     )
     
@@ -400,7 +378,7 @@ def visualize_go_explore_phases(
         exp_tid = go_tid + 1.0
         if not np.any(traj_id_flat == exp_tid):
             continue
-        gp, gtrunc = _traj_positions(go_tid)
+        gp, _ = _traj_positions(go_tid)
         ep, _      = _traj_positions(exp_tid)
         if len(gp) == 0 or len(ep) == 0:
             continue
@@ -727,7 +705,6 @@ def visualize_empowerment_density_ratio_candidates(
     es = np.asarray(emp_scores, dtype=np.float64).ravel()
     ds = np.asarray(densities, dtype=np.float64).ravel()
     ratio = np.asarray(selection_logits, dtype=np.float64).ravel()
-    sg = np.asarray(selected_goal, dtype=np.float64)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.5), sharex=True, sharey=True)
     specs = [
@@ -1449,7 +1426,7 @@ def visualize_omega_candidates(
             mega_goal[0], mega_goal[1],
             c="deepskyblue", s=180, marker="D",
             edgecolors="black", linewidths=1.5,
-            label=f"MEGA goal (min ρ)", zorder=11,
+            label="MEGA goal (min ρ)", zorder=11,
         )
         # Env (desired) goal
         ax.scatter(

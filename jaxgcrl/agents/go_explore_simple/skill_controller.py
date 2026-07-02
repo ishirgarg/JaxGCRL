@@ -20,7 +20,7 @@ from __future__ import annotations
 import functools
 import logging
 import time
-from typing import Callable, Tuple
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -195,7 +195,6 @@ def train_skill_controller(
     unwrapped_env = train_env
     eval_env_base = eval_env if eval_env is not None else train_env
 
-    action_size = int(unwrapped_env.action_size)
     state_size = int(unwrapped_env.state_dim)
     goal_size = len(unwrapped_env.goal_indices)
     obs_size = state_size + goal_size
@@ -205,7 +204,7 @@ def train_skill_controller(
     gamma_high = self.discounting
 
     rng = jax.random.PRNGKey(config.seed)
-    rng, skill_key, actor_key, critic_key, buf_key, env_key, eval_key = jax.random.split(rng, 7)
+    rng, skill_key, actor_key, critic_key, _, env_key, _ = jax.random.split(rng, 7)
     np.random.seed(config.seed)
 
     # ── Frozen skill policy + adapters ───────────────────────────────────────

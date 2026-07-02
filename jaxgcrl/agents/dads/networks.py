@@ -16,17 +16,20 @@ running statistics (so the same function is used for the numerator and the
 all-skills marginal, and so the post-training empowerment map is well-defined).
 """
 
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Optional, Sequence
 
 import flax
-import jax
 import jax.numpy as jnp
 from brax.training import distribution, networks, types
-from brax.training.types import PRNGKey
 from flax import linen
 
-ActivationFn = Callable[[jnp.ndarray], jnp.ndarray]
-Initializer = Callable[..., Any]
+from jaxgcrl.agents.common_networks import (
+    MLP,
+    ActivationFn,
+    make_inference_fn,
+    make_policy_network,
+    make_q_network,
+)
 
 
 @flax.struct.dataclass
@@ -38,100 +41,6 @@ class DADSNetworks:
     # with identity covariance.
     skill_dynamics_network: networks.FeedForwardNetwork
     parametric_action_distribution: distribution.ParametricDistribution
-
-
-class MLP(linen.Module):
-    """MLP module."""
-
-    layer_sizes: Sequence[int]
-    activation: ActivationFn = linen.relu
-    kernel_init: Initializer = jax.nn.initializers.lecun_uniform()
-    activate_final: bool = False
-    bias: bool = True
-    layer_norm: bool = False
-
-    @linen.compact
-    def __call__(self, data: jnp.ndarray):
-        hidden = data
-        for i, hidden_size in enumerate(self.layer_sizes):
-            hidden = linen.Dense(
-                hidden_size,
-                name=f"hidden_{i}",
-                kernel_init=self.kernel_init,
-                use_bias=self.bias,
-            )(hidden)
-            if i != len(self.layer_sizes) - 1 or self.activate_final:
-                if self.layer_norm:
-                    hidden = linen.LayerNorm()(hidden)
-                hidden = self.activation(hidden)
-        return hidden
-
-
-def make_q_network(
-    obs_size: int,
-    action_size: int,
-    preprocess_observations_fn: types.PreprocessObservationFn = types.identity_observation_preprocessor,
-    hidden_layer_sizes: Sequence[int] = (256, 256),
-    activation: ActivationFn = linen.relu,
-    n_critics: int = 2,
-    layer_norm: bool = False,
-) -> networks.FeedForwardNetwork:
-    """Creates a Q-network taking (obs=[state|skill], action) as input."""
-
-    class QModule(linen.Module):
-        """Q Module."""
-        n_critics: int
-
-        @linen.compact
-        def __call__(self, obs: jnp.ndarray, actions: jnp.ndarray):
-            hidden = jnp.concatenate([obs, actions], axis=-1)
-            res = []
-            for _ in range(self.n_critics):
-                q = MLP(
-                    layer_sizes=list(hidden_layer_sizes) + [1],
-                    activation=activation,
-                    layer_norm=layer_norm,
-                )(hidden)
-                res.append(q)
-            return jnp.concatenate(res, axis=-1)
-
-    q_module = QModule(n_critics=n_critics)
-
-    def apply(processor_params, q_params, obs, actions):
-        obs = preprocess_observations_fn(obs, processor_params)
-        return q_module.apply(q_params, obs, actions)
-
-    dummy_obs = jnp.zeros((1, obs_size))
-    dummy_action = jnp.zeros((1, action_size))
-    return networks.FeedForwardNetwork(
-        init=lambda key: q_module.init(key, dummy_obs, dummy_action), apply=apply
-    )
-
-
-def make_policy_network(
-    param_size: int,
-    obs_size: int,
-    preprocess_observations_fn: types.PreprocessObservationFn = types.identity_observation_preprocessor,
-    hidden_layer_sizes: Sequence[int] = (256, 256),
-    activation: ActivationFn = linen.relu,
-    layer_norm: bool = False,
-) -> networks.FeedForwardNetwork:
-    """Creates a policy network taking obs=[state|skill] as input."""
-
-    policy_module = MLP(
-        layer_sizes=list(hidden_layer_sizes) + [param_size],
-        activation=activation,
-        layer_norm=layer_norm,
-    )
-
-    def apply(processor_params, policy_params, obs):
-        obs = preprocess_observations_fn(obs, processor_params)
-        return policy_module.apply(policy_params, obs)
-
-    dummy_obs = jnp.zeros((1, obs_size))
-    return networks.FeedForwardNetwork(
-        init=lambda key: policy_module.init(key, dummy_obs), apply=apply
-    )
 
 
 def make_skill_dynamics_network(
@@ -190,31 +99,6 @@ def make_skill_dynamics_network(
     return networks.FeedForwardNetwork(
         init=lambda key: dyn_module.init(key, dummy_input), apply=apply
     )
-
-
-def make_inference_fn(dads_networks: DADSNetworks):
-    """Creates an inference function for the DADS policy.
-
-    The returned ``make_policy`` accepts ``(normalizer_params, policy_params)``
-    and returns a callable ``policy(obs, key) -> (action, extras)`` where
-    ``obs`` is the *skill-augmented* observation [state | skill_z].
-    """
-
-    def make_policy(params: types.PolicyParams, deterministic: bool = False) -> types.Policy:
-        def policy(
-            observations: types.Observation, key_sample: PRNGKey
-        ) -> Tuple[types.Action, types.Extra]:
-            logits = dads_networks.policy_network.apply(*params, observations)
-            if deterministic:
-                return dads_networks.parametric_action_distribution.mode(logits), {}
-            return (
-                dads_networks.parametric_action_distribution.sample(logits, key_sample),
-                {},
-            )
-
-        return policy
-
-    return make_policy
 
 
 def make_dads_networks(

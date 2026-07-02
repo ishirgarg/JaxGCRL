@@ -18,11 +18,12 @@ import os
 import xml.etree.ElementTree as ET
 
 import jax
-import mujoco
 from brax import base
 from brax.envs.base import PipelineEnv, State
 from brax.io import mjcf
 from jax import numpy as jnp
+
+from jaxgcrl.envs._locomotion_common import apply_mjx_solver_flags
 
 
 # Symbolic markers used inside TELEPORT_MAP. They are all open cells to the
@@ -30,7 +31,7 @@ from jax import numpy as jnp
 # drive the reset/teleport logic via TASK_PAIRS / TELEPORT_IN_IJS.
 RESET = R = "r"
 GOAL = G = "g"
-TELEPORT = T = "t"
+T = "t"
 
 
 # OGBench teleport maze layout (rows=9, cols=12).
@@ -200,12 +201,7 @@ class PointMazeOGBenchTeleport(PipelineEnv):
             n_frames = 20
 
         if backend == "mjx":
-            sys = sys.tree_replace({
-                "opt.solver": mujoco.mjtSolver.mjSOL_NEWTON,
-                "opt.disableflags": mujoco.mjtDisableBit.mjDSBL_EULERDAMP,
-                "opt.iterations": 1,
-                "opt.ls_iterations": 4,
-            })
+            sys = apply_mjx_solver_flags(sys)
 
         if backend == "positional":
             sys = sys.replace(

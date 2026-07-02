@@ -126,7 +126,6 @@ class OfflineTrajectoryBuffer:
         obs_size: int,
         action_size: int,
         state_size: int,
-        agent_type: str = "crl",
         include_phase: bool = False,
     ):
         # Goal dim is whatever remains after the env's true state_size. For the
@@ -305,7 +304,6 @@ def load_and_prepare_offline_buffer(
     obs_size: int,
     action_size: int,
     state_size: int,
-    agent_type: str = "crl",
     include_phase: bool = False,
 ) -> OfflineTrajectoryBuffer:
     """Load OGBench data and create an offline trajectory buffer.
@@ -317,7 +315,6 @@ def load_and_prepare_offline_buffer(
         obs_size: Full observation size (state + goal).
         action_size: Action dimension.
         state_size: State dimension (obs_size - goal_dim).
-        agent_type: "crl" or "sac".
         include_phase: Whether to include phase field in extras.
 
     Returns:
@@ -357,6 +354,5 @@ def load_and_prepare_offline_buffer(
         obs_size=obs_size,
         action_size=action_size,
         state_size=state_size,
-        agent_type=agent_type,
         include_phase=include_phase,
     )

@@ -1,4 +1,3 @@
-import functools
 from typing import Any, Dict, Tuple
 
 import flax.linen as nn
@@ -48,6 +47,16 @@ def _reshape_and_permute_transitions(transitions: Transition, process_key: jnp.n
     
     return transitions, new_process_key
 
+def _sample_squashed_actions(apply_fn, params, obs, key, is_deterministic: bool):
+    """Sample tanh-squashed actions from a Gaussian policy (deterministic = squashed mean)."""
+    means, log_stds = apply_fn(params, obs)
+    if is_deterministic:
+        return nn.tanh(means)
+    return nn.tanh(
+        means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
+    )
+
+
 class CRLActor(Actor):
     """CRL Actor implementation."""
     
@@ -73,12 +82,7 @@ class CRLActor(Actor):
         return self.network.init(key, x)
     
     def sample_actions(self, params, obs, key, is_deterministic: bool = False):
-        means, log_stds = self.apply(params, obs)
-        if is_deterministic:
-            return nn.tanh(means)
-        return nn.tanh(
-            means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
-        )
+        return _sample_squashed_actions(self.apply, params, obs, key, is_deterministic)
 
     def apply(self, params, obs):
         """Apply actor network to get mean and log_std."""
@@ -254,12 +258,7 @@ class SACActor(Actor):
         return self.network.apply(params, x)
     
     def sample_actions(self, params, obs, key, is_deterministic: bool = False):
-        means, log_stds = self.apply(params, obs)
-        if is_deterministic:
-            return nn.tanh(means)
-        return nn.tanh(
-            means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
-        )
+        return _sample_squashed_actions(self.apply, params, obs, key, is_deterministic)
 
     def update(self, context: Dict[str, Any], networks: Dict[str, Any],
                transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
@@ -419,12 +418,7 @@ class ExploreActor(Actor):
         return self.network.apply(params, x)
 
     def sample_actions(self, params, obs, key, is_deterministic: bool = False):
-        means, log_stds = self.apply(params, obs)
-        if is_deterministic:
-            return nn.tanh(means)
-        return nn.tanh(
-            means + jnp.exp(log_stds) * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
-        )
+        return _sample_squashed_actions(self.apply, params, obs, key, is_deterministic)
 
     def update(self, context, networks, transitions, training_state, key):
         """Update explore actor using SAC actor update."""

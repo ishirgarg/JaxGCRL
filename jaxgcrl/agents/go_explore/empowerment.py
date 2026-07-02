@@ -96,14 +96,11 @@ def build_empowerment_base_obs_template(
             head_ant_xy=(0.0, 0.0),
             head_ball_xy=(5.0, 0.0),
         )
-    if isinstance(jax_env, AntMaze):
-        state = jax_env.reset(template_rng)
-        return _jax_obs_resize_to_ex_dim(state.obs, ex_obs_dim)
-    if isinstance(jax_env, HumanoidMaze):
-        if not getattr(jax_env, "_is_ogbench_layout", False):
-            raise ValueError(
-                "Empowerment template for HumanoidMaze requires the OGBench obs layout."
-            )
+    if isinstance(jax_env, HumanoidMaze) and not getattr(jax_env, "_is_ogbench_layout", False):
+        raise ValueError(
+            "Empowerment template for HumanoidMaze requires the OGBench obs layout."
+        )
+    if isinstance(jax_env, (AntMaze, HumanoidMaze)):
         state = jax_env.reset(template_rng)
         return _jax_obs_resize_to_ex_dim(state.obs, ex_obs_dim)
     raise ValueError(
@@ -140,13 +137,18 @@ def infer_ogbench_root_from_run_dir(run_dir: str) -> str:
         current = parent
 
 
-def _setup_external_imports(ogbench_root: str):
+def _ensure_ogbench_on_path(ogbench_root: str) -> None:
+    """Prepend the OGBench repo root and its ``impls/`` dir to ``sys.path`` (idempotent)."""
     import sys
 
     impls_root = os.path.join(ogbench_root, "impls")
     for p in (impls_root, ogbench_root):
         if p not in sys.path:
             sys.path.insert(0, p)
+
+
+def _setup_external_imports(ogbench_root: str):
+    _ensure_ogbench_on_path(ogbench_root)
     from agents import agents as agent_registry
     from utils.env_utils import make_env_and_datasets
     from utils.flax_utils import restore_agent
@@ -345,6 +347,37 @@ def make_empowerment_full_obs_builder() -> Callable[[jnp.ndarray], jnp.ndarray]:
     return _builder
 
 
+def _chunked_normalized_score(
+    empowerment_of_chunk: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray],
+    states: jnp.ndarray,
+    rng: jnp.ndarray,
+    chunk_size: int,
+    mean_f: jnp.ndarray,
+    scale_f: jnp.ndarray,
+) -> jnp.ndarray:
+    """Score ``states`` in ``chunk_size`` batches via ``lax.fori_loop``, then return ``(raw - mean) / scale``.
+
+    ``empowerment_of_chunk(chunk, rng_i)`` returns the raw per-row empowerment for one chunk.
+    Chunking bounds peak activation memory to ``chunk_size`` rows; padding keeps the loop
+    shape static so the trace stays JIT-friendly.
+    """
+    n = states.shape[0]
+    pad = (chunk_size - (n % chunk_size)) % chunk_size
+    states_pad = jnp.pad(states, ((0, pad), (0, 0)))
+    total = states_pad.shape[0]
+    n_chunks = total // chunk_size
+    acc0 = jnp.zeros((total,), dtype=jnp.float32)
+
+    def body(i, acc):
+        chunk = jax.lax.dynamic_slice_in_dim(states_pad, i * chunk_size, chunk_size, axis=0)
+        ki = jax.random.fold_in(rng, i)
+        s = jnp.reshape(empowerment_of_chunk(chunk, ki), (chunk_size,)).astype(jnp.float32)
+        return jax.lax.dynamic_update_slice(acc, s, (i * chunk_size,))
+
+    acc = jax.lax.fori_loop(0, n_chunks, body, acc0)
+    return (acc[:n] - mean_f) / scale_f
+
+
 def make_offline_empowerment_scorer(
     emp_agent,
     obs_builder: Callable[[jnp.ndarray], jnp.ndarray],
@@ -370,24 +403,9 @@ def make_offline_empowerment_scorer(
     scale_f = jnp.asarray(scale, dtype=jnp.float32)
 
     def _score(states: jnp.ndarray, rng: jnp.ndarray) -> jnp.ndarray:
-        n = states.shape[0]
-        pad = (chunk_size - (n % chunk_size)) % chunk_size
-        states_pad = jnp.pad(states, ((0, pad), (0, 0)))
-        total = states_pad.shape[0]
-        n_chunks = total // chunk_size
-        acc0 = jnp.zeros((total,), dtype=jnp.float32)
-
-        def body(i, acc):
-            chunk = jax.lax.dynamic_slice_in_dim(
-                states_pad, i * chunk_size, chunk_size, axis=0
-            )
-            emp_obs = obs_builder(chunk)
-            ki = jax.random.fold_in(rng, i)
-            s = emp_agent.empowerment(emp_obs, rng=ki)
-            s = jnp.reshape(s, (chunk_size,)).astype(jnp.float32)
-            return jax.lax.dynamic_update_slice(acc, s, (i * chunk_size,))
-
-        acc = jax.lax.fori_loop(0, n_chunks, body, acc0)
-        return (acc[:n] - mean_f) / scale_f
+        return _chunked_normalized_score(
+            lambda chunk, ki: emp_agent.empowerment(obs_builder(chunk), rng=ki),
+            states, rng, chunk_size, mean_f, scale_f,
+        )
 
     return _score

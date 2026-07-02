@@ -1,11 +1,8 @@
-import functools
 import logging
-import pickle
 import random
 import time
-from typing import Any, Callable, Literal, NamedTuple, Optional, Tuple, Union
+from typing import Callable, Literal, Optional, Tuple, Union
 
-import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -13,7 +10,6 @@ import optax
 from brax import base, envs
 from brax.training import types
 from brax.v1 import envs as envs_v1
-from etils import epath
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
 
@@ -26,18 +22,16 @@ from jaxgcrl.envs.wrappers import (
 )
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
-from jaxgcrl.agents.go_explore.visualization import handle_goal_proposer_visualization
 
-from .types import Actor, Critic, TrainingState, Transition, GoalProposerState
+from .types import TrainingState, Transition, GoalProposerState
 from .algorithms import get_algorithm
+from .algorithms_utils import reconstruct_full_critic_params
 from .utils import save_params, create_single_dummy_transition, create_dummy_transition_for_buffer, create_dummy_transition_for_goal_proposer
-from .losses import update_alpha_sac, update_critic_sac, update_actor_sac
-from .visualization import all_visualizations
+from .losses import update_alpha_sac, soft_update_target_params
+from .visualization import all_visualizations, handle_goal_proposer_visualization
 from .goal_proposers import create_goal_proposer, create_random_env_goals_proposer
 
 Metrics = types.Metrics
-Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
-State = Union[envs.State, envs_v1.State]
 
 @dataclass
 class Baseline:
@@ -266,7 +260,6 @@ class Baseline:
         dummy_transition = create_single_dummy_transition(
             obs_size=obs_size,
             action_size=action_size,
-            agent_type=self.agent_type,
         )
 
         def jit_wrap(buffer):
@@ -291,7 +284,6 @@ class Baseline:
             num_envs=config.num_envs,
             obs_size=obs_size,
             action_size=action_size,
-            agent_type=self.agent_type,
         )
         buffer_state = replay_buffer.insert(buffer_state, dummy_batch_transition)
         
@@ -302,7 +294,6 @@ class Baseline:
             episode_length=config.episode_length,
             obs_size=obs_size,
             action_size=action_size,
-            agent_type=self.agent_type,
         )
         goal_proposer_state = GoalProposerState(
             transitions_sample=dummy_goal_proposer_transition,
@@ -346,7 +337,7 @@ class Baseline:
             
             info = dict(env_state.info)
             
-            reset_threshold = jnp.array(episode_length // (self.unroll_length * 2), dtype=jnp.int32)
+            goal_reproposal_interval = jnp.array(episode_length // (self.unroll_length * 2), dtype=jnp.int32)
             new_experience_count = experience_count + 1
             
             # Propose new goals if we've reached the threshold
@@ -359,7 +350,7 @@ class Baseline:
                 first_obs = info['first_obs']
                 # Call goal proposer to get new goals (vmapped over envs)
                 def propose_single_goal(rng_key, obs, state):
-                    goal, updated_state, log_data = goal_proposer(rng_key, obs, state)
+                    goal, _, log_data = goal_proposer(rng_key, obs, state)
                     return goal, log_data
                 
                 new_goals, log_data_tree = jax.vmap(
@@ -371,8 +362,8 @@ class Baseline:
                 # Capture goal_proposer_name from closure (static value, not traced)
                 def log_visualization(log_data_tree_np, viz_idx):
                     selected_log_data = {}
-                    for key, value in log_data_tree_np.items():
-                        selected_log_data[key] = value[viz_idx]
+                    for name, value in log_data_tree_np.items():
+                        selected_log_data[name] = value[viz_idx]
                     handle_goal_proposer_visualization(selected_log_data, self.goal_proposer_name, unwrapped_env.x_bounds, unwrapped_env.y_bounds)
                     return jnp.array(0, dtype=jnp.int32)
                 
@@ -397,7 +388,7 @@ class Baseline:
             propose_key, rollout_key = jax.random.split(key)
             # Conditionally propose new goals
             env_state, info, updated_experience_count, updated_goal_proposer_state = jax.lax.cond(
-                new_experience_count >= reset_threshold,
+                new_experience_count >= goal_reproposal_interval,
                 propose_new_goals,
                 keep_existing_goals,
                 env_state, propose_key, info, experience_count, goal_proposer_state
@@ -505,16 +496,10 @@ class Baseline:
             
             # Update target networks for SAC
             if self.agent_type == "sac" and training_state.target_critic_params is not None:
-                # Reconstruct full critic params from separate critic states (SAC structure)
-                full_critic_params = {}
-                for i, critic_i_state in enumerate(training_state.critic_states):
-                    for layer_name, layer_params in critic_i_state.params.items():
-                        full_critic_params[f"critic_{i}_{layer_name}"] = layer_params
-                
-                new_target_critic_params = jax.tree_util.tree_map(
-                    lambda x, y: x * (1 - self.tau) + y * self.tau,
+                new_target_critic_params = soft_update_target_params(
                     training_state.target_critic_params,
-                    full_critic_params,
+                    training_state.critic_states,
+                    self.tau,
                 )
                 training_state = training_state.replace(target_critic_params=new_target_critic_params)
             
@@ -657,14 +642,13 @@ class Baseline:
             # Visualize trajectories every 1M steps (robust check that handles step skips)
             # Check if we've crossed a 1M boundary since last visualization
             if current_step // 2_000_000 > last_visualization_step // 2_000_000:
-                key, viz_key = jax.random.split(key)
+                key, _ = jax.random.split(key)
                 buffer_state = all_visualizations(
                     replay_buffer=replay_buffer,
                     buffer_state=buffer_state,
                     env=unwrapped_env,
                     state_size=state_size,
                     goal_indices=tuple(train_env.goal_indices),
-                    rng_key=viz_key,
                     current_step=current_step,
                 )
                 last_visualization_step = current_step
@@ -679,17 +663,9 @@ class Baseline:
             )
 
             # Prepare params for return (and optionally save if checkpointing)
-            # Reconstruct full critic params from separate critic states
-            # CRL uses sa_encoder_{i}/g_encoder_{i}, SAC uses critic_{i}_hidden_{j}/critic_{i}_output
-            full_critic_params = {}
-            for i, critic_i_state in enumerate(training_state.critic_states):
-                for layer_name, layer_params in critic_i_state.params.items():
-                    # Check if this is CRL structure (sa_encoder/g_encoder) or SAC structure (hidden/output)
-                    if layer_name in ["sa_encoder", "g_encoder"]:
-                        full_critic_params[f"{layer_name}_{i}"] = layer_params
-                    else:
-                        # SAC structure: add critic_{i}_ prefix
-                        full_critic_params[f"critic_{i}_{layer_name}"] = layer_params
+            full_critic_params = reconstruct_full_critic_params(
+                {i: cs.params for i, cs in enumerate(training_state.critic_states)}
+            )
             
             params = (
                 training_state.alpha_state.params,

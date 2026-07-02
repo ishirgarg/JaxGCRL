@@ -33,15 +33,15 @@ from brax.training import acting, gradients, pmap, types
 from brax.training.acme import running_statistics, specs
 from brax.training.agents.ppo import losses as ppo_losses
 from brax.training.agents.ppo import networks as ppo_networks
-from brax.training.types import Params, PRNGKey
+from brax.training.types import PRNGKey
 from brax.v1 import envs as envs_v1
 from etils import epath
 from orbax import checkpoint as ocp
 
+from jaxgcrl.agents.common_agent_utils import _unpmap
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import Evaluator
 
-InferenceParams = Tuple[running_statistics.NestedMeanStd, Params]
 Metrics = types.Metrics
 
 _PMAP_AXIS_NAME = "i"
@@ -55,10 +55,6 @@ class TrainingState:
     params: ppo_losses.PPONetworkParams
     normalizer_params: running_statistics.RunningStatisticsState
     env_steps: jnp.ndarray
-
-
-def _unpmap(v):
-    return jax.tree_util.tree_map(lambda x: x[0], v)
 
 
 def _strip_weak_type(tree):

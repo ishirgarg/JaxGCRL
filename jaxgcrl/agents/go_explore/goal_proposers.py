@@ -490,6 +490,64 @@ def create_max_critic_to_env_goal_proposer(
     return propose_goal
 
 
+def _make_empowerment_family_proposer(
+    num_candidates: int,
+    state_size: int,
+    goal_idx_array: jnp.ndarray,
+    empowerment_scorer: Callable[[jnp.ndarray, jnp.ndarray, GoalProposerState], jnp.ndarray],
+    combine_fn: Callable[[jnp.ndarray, jnp.ndarray], tuple],
+    temperature: float,
+    kde_bandwidth: float,
+    kde_eps: float,
+) -> Callable[[jax.Array, jnp.ndarray, GoalProposerState], tuple]:
+    """Shared body for the empowerment goal-proposer family.
+
+    Each variant samples replay-buffer candidate states, estimates the KDE log-density of
+    their goals, and scores them with ``empowerment_scorer``; variants differ only in
+    ``combine_fn``, which maps ``(emp_scores, log_density)`` to ``(logits, extra_log_data)``.
+    Selection is ``softmax(logits / T)`` when ``T > 0`` else ``argmax(logits)``.
+    """
+
+    def propose_goal(rng: jax.Array, start_obs: jnp.ndarray, goal_proposer_state: GoalProposerState):
+        transitions_sample = goal_proposer_state.transitions_sample
+        obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
+        # Slice off the appended goal-conditioning so density / empowerment see state only.
+        states = obs_flat[:, :state_size]  # (N, state_size)
+        all_goals = states[:, goal_idx_array]  # (N_buf, goal_dim) — same KDE reference as MEGA
+
+        num_states = states.shape[0]
+        rng, sample_rng, emp_rng, select_rng = jax.random.split(rng, 4)
+        candidate_indices = jax.random.randint(sample_rng, (num_candidates,), 0, num_states)
+        candidate_states = states[candidate_indices]  # (num_candidates, state_size)
+        candidate_goals = candidate_states[:, goal_idx_array]
+
+        densities = _jax_gaussian_kde(candidate_goals, all_goals, kde_bandwidth)
+        log_density = jnp.log(densities + kde_eps)
+
+        emp_scores = empowerment_scorer(candidate_states, emp_rng, goal_proposer_state)  # (num_candidates,)
+        logits, extra_log_data = combine_fn(emp_scores, log_density)
+        best_idx = _sample_idx_from_temperature_logits(select_rng, logits, temperature)
+        selected_state = candidate_states[best_idx]
+        selected_goal = selected_state[goal_idx_array]
+
+        first_obs_state = start_obs[:state_size]
+        first_obs_position = first_obs_state[goal_idx_array]
+
+        log_data = {
+            "candidate_goals": candidate_goals,
+            "first_obs_position": first_obs_position,
+            "emp_scores": emp_scores,
+            **extra_log_data,
+            "densities": densities,
+            "log_densities": log_density,
+            "selection_logits": logits,
+            "selected_goal": selected_goal,
+        }
+        return selected_goal, goal_proposer_state, log_data
+
+    return propose_goal
+
+
 def create_empowerment_goal_proposer(
     env,
     num_envs: int,
@@ -516,43 +574,13 @@ def create_empowerment_goal_proposer(
     goal_idx_array = jnp.array(goal_indices)
     alpha_f = jnp.asarray(alpha, dtype=jnp.float32)
 
-    def propose_goal(rng: jax.Array, start_obs: jnp.ndarray, goal_proposer_state: GoalProposerState):
-        transitions_sample = goal_proposer_state.transitions_sample
-        obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
-        # Slice off the appended goal-conditioning so density / empowerment see state only.
-        states = obs_flat[:, :state_size]  # (N, state_size)
-        all_goals = states[:, goal_idx_array]  # (N_buf, goal_dim) — same KDE reference as MEGA
+    def combine_fn(emp_scores, log_density):
+        return alpha_f * emp_scores - log_density, {}
 
-        num_states = states.shape[0]
-        rng, sample_rng, emp_rng, select_rng = jax.random.split(rng, 4)
-        candidate_indices = jax.random.randint(sample_rng, (num_candidates,), 0, num_states)
-        candidate_states = states[candidate_indices]  # (num_candidates, state_size)
-        candidate_goals = candidate_states[:, goal_idx_array]
-
-        densities = _jax_gaussian_kde(candidate_goals, all_goals, kde_bandwidth)
-        log_density = jnp.log(densities + kde_eps)
-
-        emp_scores = empowerment_scorer(candidate_states, emp_rng, goal_proposer_state)  # (num_candidates,)
-        logits = alpha_f * emp_scores - log_density
-        best_idx = _sample_idx_from_temperature_logits(select_rng, logits, temperature)
-        selected_state = candidate_states[best_idx]
-        selected_goal = selected_state[goal_idx_array]
-
-        first_obs_state = start_obs[:state_size]
-        first_obs_position = first_obs_state[goal_idx_array]
-
-        log_data = {
-            "candidate_goals": candidate_goals,
-            "first_obs_position": first_obs_position,
-            "emp_scores": emp_scores,
-            "densities": densities,
-            "log_densities": log_density,
-            "selection_logits": logits,
-            "selected_goal": selected_goal,
-        }
-        return selected_goal, goal_proposer_state, log_data
-
-    return propose_goal
+    return _make_empowerment_family_proposer(
+        num_candidates, state_size, goal_idx_array, empowerment_scorer,
+        combine_fn, temperature, kde_bandwidth, kde_eps,
+    )
 
 
 def create_empowerment_density_ratio_goal_proposer(
@@ -580,42 +608,13 @@ def create_empowerment_density_ratio_goal_proposer(
 
     goal_idx_array = jnp.array(goal_indices)
 
-    def propose_goal(rng: jax.Array, start_obs: jnp.ndarray, goal_proposer_state: GoalProposerState):
-        transitions_sample = goal_proposer_state.transitions_sample
-        obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
-        states = obs_flat[:, :state_size]
-        all_goals = states[:, goal_idx_array]
+    def combine_fn(emp_scores, log_density):
+        return emp_scores / log_density, {}
 
-        num_states = states.shape[0]
-        rng, sample_rng, emp_rng, select_rng = jax.random.split(rng, 4)
-        candidate_indices = jax.random.randint(sample_rng, (num_candidates,), 0, num_states)
-        candidate_states = states[candidate_indices]
-        candidate_goals = candidate_states[:, goal_idx_array]
-
-        densities = _jax_gaussian_kde(candidate_goals, all_goals, kde_bandwidth)
-        log_density = jnp.log(densities + kde_eps)
-
-        emp_scores = empowerment_scorer(candidate_states, emp_rng, goal_proposer_state)
-        logits = emp_scores / log_density
-        best_idx = _sample_idx_from_temperature_logits(select_rng, logits, temperature)
-        selected_state = candidate_states[best_idx]
-        selected_goal = selected_state[goal_idx_array]
-
-        first_obs_state = start_obs[:state_size]
-        first_obs_position = first_obs_state[goal_idx_array]
-
-        log_data = {
-            "candidate_goals": candidate_goals,
-            "first_obs_position": first_obs_position,
-            "emp_scores": emp_scores,
-            "densities": densities,
-            "log_densities": log_density,
-            "selection_logits": logits,
-            "selected_goal": selected_goal,
-        }
-        return selected_goal, goal_proposer_state, log_data
-
-    return propose_goal
+    return _make_empowerment_family_proposer(
+        num_candidates, state_size, goal_idx_array, empowerment_scorer,
+        combine_fn, temperature, kde_bandwidth, kde_eps,
+    )
 
 
 def create_empowerment_density_product_goal_proposer(
@@ -647,45 +646,15 @@ def create_empowerment_density_product_goal_proposer(
     goal_idx_array = jnp.array(goal_indices)
     alpha_f = jnp.asarray(alpha, dtype=jnp.float32)
 
-    def propose_goal(rng: jax.Array, start_obs: jnp.ndarray, goal_proposer_state: GoalProposerState):
-        transitions_sample = goal_proposer_state.transitions_sample
-        obs_flat = jnp.reshape(transitions_sample.observation, (-1, transitions_sample.observation.shape[-1]))
-        states = obs_flat[:, :state_size]
-        all_goals = states[:, goal_idx_array]
-
-        num_states = states.shape[0]
-        rng, sample_rng, emp_rng, select_rng = jax.random.split(rng, 4)
-        candidate_indices = jax.random.randint(sample_rng, (num_candidates,), 0, num_states)
-        candidate_states = states[candidate_indices]
-        candidate_goals = candidate_states[:, goal_idx_array]
-
-        densities = _jax_gaussian_kde(candidate_goals, all_goals, kde_bandwidth)
-        log_density = jnp.log(densities + kde_eps)  # negative: densities < 1
-
-        emp_scores = empowerment_scorer(candidate_states, emp_rng, goal_proposer_state)
-        emp_alpha_scores = jnp.sign(emp_scores) * (jnp.abs(emp_scores) ** alpha_f)  # empowerment**alpha
+    def combine_fn(emp_scores, log_density):
         # -(E**alpha) * log_density == (E**alpha) * (-log_density) == empowerment**alpha * novelty.
-        logits = -emp_alpha_scores * log_density
-        best_idx = _sample_idx_from_temperature_logits(select_rng, logits, temperature)
-        selected_state = candidate_states[best_idx]
-        selected_goal = selected_state[goal_idx_array]
+        emp_alpha_scores = jnp.sign(emp_scores) * (jnp.abs(emp_scores) ** alpha_f)  # empowerment**alpha
+        return -emp_alpha_scores * log_density, {"emp_alpha_scores": emp_alpha_scores}
 
-        first_obs_state = start_obs[:state_size]
-        first_obs_position = first_obs_state[goal_idx_array]
-
-        log_data = {
-            "candidate_goals": candidate_goals,
-            "first_obs_position": first_obs_position,
-            "emp_scores": emp_scores,
-            "emp_alpha_scores": emp_alpha_scores,
-            "densities": densities,
-            "log_densities": log_density,
-            "selection_logits": logits,
-            "selected_goal": selected_goal,
-        }
-        return selected_goal, goal_proposer_state, log_data
-
-    return propose_goal
+    return _make_empowerment_family_proposer(
+        num_candidates, state_size, goal_idx_array, empowerment_scorer,
+        combine_fn, temperature, kde_bandwidth, kde_eps,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -8,16 +8,28 @@ import numpy as np
 from etils import epath
 
 
-def load_params(path: str):
-    with epath.Path(path).open("rb") as fin:
-        buf = fin.read()
-    return pickle.loads(buf)
-
-
 def save_params(path: str, params: Any):
     """Saves parameters in flax format."""
     with epath.Path(path).open("wb") as fout:
         fout.write(pickle.dumps(params))
+
+
+def format_epoch_metrics(metrics):
+    """Map raw epoch metrics to a wandb-ready dict: prefix keys, coerce scalars to float.
+
+    Keys under ``online_empowerment/`` keep that prefix (dedicated wandb tab); all others are
+    prefixed ``training/``. Array/scalar values are coerced to Python float when possible.
+    """
+    formatted = {}
+    for name, value in metrics.items():
+        metric_key = name if name.startswith("online_empowerment/") else f"training/{name}"
+        if hasattr(value, "item"):
+            formatted[metric_key] = float(value.item())
+        elif hasattr(value, "__float__"):
+            formatted[metric_key] = float(value)
+        else:
+            formatted[metric_key] = value
+    return formatted
 
 
 @functools.partial(jax.jit, static_argnames=("buffer_config"))
@@ -97,7 +109,6 @@ def sample_trajectories_from_buffer(
     buffer_state,
     state_size: int,
     goal_indices: Tuple[int, ...],
-    rng_key: jax.Array,
 ) -> Tuple[Any, np.ndarray, np.ndarray, np.ndarray]:
     """
     Sample trajectories from the replay buffer and extract positions.
@@ -107,7 +118,6 @@ def sample_trajectories_from_buffer(
         buffer_state: Current buffer state (will be modified by sampling)
         state_size: Size of state dimension
         goal_indices: Indices for x, y positions (typically [0, 1])
-        rng_key: Random key for sampling
         
     Returns:
         Tuple of (buffer_state, all_positions, final_positions, goal_positions) where:
@@ -191,7 +201,6 @@ def _dummy_transition(
     prefix: Tuple[int, ...],
     obs_size: int,
     action_size: int,
-    agent_type: str,
     include_phase: bool,
 ) -> Any:
     """Build a zero-filled ``Transition`` with leading shape ``prefix``.
@@ -228,12 +237,11 @@ def create_dummy_transition_for_buffer(
     num_envs: int,
     obs_size: int,
     action_size: int,
-    agent_type: str = "crl",
     include_phase: bool = False,
 ) -> Any:
     """Dummy transition shaped ``(unroll_length, num_envs, ...)`` for buffer inserts."""
     return _dummy_transition(
-        (unroll_length, num_envs), obs_size, action_size, agent_type, include_phase,
+        (unroll_length, num_envs), obs_size, action_size, include_phase,
     )
 
 
@@ -242,24 +250,22 @@ def create_dummy_transition_for_goal_proposer(
     episode_length: int,
     obs_size: int,
     action_size: int,
-    agent_type: str = "crl",
     include_phase: bool = False,
 ) -> Any:
     """Dummy transition shaped ``(num_envs, episode_length, ...)`` matching ``buffer.sample``."""
     return _dummy_transition(
-        (num_envs, episode_length), obs_size, action_size, agent_type, include_phase,
+        (num_envs, episode_length), obs_size, action_size, include_phase,
     )
 
 
 def create_single_dummy_transition(
     obs_size: int,
     action_size: int,
-    agent_type: str = "crl",
     include_phase: bool = False,
 ) -> Any:
     """Scalar dummy transition for replay-buffer initialization."""
     return _dummy_transition(
-        (), obs_size, action_size, agent_type, include_phase,
+        (), obs_size, action_size, include_phase,
     )
 
 
@@ -268,7 +274,6 @@ def sample_trajectory_sequences(
     buffer_state,
     state_size: int,
     goal_indices: Tuple[int, ...],
-    rng_key: jax.Array,
     num_trajectories: int = 4,
 ) -> Tuple[Any, np.ndarray, np.ndarray]:
     """
@@ -279,7 +284,6 @@ def sample_trajectory_sequences(
         buffer_state: Current buffer state (will be modified by sampling)
         state_size: Size of state dimension
         goal_indices: Indices for x, y positions (typically [0, 1])
-        rng_key: Random key for sampling
         num_trajectories: Number of trajectories to extract (default: 4)
         
     Returns:

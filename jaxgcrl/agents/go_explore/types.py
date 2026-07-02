@@ -58,10 +58,6 @@ class TrainingState:
     alpha_state: Optional[TrainState] = None
     # SAC-specific fields
     target_critic_params: Optional[Any] = None  # Params for target Q-network
-    normalizer_params: Optional[Any] = None  # Running statistics for observations
-    policy_optimizer_state: Optional[Any] = None  # For SAC's policy optimizer
-    q_optimizer_state: Optional[Any] = None  # For SAC's Q-network optimizer
-    target_policy_params: Optional[Any] = None  # For SAC's target policy (if TD3-like)
     # Go Explore explore policy fields
     explore_actor_state: Optional[TrainState] = None
     explore_critic_states: Optional[Tuple[TrainState, ...]] = None

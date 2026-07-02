@@ -3,7 +3,6 @@ import glob
 import json
 import os
 import re
-from typing import Tuple
 
 import jax
 import jax.numpy as jnp

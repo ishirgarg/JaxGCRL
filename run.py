@@ -184,7 +184,6 @@ def main(config: Config):
             ]
 
     metrics_recorder = MetricsRecorder(
-        config.run.total_env_steps,
         metrics_to_collect,
         None if config.run.no_save else run_dir,
         config.run.exp_name,

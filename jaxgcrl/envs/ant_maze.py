@@ -2,11 +2,13 @@ import os
 import xml.etree.ElementTree as ET
 
 import jax
-import mujoco
 from brax import base, math
 from brax.envs.base import PipelineEnv, State
 from brax.io import mjcf
 from jax import numpy as jnp
+
+from jaxgcrl.envs._locomotion_common import ant_initial_metrics, apply_mjx_solver_flags
+from jaxgcrl.envs._maze_layouts import BIG_MAZE, BIG_MAZE_EVAL, HARDEST_MAZE, U_MAZE, U_MAZE_EVAL
 
 # This is based on original Ant environment from Brax
 # https://github.com/google/brax/blob/main/brax/envs/ant.py
@@ -17,27 +19,11 @@ GOAL = G = "g"
 
 
 
-U_MAZE = [
-    [1, 1, 1, 1, 1],
-    [1, R, G, G, 1],
-    [1, 1, 1, G, 1],
-    [1, G, G, G, 1],
-    [1, 1, 1, 1, 1],
-]
-
 U_MAZE_HARD = [
     [1, 1, 1, 1, 1],
     [1, R, 0, 0, 1],
     [1, 1, 1, 0, 1],
     [1, G, 0, 0, 1],
-    [1, 1, 1, 1, 1],
-]
-
-U_MAZE_EVAL = [
-    [1, 1, 1, 1, 1],
-    [1, R, 0, 0, 1],
-    [1, 1, 1, 0, 1],
-    [1, G, G, G, 1],
     [1, 1, 1, 1, 1],
 ]
 
@@ -59,17 +45,6 @@ OGBENCH_ARENA = [
 # R cells at (1,1) and (2,1) cover OGBench's init_ij=(1,1) and a second
 # start near the same corner.
 OGBENCH_MEDIUM_NAVIGATE = [
-    [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, G, 1, 1, G, G, 1],
-    [1, G, G, 1, G, G, G, 1],
-    [1, 1, G, G, G, 1, 1, 1],
-    [1, G, G, 1, G, G, G, 1],
-    [1, G, 1, G, G, 1, G, 1],
-    [1, G, G, G, 1, G, G, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1],
-]
-
-BIG_MAZE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
     [1, R, G, 1, 1, G, G, 1],
     [1, G, G, 1, G, G, G, 1],
@@ -119,29 +94,6 @@ BIG_MAZE_HARD = [
     [1, 0, 1, 0, 0, 1, 0, 1],
     [1, G, 0, 0, 1, G, 0, 1],
     [1, 1, 1, 1, 1, 1, 1, 1],
-]
-
-BIG_MAZE_EVAL = [
-    [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, 0, 1, 1, G, G, 1],
-    [1, 0, 0, 1, 0, G, G, 1],
-    [1, 1, 0, 0, 0, 1, 1, 1],
-    [1, 0, 0, 1, 0, 0, 0, 1],
-    [1, 0, 1, G, 0, 1, G, 1],
-    [1, 0, G, G, 1, G, G, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1],
-]
-
-HARDEST_MAZE = [
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, G, G, G, 1, G, G, G, G, G, 1],
-    [1, G, 1, 1, G, 1, G, 1, G, 1, G, 1],
-    [1, G, G, G, G, G, G, 1, G, G, G, 1],
-    [1, G, 1, 1, 1, 1, G, 1, 1, 1, G, 1],
-    [1, G, G, 1, G, 1, G, G, G, G, G, 1],
-    [1, 1, G, 1, G, 1, G, 1, G, 1, 1, 1],
-    [1, G, G, 1, G, G, G, 1, G, G, G, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
 OGBENCH_MEDIUM_1G = [
@@ -208,37 +160,39 @@ def is_ogbench_maze(maze_layout_name: str) -> bool:
     return maze_layout_name in OGBENCH_MAZE_LAYOUTS
 
 
+def _layout_for_name(maze_layout_name):
+    if maze_layout_name == "u_maze":
+        return U_MAZE
+    if maze_layout_name == "u_maze_hard":
+        return U_MAZE_HARD
+    if maze_layout_name == "u_maze_eval":
+        return U_MAZE_EVAL
+    if maze_layout_name == "maze_ogbench_arena":
+        return OGBENCH_ARENA
+    if maze_layout_name == "maze_ogbench_medium_navigate":
+        return OGBENCH_MEDIUM_NAVIGATE
+    if maze_layout_name == "maze_ogbench_medium_1g":
+        return OGBENCH_MEDIUM_1G
+    if maze_layout_name == "maze_ogbench_u":
+        return U_MAZE
+    if maze_layout_name == "big_maze":
+        return BIG_MAZE
+    if maze_layout_name == "big_maze_hard":
+        return BIG_MAZE_HARD
+    if maze_layout_name == "big_maze_eval":
+        return BIG_MAZE_EVAL
+    if maze_layout_name == "cross_maze":
+        return CROSS_MAZE
+    if maze_layout_name == "cross_maze_hard":
+        return CROSS_MAZE_HARD
+    if maze_layout_name == "hardest_maze":
+        return HARDEST_MAZE
+    raise ValueError(f"Unknown maze layout: {maze_layout_name}")
+
+
 # Create a xml with maze and a list of possible goal positions
 def make_maze(maze_layout_name, maze_size_scaling):
-    if maze_layout_name == "u_maze":
-        maze_layout = U_MAZE
-    elif maze_layout_name == "u_maze_hard":
-        maze_layout = U_MAZE_HARD
-    elif maze_layout_name == "u_maze_eval":
-        maze_layout = U_MAZE_EVAL
-    elif maze_layout_name == "maze_ogbench_arena":
-        maze_layout = OGBENCH_ARENA
-    elif maze_layout_name == "maze_ogbench_medium_navigate":
-        maze_layout = OGBENCH_MEDIUM_NAVIGATE
-    elif maze_layout_name == "maze_ogbench_medium_1g":
-        maze_layout = OGBENCH_MEDIUM_1G
-    elif maze_layout_name == "maze_ogbench_u":
-        maze_layout = U_MAZE
-    elif maze_layout_name == "big_maze":
-        maze_layout = BIG_MAZE
-    elif maze_layout_name == "big_maze_hard":
-        maze_layout = BIG_MAZE_HARD
-    elif maze_layout_name == "big_maze_eval":
-        maze_layout = BIG_MAZE_EVAL
-    elif maze_layout_name == "cross_maze":
-        maze_layout = CROSS_MAZE
-    elif maze_layout_name == "cross_maze_hard":
-        maze_layout = CROSS_MAZE_HARD
-    elif maze_layout_name == "hardest_maze":
-        maze_layout = HARDEST_MAZE
-    else:
-        raise ValueError(f"Unknown maze layout: {maze_layout_name}")
-
+    maze_layout = _layout_for_name(maze_layout_name)
     use_ogbench_convention = is_ogbench_maze(maze_layout_name)
     xml_name = "ant_maze_ogbench.xml" if use_ogbench_convention else "ant_maze.xml"
     xml_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", xml_name)
@@ -307,34 +261,7 @@ class AntMaze(PipelineEnv):
         xml_string, possible_starts, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
 
         # Get maze layout to calculate bounds
-        if maze_layout_name == "u_maze":
-            maze_layout = U_MAZE
-        elif maze_layout_name == "u_maze_hard":
-            maze_layout = U_MAZE_HARD
-        elif maze_layout_name == "u_maze_eval":
-            maze_layout = U_MAZE_EVAL
-        elif maze_layout_name == "maze_ogbench_arena":
-            maze_layout = OGBENCH_ARENA
-        elif maze_layout_name == "maze_ogbench_medium_navigate":
-            maze_layout = OGBENCH_MEDIUM_NAVIGATE
-        elif maze_layout_name == "maze_ogbench_medium_1g":
-            maze_layout = OGBENCH_MEDIUM_1G
-        elif maze_layout_name == "maze_ogbench_u":
-            maze_layout = U_MAZE
-        elif maze_layout_name == "big_maze":
-            maze_layout = BIG_MAZE
-        elif maze_layout_name == "big_maze_hard":
-            maze_layout = BIG_MAZE_HARD
-        elif maze_layout_name == "big_maze_eval":
-            maze_layout = BIG_MAZE_EVAL
-        elif maze_layout_name == "cross_maze":
-            maze_layout = CROSS_MAZE
-        elif maze_layout_name == "cross_maze_hard":
-            maze_layout = CROSS_MAZE_HARD
-        elif maze_layout_name == "hardest_maze":
-            maze_layout = HARDEST_MAZE
-        else:
-            raise ValueError(f"Unknown maze layout: {maze_layout_name}")
+        maze_layout = _layout_for_name(maze_layout_name)
 
         # Calculate x and y bounds based on maze layout dimensions.
         # Under the OGBench convention grid columns map to x and rows to y;
@@ -381,14 +308,7 @@ class AntMaze(PipelineEnv):
                 n_frames = 10
 
         if backend == "mjx":
-            sys = sys.tree_replace(
-                {
-                    "opt.solver": mujoco.mjtSolver.mjSOL_NEWTON,
-                    "opt.disableflags": mujoco.mjtDisableBit.mjDSBL_EULERDAMP,
-                    "opt.iterations": 1,
-                    "opt.ls_iterations": 4,
-                }
-            )
+            sys = apply_mjx_solver_flags(sys)
 
         if backend == "positional":
             # TODO: does the same actuator strength work as in spring
@@ -459,21 +379,7 @@ class AntMaze(PipelineEnv):
 
         # Return metrics
         reward, done, zero = jnp.zeros(3)
-        metrics = {
-            "reward_forward": zero,
-            "reward_survive": zero,
-            "reward_ctrl": zero,
-            "reward_contact": zero,
-            "x_position": zero,
-            "y_position": zero,
-            "distance_from_origin": zero,
-            "x_velocity": zero,
-            "y_velocity": zero,
-            "forward_reward": zero,
-            "dist": zero,
-            "success": zero,
-            "success_easy": zero,
-        }
+        metrics = ant_initial_metrics(zero)
         state = State(pipeline_state, obs, reward, done, metrics)
         return state
 

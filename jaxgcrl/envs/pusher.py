@@ -167,7 +167,7 @@ class PusherReacher(PipelineEnv):
     def reset(self, rng: jax.Array) -> State:
         qpos = self.sys.init_q
 
-        rng, rng1, rng2, rng3, rng4 = jax.random.split(rng, 5)
+        rng, _, rng2, rng3, rng4 = jax.random.split(rng, 5)
 
         # randomly orient the object
         cylinder_pos = jnp.concatenate(
@@ -213,9 +213,6 @@ class PusherReacher(PipelineEnv):
     def step(self, state: State, action: jax.Array) -> State:
         assert state.pipeline_state is not None
         x_i = state.pipeline_state.x.vmap().do(base.Transform.create(pos=self.sys.link.inertia.transform.pos))
-        vec_1 = x_i.pos[self._object_idx] - x_i.pos[self._tips_arm_idx]
-        vec_2 = x_i.pos[self._object_idx] - x_i.pos[self._goal_idx]
-
         arm_to_goal_dist = math.safe_norm(x_i.pos[self._goal_idx] - x_i.pos[self._tips_arm_idx])
 
         reward_dist = -arm_to_goal_dist

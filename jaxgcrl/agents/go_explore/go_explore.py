@@ -8,14 +8,11 @@ Two-phase training loop:
 Phase management is handled by ``GoExploreWrapper`` (see ``jaxgcrl/envs/wrappers.py``).
 """
 
-import functools
 import logging
-import pickle
 import random
 import time
-from typing import Any, Callable, Literal, NamedTuple, Optional, Tuple, Union
+from typing import Callable, Literal, Optional, Tuple, Union
 
-import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -23,7 +20,6 @@ import optax
 from brax import base, envs
 from brax.training import types
 from brax.v1 import envs as envs_v1
-from etils import epath
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
 
@@ -36,9 +32,8 @@ from jaxgcrl.envs.wrappers import (
 )
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
-from jaxgcrl.agents.go_explore.visualization import handle_goal_proposer_visualization
 
-from .types import Actor, Critic, TrainingState, Transition, GoalProposerState
+from .types import TrainingState, Transition, GoalProposerState
 from .algorithms import get_algorithm, get_explore_policy
 from .algorithms_utils import reconstruct_full_critic_params
 from .utils import (
@@ -46,9 +41,15 @@ from .utils import (
     create_single_dummy_transition,
     create_dummy_transition_for_buffer,
     create_dummy_transition_for_goal_proposer,
+    format_epoch_metrics,
 )
-from .losses import update_alpha_sac, update_critic_sac, update_actor_sac
-from .visualization import all_visualizations, visualize_go_explore_phases
+from .losses import update_alpha_sac, soft_update_target_params
+from .visualization import (
+    all_visualizations,
+    visualize_go_explore_phases,
+    log_online_empowerment_heatmap,
+    handle_goal_proposer_visualization,
+)
 from .goal_proposers import (
     create_goal_proposer,
     create_random_env_goals_proposer,
@@ -66,11 +67,8 @@ from .online_empowerment import (
     make_online_empowerment_scorer,
     make_online_empowerment_train_fn,
 )
-from .visualization import log_online_empowerment_heatmap
 
 Metrics = types.Metrics
-Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
-State = Union[envs.State, envs_v1.State]
 
 
 @dataclass
@@ -213,7 +211,6 @@ class GoExplore:
             num_gcp_steps=self.num_gcp_steps,
             num_ep_steps=self.num_ep_steps,
             state_size=state_size,
-            goal_size=goal_size,
             goal_indices=unwrapped_env.goal_indices,
         )
 
@@ -237,7 +234,7 @@ class GoExplore:
         np.random.seed(config.seed)
         key = jax.random.PRNGKey(config.seed)
         key, buffer_key, eval_env_key, env_key, actor_key, critic_key = jax.random.split(key, 6)
-        key, explore_actor_key, explore_critic_key, explore_alpha_key = jax.random.split(key, 4)
+        key, explore_actor_key, explore_critic_key, _ = jax.random.split(key, 4)
 
         # ── GCP (goal-conditioned policy) ────────────────────────────────────
         gcp_actor, gcp_critic = get_algorithm(
@@ -386,7 +383,7 @@ class GoExplore:
                     "(or set online_empowerment=True)."
                 )
             key, empowerment_template_key = jax.random.split(key)
-            emp_agent, _ex_obs_dim, base_obs_template = load_offline_empowerment_agent(
+            emp_agent, ex_obs_dim, base_obs_template = load_offline_empowerment_agent(
                 run_dir=self.empowerment_run_dir,
                 jax_env=unwrapped_env,
                 template_rng=empowerment_template_key,
@@ -396,10 +393,10 @@ class GoExplore:
                 ogbench_root=self.ogbench_root,
             )
             if self.use_full_empowerment:
-                if state_size != int(_ex_obs_dim):
+                if state_size != int(ex_obs_dim):
                     raise ValueError(
                         "use_full_empowerment=True requires state_size == ex_obs_dim; "
-                        f"got state_size={state_size}, ex_obs_dim={_ex_obs_dim}."
+                        f"got state_size={state_size}, ex_obs_dim={ex_obs_dim}."
                     )
                 obs_builder = make_empowerment_full_obs_builder()
             else:
@@ -468,7 +465,6 @@ class GoExplore:
         dummy_transition = create_single_dummy_transition(
             obs_size=obs_size,
             action_size=action_size,
-            agent_type="sac",   # always include next_observation for explore critic
             include_phase=True,
         )
 
@@ -493,7 +489,6 @@ class GoExplore:
             num_envs=config.num_envs,
             obs_size=obs_size,
             action_size=action_size,
-            agent_type="sac",   # always include next_observation for explore critic
             include_phase=True,
         )
         buffer_state = replay_buffer.insert(buffer_state, dummy_batch_transition)
@@ -503,7 +498,6 @@ class GoExplore:
             episode_length=config.episode_length,
             obs_size=obs_size,
             action_size=action_size,
-            agent_type="sac",   # always include next_observation for explore critic
             include_phase=True,
         )
         goal_proposer_state = GoalProposerState(
@@ -589,21 +583,21 @@ class GoExplore:
                 empowerment_state=training_state.online_empowerment_agent,
             )
 
-            num_envs_     = config.num_envs
+            num_envs     = config.num_envs
             episode_length = config.episode_length
             info           = dict(env_state.info)
             
-            reset_threshold    = jnp.array(episode_length // (self.unroll_length * 2), dtype=jnp.int32)
+            goal_reproposal_interval = jnp.array(episode_length // (self.unroll_length * 2), dtype=jnp.int32)
             new_experience_count = experience_count + 1
             
-            def propose_new_goals(env_state, key, info, experience_count, goal_proposer_state):
+            def propose_new_goals(env_state, key, info, new_experience_count, goal_proposer_state):
                 viz_key, goal_key = jax.random.split(key)
-                viz_env_idx = jax.random.randint(viz_key, (), 0, num_envs_)
-                goal_keys   = jax.random.split(goal_key, num_envs_)
+                viz_env_idx = jax.random.randint(viz_key, (), 0, num_envs)
+                goal_keys   = jax.random.split(goal_key, num_envs)
                 first_obs   = info['first_obs']
 
                 def propose_single(rng_key, obs, state):
-                    goal, updated_state, log_data = goal_proposer(rng_key, obs, state)
+                    goal, _, log_data = goal_proposer(rng_key, obs, state)
                     return goal, log_data
                 
                 new_goals, log_data_tree = jax.vmap(
@@ -634,7 +628,7 @@ class GoExplore:
             # Split key so proposal and rollout use independent randomness.
             _, propose_key, rollout_key = jax.random.split(key, 3)
             env_state, info, updated_experience_count, updated_goal_proposer_state = jax.lax.cond(
-                new_experience_count >= reset_threshold,
+                new_experience_count >= goal_reproposal_interval,
                 propose_new_goals,
                 keep_existing_goals,
                 env_state, propose_key, info, new_experience_count, goal_proposer_state,
@@ -716,13 +710,10 @@ class GoExplore:
             
             # Update SAC target network
             if self.agent_type == "sac" and training_state.target_critic_params is not None:
-                full_cp = {}
-                for i, cs in enumerate(training_state.critic_states):
-                    for lname, lparams in cs.params.items():
-                        full_cp[f"critic_{i}_{lname}"] = lparams
-                new_target = jax.tree_util.tree_map(
-                    lambda x, y: x * (1 - self.tau) + y * self.tau,
-                    training_state.target_critic_params, full_cp,
+                new_target = soft_update_target_params(
+                    training_state.target_critic_params,
+                    training_state.critic_states,
+                    self.tau,
                 )
                 training_state = training_state.replace(target_critic_params=new_target)
             
@@ -777,13 +768,8 @@ class GoExplore:
             temp_ts, actor_metrics  = explore_actor.update(explore_context, explore_networks, explore_transitions, temp_ts, actor_key)
 
             # Update explore target network
-            full_exp_cp = {}
-            for i, cs in enumerate(temp_ts.critic_states):
-                for lname, lparams in cs.params.items():
-                    full_exp_cp[f"critic_{i}_{lname}"] = lparams
-            new_exp_target = jax.tree_util.tree_map(
-                lambda x, y: x * (1 - self.tau) + y * self.tau,
-                temp_ts.target_critic_params, full_exp_cp,
+            new_exp_target = soft_update_target_params(
+                temp_ts.target_critic_params, temp_ts.critic_states, self.tau
             )
 
             # Write updated explore states back to the full training_state
@@ -969,15 +955,7 @@ class GoExplore:
             # metrics keep their own top-level "online_empowerment/" prefix so
             # they land in a dedicated wandb tab; everything else goes under
             # "training/".
-            metrics_dict = {}
-            for name, value in metrics.items():
-                metric_key = name if name.startswith("online_empowerment/") else f"training/{name}"
-                if hasattr(value, 'item'):
-                    metrics_dict[metric_key] = float(value.item())
-                elif hasattr(value, '__float__'):
-                    metrics_dict[metric_key] = float(value)
-                else:
-                    metrics_dict[metric_key] = value
+            metrics_dict = format_epoch_metrics(metrics)
             
             metrics = {
                 "training/sps": sps,
@@ -992,14 +970,13 @@ class GoExplore:
 
             # Visualize trajectories every 1M steps
             if current_step // 2_000_000 > last_visualization_step // 2_000_000:
-                key, viz_key = jax.random.split(key)
+                key, _ = jax.random.split(key)
                 buffer_state = all_visualizations(
                     replay_buffer=replay_buffer,
                     buffer_state=buffer_state,
                     env=unwrapped_env,
                     state_size=state_size,
                     goal_indices=tuple(train_env.goal_indices),
-                    rng_key=viz_key,
                     current_step=current_step,
                 )
                 # Separate Go Explore phase breakdown plot
@@ -1045,13 +1022,9 @@ class GoExplore:
                 )
 
             # Build full GCP critic params for checkpointing
-            full_critic_params = {}
-            for i, cs in enumerate(training_state.critic_states):
-                for lname, lparams in cs.params.items():
-                    if lname in ["sa_encoder", "g_encoder"]:
-                        full_critic_params[f"{lname}_{i}"] = lparams
-                    else:
-                        full_critic_params[f"critic_{i}_{lname}"] = lparams
+            full_critic_params = reconstruct_full_critic_params(
+                {i: cs.params for i, cs in enumerate(training_state.critic_states)}
+            )
             
             params = (
                 training_state.alpha_state.params,

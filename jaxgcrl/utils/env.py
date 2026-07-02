@@ -1,17 +1,13 @@
-import argparse
 import csv
 import logging
 import math
 import os
-from collections import namedtuple
 from datetime import datetime
 from typing import List
 
-import flax.linen as nn
 import jax
 import wandb_osh
 from brax.io import html
-from matplotlib import pyplot as plt
 from wandb_osh.hooks import TriggerWandbSyncHook
 
 import wandb
@@ -264,51 +260,12 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
     return env
 
 
-def get_env_config(args: argparse.Namespace):
-    """
-    Generate and validate environment configuration based on input arguments.
-
-    This function takes an argparse.Namespace object, validates the specified environment name
-    against a list of legal environments, and returns a configuration named tuple constructed
-    from the input arguments.
-
-    Parameters
-    ----------
-    args : dataclass
-        The input arguments containing the environment name and other configuration settings.
-
-    Returns
-    -------
-    Config
-        A named tuple containing the configuration derived from the input arguments.
-
-    Raises
-    ------
-    ValueError
-        If the specified environment name is not in the list of legal environments or does not
-        contain the word 'maze'.
-    """
-    if args.env_name not in legal_envs:
-        raise ValueError(f"Unknown environment: {args.env_name}")
-
-    # TODO: round num_envs to nearest valid value instead of throwing error
-    if ((args.episode_length - 1) * args.num_envs) % args.batch_size != 0:
-        raise ValueError("(episode_length - 1) * num_envs must be divisible by batch_size")
-
-    args_dict = vars(args)
-    Config = namedtuple("Config", [*args_dict.keys()])
-    config = Config(*args_dict.values())
-
-    return config
-
-
 class MetricsRecorder:
     """
     Initialize the MetricsRecorder with the specified number of timesteps
     and the metrics to be collected.
 
     Parameters:
-    total_env_steps (int): The maximum number of timesteps for recording metrics.
     metrics_to_collect (List[str]): List of metric names that are to be collected.
     exp_dir (str): Directory to save renders to.
     exp_name (str): Experiment name for naming rendered trajectory visualizations.
@@ -316,7 +273,6 @@ class MetricsRecorder:
 
     def __init__(
         self,
-        total_env_steps: int,
         metrics_to_collect: List[str],
         exp_dir,
         exp_name,
@@ -330,8 +286,6 @@ class MetricsRecorder:
         self.exp_dir = exp_dir
         self.exp_name = exp_name
         self.mode = mode
-
-        self.max_x, self.min_x = total_env_steps * 1.1, 0
 
         if mode == "offline":
             wandb_osh.set_log_level("ERROR")
@@ -385,40 +339,11 @@ class MetricsRecorder:
         with open(self._csv_path, "a", newline="") as f:
             csv.writer(f).writerow(row)
 
-    def plot_progress(self):
-        num_plots = len(self.y_data)
-        # Calculate number of rows needed for 2 columns
-        num_rows = (num_plots + 1) // 2
-
-        fig, axs = plt.subplots(num_rows, 2, figsize=(15, 5 * num_rows))
-
-        for idx, (key, y_values) in enumerate(self.y_data.items()):
-            row = idx // 2
-            col = idx % 2
-
-            axs[row, col].set_xlim(self.min_x, self.max_x)
-            axs[row, col].set_xlabel("# environment steps")
-            axs[row, col].set_ylabel(key)
-            axs[row, col].errorbar(self.x_data, y_values, yerr=self.y_data_err[key])
-            axs[row, col].set_title(f"{key}: {y_values[-1]:.3f}")
-
-        # Hide any empty subplots
-        for idx in range(num_plots, num_rows * 2):
-            row = idx // 2
-            col = idx % 2
-            axs[row, col].axis("off")
-        plt.tight_layout()
-        plt.show()
-
     def print_progress(self):
-        for idx, (key, y_values) in enumerate(self.y_data.items()):
+        for key, y_values in self.y_data.items():
             logging.info(
                 f"step: {self.x_data[-1]}, {key}: {y_values[-1]:.3f} +/- {self.y_data_err[key][-1]:.3f}"
             )
-
-    def print_times(self):
-        logging.info(f"time to jit: {self.times[1] - self.times[0]}")
-        logging.info(f"time to train: {self.times[-1] - self.times[1]}")
 
     def progress(self, num_steps, metrics, make_policy, params, env, do_render=True):
         # Optional non-scalar wandb media (e.g. the skill controller's histogram /
@@ -500,35 +425,3 @@ def render(make_policy, params, env, exp_dir, exp_name, num_steps):
         with open(os.path.join(exp_dir, f"{exp_name}_{num_steps}.html"), "w") as file:
             file.write(url)
     wandb.log({"render": wandb.Html(url)}, step=int(num_steps))
-
-
-def render_policy(params, save_path, env, actor, eval_env, vis_length):
-    """Renders the policy and saves it as an HTML file."""
-
-    # JIT compile the rollout function
-    @jax.jit
-    def policy_step(env_state, actor_params):
-        means, _ = actor.apply(actor_params, env_state.obs)
-        actions = nn.tanh(means)
-        next_state = env.step(env_state, actions)
-        return next_state, env_state  # Return current state for visualization
-
-    rollout_states = []
-    for i in range(10):
-        env = create_env(eval_env) if type(eval_env) == str else eval_env
-
-        # Initialize environment
-        rng = jax.random.PRNGKey(seed=i + 1)
-        env_state = jax.jit(env.reset)(rng)
-
-        # Collect rollout using jitted function
-        for _ in range(vis_length):
-            env_state, current_state = policy_step(env_state, params)
-            rollout_states.append(current_state.pipeline_state)
-
-    # Render and save
-    html_string = html.render(env.sys, rollout_states)
-    render_path = f"{save_path}/vis.html"
-    with open(render_path, "w") as f:
-        f.write(html_string)
-    wandb.log({"vis": wandb.Html(html_string)})

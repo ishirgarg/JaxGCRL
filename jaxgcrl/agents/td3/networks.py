@@ -9,6 +9,8 @@ from brax.training.networks import ActivationFn, FeedForwardNetwork, Initializer
 from brax.training.types import PRNGKey
 from flax import linen, struct
 
+from jaxgcrl.agents.common_networks import MLP
+
 
 @struct.dataclass
 class TD3Networks:
@@ -32,33 +34,6 @@ def make_inference_fn(td3_networks: TD3Networks):
         return policy
 
     return make_policy
-
-
-class MLP(linen.Module):
-    """MLP module."""
-
-    layer_sizes: Sequence[int]
-    activation: ActivationFn = linen.relu
-    kernel_init: Initializer = jax.nn.initializers.lecun_uniform()
-    activate_final: bool = False
-    bias: bool = True
-    layer_norm: bool = False
-
-    @linen.compact
-    def __call__(self, data: jnp.ndarray):
-        hidden = data
-        for i, hidden_size in enumerate(self.layer_sizes):
-            hidden = linen.Dense(
-                hidden_size,
-                name=f"hidden_{i}",
-                kernel_init=self.kernel_init,
-                use_bias=self.bias,
-            )(hidden)
-            if i != len(self.layer_sizes) - 1 or self.activate_final:
-                if self.layer_norm:
-                    hidden = linen.LayerNorm()(hidden)
-                hidden = self.activation(hidden)
-        return hidden
 
 
 def make_policy_network(

@@ -1,9 +1,8 @@
 import functools
 import logging
-import pickle
 import random
 import time
-from typing import Any, Callable, Literal, NamedTuple, Optional, Tuple, Union
+from typing import Callable, Literal, NamedTuple, Optional, Tuple, Union
 
 import flax.linen as nn
 import jax
@@ -13,10 +12,10 @@ import optax
 from brax import base, envs
 from brax.training import types
 from brax.v1 import envs as envs_v1
-from etils import epath
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
 
+from jaxgcrl.agents.go_explore.utils import save_params
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
@@ -28,8 +27,6 @@ from .losses import (
 from .networks import Actor, Encoder
 
 Metrics = types.Metrics
-Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
-State = Union[envs.State, envs_v1.State]
 
 
 @dataclass
@@ -117,18 +114,6 @@ def flatten_batch(buffer_config, transition, sample_key):
         discount=jnp.squeeze(transition.discount[:-1]),
         extras=extras,
     )
-
-
-def load_params(path: str):
-    with epath.Path(path).open("rb") as fin:
-        buf = fin.read()
-    return pickle.loads(buf)
-
-
-def save_params(path: str, params: Any):
-    """Saves parameters in flax format."""
-    with epath.Path(path).open("wb") as fout:
-        fout.write(pickle.dumps(params))
 
 
 @dataclass
@@ -355,7 +340,6 @@ class CRL:
                 obs_size=obs_size,
                 action_size=action_size,
                 state_size=state_size,
-                agent_type="crl",
                 include_phase=False,
             )
 

@@ -18,16 +18,17 @@ import os
 import xml.etree.ElementTree as ET
 
 import jax
-import mujoco
 from brax import base, math
 from brax.envs.base import PipelineEnv, State
 from brax.io import mjcf
 from jax import numpy as jnp
 
+from jaxgcrl.envs._locomotion_common import apply_mjx_solver_flags, ant_initial_metrics
+
 RESET = R = "r"
 GOAL = G = "g"
 BALL = B = "b"
-RESET_GOAL = M = "m"  # cell that is both an agent reset AND a goal candidate
+M = "m"  # cell that is both an agent reset AND a goal candidate
 
 MAZE_HEIGHT = 0.5
 
@@ -470,14 +471,7 @@ class AntBallOGBench(PipelineEnv):
             n_frames = 20
 
         if backend == "mjx":
-            sys = sys.tree_replace(
-                {
-                    "opt.solver": mujoco.mjtSolver.mjSOL_NEWTON,
-                    "opt.disableflags": mujoco.mjtDisableBit.mjDSBL_EULERDAMP,
-                    "opt.iterations": 1,
-                    "opt.ls_iterations": 4,
-                }
-            )
+            sys = apply_mjx_solver_flags(sys)
 
         if backend == "positional":
             sys = sys.replace(
@@ -615,21 +609,7 @@ class AntBallOGBench(PipelineEnv):
         obs = self._get_obs(pipeline_state)
 
         reward, done, zero = jnp.zeros(3)
-        metrics = {
-            "reward_forward": zero,
-            "reward_survive": zero,
-            "reward_ctrl": zero,
-            "reward_contact": zero,
-            "x_position": zero,
-            "y_position": zero,
-            "distance_from_origin": zero,
-            "x_velocity": zero,
-            "y_velocity": zero,
-            "forward_reward": zero,
-            "dist": zero,
-            "success": zero,
-            "success_easy": zero,
-        }
+        metrics = ant_initial_metrics(zero)
         return State(pipeline_state, obs, reward, done, metrics)
 
     def step(self, state: State, action: jax.Array) -> State:

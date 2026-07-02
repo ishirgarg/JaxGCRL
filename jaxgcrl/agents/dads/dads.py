@@ -46,6 +46,7 @@ from brax.training.types import Params, PRNGKey
 from brax.v1 import envs as envs_v1
 from flax.struct import dataclass
 
+from jaxgcrl.agents.common_agent_utils import _unpmap
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
@@ -54,12 +55,9 @@ from . import eval as dads_eval
 from . import losses as dads_losses
 
 Metrics = types.Metrics
-Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
-State = Union[envs.State, envs_v1.State]
 
 _PMAP_AXIS_NAME = "i"
 
-InferenceParams = Tuple[running_statistics.NestedMeanStd, Params]
 ReplayBufferState = Any
 
 
@@ -169,10 +167,6 @@ class TrainingState:
     # normalization and the post-training empowerment map is well-defined.
     dyn_input_normalizer_params: running_statistics.RunningStatisticsState
     dyn_delta_normalizer_params: running_statistics.RunningStatisticsState
-
-
-def _unpmap(v):
-    return jax.tree_util.tree_map(lambda x: x[0], v)
 
 
 def _init_training_state(

@@ -1,8 +1,17 @@
 import jax
 from brax.envs import PipelineEnv, State, Wrapper, Env
 from jax import numpy as jnp
-from jax import tree_util
-from typing import Callable, Any, Optional
+from typing import Optional
+
+
+def _where_done(done, x, y):
+    """Per-leaf select ``x`` where ``done`` else ``y``, broadcasting ``done`` over ``x``'s shape."""
+    if done.shape and done.shape[0] != x.shape[0]:
+        return y
+    if done.shape:
+        done = jnp.reshape(done, [x.shape[0]] + [1] * (len(x.shape) - 1))
+    return jnp.where(done, x, y)
+
 
 class TrajectoryIdWrapper(Wrapper):
     def __init__(self, env: PipelineEnv):
@@ -45,12 +54,7 @@ class EvalAutoResetWrapper(Wrapper):
         state = self.env.step(state, action)
 
         def where_done(x, y):
-            done = state.done
-            if done.shape and done.shape[0] != x.shape[0]:
-                return y
-            if done.shape:
-                done = jnp.reshape(done, [x.shape[0]] + [1] * (len(x.shape) - 1))  # type: ignore
-            return jnp.where(done, x, y)
+            return _where_done(state.done, x, y)
 
         pipeline_state = jax.tree.map(
             where_done, state.info['first_pipeline_state'], state.pipeline_state
@@ -212,12 +216,7 @@ class TrainAutoResetWrapper(Wrapper):
         )
 
         def where_done(x, y):
-            done = state.done
-            if done.shape and done.shape[0] != x.shape[0]:
-                return y
-            if done.shape:
-                done = jnp.reshape(done, [x.shape[0]] + [1] * (len(x.shape) - 1))  # type: ignore
-            return jnp.where(done, x, y)
+            return _where_done(state.done, x, y)
 
         pipeline_state = jax.tree.map(
             where_done, state.info['first_pipeline_state'], state.pipeline_state
@@ -247,13 +246,12 @@ class GoExploreWrapper(Wrapper):
     """
 
     def __init__(self, env: Env, num_gcp_steps: int, num_ep_steps: int,
-                 state_size: int, goal_size: int, goal_indices=None,
+                 state_size: int, goal_indices=None,
                  reset_on_explore_goal_reached: bool = True):
         super().__init__(env)
         self.num_gcp_steps = num_gcp_steps
         self.num_ep_steps = num_ep_steps
         self.state_size = state_size
-        self.goal_size = goal_size
         # Indices into the state portion of obs that select the (x, y) position
         # used as the ant's start position (passed to env.reset(start=...)).
         self.goal_indices = goal_indices
@@ -398,9 +396,9 @@ class GoExploreWrapper(Wrapper):
         # so pipeline_init regenerates correct q/qd with the new goal embedded.
         # This matches how TrainAutoResetWrapper resets via the env API.
         first_start = state.info['first_start']   # (num_envs, 2) — ant xy at episode start
-        num_envs_local = state.obs.shape[0]
+        num_envs = state.obs.shape[0]
         # Split rng for per-env resets (rng may be a single key from actor_step)
-        reset_rng = jax.random.split(rng, num_envs_local)  # (num_envs, 2)
+        reset_rng = jax.random.split(rng, num_envs)  # (num_envs, 2)
         # Reset ALL envs unconditionally (JAX traces the branch regardless);
         # _where_masked selects results only for envs where should_reset is True.
         reset_state = self.env.reset(reset_rng, goal=new_go_goal, start=first_start)

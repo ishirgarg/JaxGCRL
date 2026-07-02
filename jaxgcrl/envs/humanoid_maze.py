@@ -2,11 +2,13 @@ import os
 import xml.etree.ElementTree as ET
 
 import jax
-import mujoco
 from brax import actuator, base, math
 from brax.envs.base import PipelineEnv, State
 from brax.io import mjcf
 from jax import numpy as jnp
+
+from jaxgcrl.envs._locomotion_common import apply_mjx_solver_flags
+from jaxgcrl.envs._maze_layouts import BIG_MAZE, BIG_MAZE_EVAL, HARDEST_MAZE, U_MAZE, U_MAZE_EVAL
 
 # This is based on original Humanoid environment from Brax
 # https://github.com/google/brax/blob/main/brax/envs/humanoid.py
@@ -17,56 +19,6 @@ TARGET_Z_COORD = 1.25
 # Maze creation adapted from: https://github.com/Farama-Foundation/D4RL/blob/master/d4rl/locomotion/maze_env.py
 RESET = R = "r"
 GOAL = G = "g"
-
-U_MAZE = [
-    [1, 1, 1, 1, 1],
-    [1, R, G, G, 1],
-    [1, 1, 1, G, 1],
-    [1, G, G, G, 1],
-    [1, 1, 1, 1, 1],
-]
-
-U_MAZE_EVAL = [
-    [1, 1, 1, 1, 1],
-    [1, R, 0, 0, 1],
-    [1, 1, 1, 0, 1],
-    [1, G, G, G, 1],
-    [1, 1, 1, 1, 1],
-]
-
-BIG_MAZE = [
-    [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, G, 1, 1, G, G, 1],
-    [1, G, G, 1, G, G, G, 1],
-    [1, 1, G, G, G, 1, 1, 1],
-    [1, G, G, 1, G, G, G, 1],
-    [1, G, 1, G, G, 1, G, 1],
-    [1, G, G, G, 1, G, G, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1],
-]
-
-BIG_MAZE_EVAL = [
-    [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, 0, 1, 1, G, G, 1],
-    [1, 0, 0, 1, 0, G, G, 1],
-    [1, 1, 0, 0, 0, 1, 1, 1],
-    [1, 0, 0, 1, 0, 0, 0, 1],
-    [1, 0, 1, G, 0, 1, G, 1],
-    [1, 0, G, G, 1, G, G, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1],
-]
-
-HARDEST_MAZE = [
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [1, R, G, G, G, 1, G, G, G, G, G, 1],
-    [1, G, 1, 1, G, 1, G, 1, G, 1, G, 1],
-    [1, G, G, G, G, G, G, 1, G, G, G, 1],
-    [1, G, 1, 1, 1, 1, G, 1, 1, 1, G, 1],
-    [1, G, G, 1, G, 1, G, G, G, G, G, 1],
-    [1, 1, G, 1, G, 1, G, 1, G, 1, 1, 1],
-    [1, G, G, 1, G, G, G, 1, G, G, G, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-]
 
 # OGBench humanoidmaze-giant layout (12 rows x 16 cols), aligned with
 # ogbench/locomaze/maze.py's giant maze_map. R cells mark the five task
@@ -324,14 +276,7 @@ class HumanoidMaze(PipelineEnv):
                 sys = sys.replace(actuator=sys.actuator.replace(gear=gear))
 
         if backend == "mjx":
-            sys = sys.tree_replace(
-                {
-                    "opt.solver": mujoco.mjtSolver.mjSOL_NEWTON,
-                    "opt.disableflags": mujoco.mjtDisableBit.mjDSBL_EULERDAMP,
-                    "opt.iterations": 1,
-                    "opt.ls_iterations": 4,
-                }
-            )
+            sys = apply_mjx_solver_flags(sys)
 
         kwargs["n_frames"] = kwargs.get("n_frames", n_frames)
 

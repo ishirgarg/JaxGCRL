@@ -11,7 +11,7 @@ Phase management is handled by ``GoExploreWrapper`` (see ``jaxgcrl/envs/wrappers
 import logging
 import random
 import time
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import Callable, Literal, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -32,7 +32,6 @@ from jaxgcrl.envs.wrappers import (
 )
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
-from jaxgcrl.agents.go_explore.visualization import handle_goal_proposer_visualization
 
 from jaxgcrl.agents.go_explore.types import TrainingState, Transition, GoalProposerState
 from jaxgcrl.agents.go_explore.algorithms import get_algorithm
@@ -41,6 +40,7 @@ from jaxgcrl.agents.go_explore.utils import (
     create_single_dummy_transition,
     create_dummy_transition_for_buffer,
     create_dummy_transition_for_goal_proposer,
+    format_epoch_metrics,
 )
 from jaxgcrl.agents.go_explore.losses import (
     flatten_crl_critic_params,
@@ -52,6 +52,7 @@ from jaxgcrl.agents.go_explore.visualization import (
     all_visualizations,
     visualize_go_explore_phases,
     log_online_empowerment_heatmap,
+    handle_goal_proposer_visualization,
 )
 from jaxgcrl.agents.go_explore.goal_proposers import (
     create_goal_proposer,
@@ -72,8 +73,6 @@ from jaxgcrl.agents.go_explore.online_empowerment import (
 
 
 Metrics = types.Metrics
-Env = Union[envs.Env, envs_v1.Env, envs_v1.Wrapper]
-State = Union[envs.State, envs_v1.State]
 
 
 @dataclass
@@ -297,7 +296,6 @@ class GoExploreSimple:
             num_gcp_steps=self.num_gcp_steps,
             num_ep_steps=self.num_ep_steps,
             state_size=state_size,
-            goal_size=goal_size,
             goal_indices=unwrapped_env.goal_indices,
             reset_on_explore_goal_reached=self.reset_on_explore_goal_reached,
         )
@@ -435,7 +433,7 @@ class GoExploreSimple:
                     "or set online_empowerment=True."
                 )
             key, empowerment_template_key = jax.random.split(key)
-            emp_agent, _ex_obs_dim, base_obs_template = load_offline_empowerment_agent(
+            emp_agent, ex_obs_dim, base_obs_template = load_offline_empowerment_agent(
                 run_dir=self.empowerment_run_dir,
                 jax_env=unwrapped_env,
                 template_rng=empowerment_template_key,
@@ -445,10 +443,10 @@ class GoExploreSimple:
                 ogbench_root=self.ogbench_root,
             )
             if self.use_full_empowerment:
-                if state_size != int(_ex_obs_dim):
+                if state_size != int(ex_obs_dim):
                     raise ValueError(
                         "use_full_empowerment=True requires state_size == ex_obs_dim; "
-                        f"got state_size={state_size}, ex_obs_dim={_ex_obs_dim}."
+                        f"got state_size={state_size}, ex_obs_dim={ex_obs_dim}."
                     )
                 obs_builder = make_empowerment_full_obs_builder()
             else:
@@ -505,7 +503,6 @@ class GoExploreSimple:
         dummy_transition = create_single_dummy_transition(
             obs_size=obs_size,
             action_size=action_size,
-            agent_type=self.agent_type,
             include_phase=True,
         )
 
@@ -530,7 +527,6 @@ class GoExploreSimple:
             num_envs=config.num_envs,
             obs_size=obs_size,
             action_size=action_size,
-            agent_type=self.agent_type,
             include_phase=True,
         )
         buffer_state = replay_buffer.insert(buffer_state, dummy_batch_transition)
@@ -540,7 +536,6 @@ class GoExploreSimple:
             episode_length=config.episode_length,
             obs_size=obs_size,
             action_size=action_size,
-            agent_type=self.agent_type,
             include_phase=True,
         )
         goal_proposer_state = GoalProposerState(
@@ -561,7 +556,6 @@ class GoExploreSimple:
                 obs_size=obs_size,
                 action_size=action_size,
                 state_size=state_size,
-                agent_type=self.agent_type,
                 include_phase=True,
             )
 
@@ -625,11 +619,11 @@ class GoExploreSimple:
         # ── get_experience ────────────────────────────────────────────────────
         def get_experience(training_state, env_state, buffer_state, key,
                            experience_count, goal_proposer_state):
-            num_envs_     = config.num_envs
+            num_envs     = config.num_envs
             episode_length = config.episode_length
             info           = dict(env_state.info)
 
-            reset_threshold    = jnp.array(episode_length // (self.unroll_length * 2), dtype=jnp.int32)
+            goal_reproposal_interval    = jnp.array(episode_length // (self.unroll_length * 2), dtype=jnp.int32)
             new_experience_count = experience_count + 1
 
             def propose_new_goals(env_state, key, info, buffer_state, goal_proposer_state):
@@ -645,12 +639,12 @@ class GoExploreSimple:
                 )
 
                 viz_key, goal_key = jax.random.split(key)
-                viz_env_idx = jax.random.randint(viz_key, (), 0, num_envs_)
-                goal_keys   = jax.random.split(goal_key, num_envs_)
+                viz_env_idx = jax.random.randint(viz_key, (), 0, num_envs)
+                goal_keys   = jax.random.split(goal_key, num_envs)
                 first_obs   = info['first_obs']
 
                 def propose_single(rng_key, obs, state):
-                    goal, updated_state, log_data = goal_proposer(rng_key, obs, state)
+                    goal, _, log_data = goal_proposer(rng_key, obs, state)
                     return goal, log_data
 
                 new_goals, log_data_tree = jax.vmap(
@@ -683,7 +677,7 @@ class GoExploreSimple:
                 env_state, info, updated_experience_count,
                 buffer_state, updated_goal_proposer_state,
             ) = jax.lax.cond(
-                new_experience_count >= reset_threshold,
+                new_experience_count >= goal_reproposal_interval,
                 propose_new_goals,
                 keep_existing_goals,
                 env_state, propose_key, info, buffer_state, goal_proposer_state,
@@ -966,15 +960,7 @@ class GoExploreSimple:
             # Online empowerment metrics keep their own top-level
             # "online_empowerment/" prefix (dedicated wandb tab); the rest go
             # under "training/".
-            metrics_dict = {}
-            for name, value in metrics.items():
-                metric_key = name if name.startswith("online_empowerment/") else f"training/{name}"
-                if hasattr(value, 'item'):
-                    metrics_dict[metric_key] = float(value.item())
-                elif hasattr(value, '__float__'):
-                    metrics_dict[metric_key] = float(value)
-                else:
-                    metrics_dict[metric_key] = value
+            metrics_dict = format_epoch_metrics(metrics)
 
             metrics = {
                 "training/sps": sps,
@@ -989,14 +975,13 @@ class GoExploreSimple:
 
             # Visualize trajectories every 1M steps
             if current_step // 2_000_000 > last_visualization_step // 2_000_000:
-                key, viz_key = jax.random.split(key)
+                key, _ = jax.random.split(key)
                 buffer_state = all_visualizations(
                     replay_buffer=replay_buffer,
                     buffer_state=buffer_state,
                     env=unwrapped_env,
                     state_size=state_size,
                     goal_indices=tuple(train_env.goal_indices),
-                    rng_key=viz_key,
                     current_step=current_step,
                 )
                 _, phase_transitions = replay_buffer.sample(buffer_state)

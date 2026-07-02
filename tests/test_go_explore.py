@@ -54,7 +54,7 @@ def _make_go_explore_env(num_gcp_steps=2, num_ep_steps=2, episode_length=100,
     env = VmapWrapper(env)
     env = EpisodeWrapper(env, episode_length=episode_length, action_repeat=1)
     env = GoExploreWrapper(env, num_gcp_steps=num_gcp_steps, num_ep_steps=num_ep_steps,
-                           state_size=STATE_DIM, goal_size=GOAL_SIZE,
+                           state_size=STATE_DIM,
                            goal_indices=jnp.array([0, 1]))
     return env
 

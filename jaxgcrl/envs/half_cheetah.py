@@ -120,7 +120,7 @@ class Halfcheetah(PipelineEnv):
 
     def _random_target(self, rng: jax.Array) -> Tuple[jax.Array, jax.Array]:
         """Returns a target location in a random circle slightly above xy plane."""
-        rng, rng1 = jax.random.split(rng, 2)
+        rng, _ = jax.random.split(rng, 2)
         dist = 5
         target_x = dist
         return rng, jnp.array([target_x])

@@ -2,11 +2,12 @@ import os
 from typing import Tuple
 
 import jax
-import mujoco
 from brax import base, math
 from brax.envs.base import PipelineEnv, State
 from brax.io import mjcf
 from jax import numpy as jnp
+
+from jaxgcrl.envs._locomotion_common import ant_initial_metrics, apply_mjx_solver_flags
 
 # This is based on original Ant environment from Brax
 # https://github.com/google/brax/blob/main/brax/envs/ant.py
@@ -35,14 +36,7 @@ class AntPush(PipelineEnv):
         n_frames = 5
 
         if backend == "mjx":
-            sys = sys.tree_replace(
-                {
-                    "opt.solver": mujoco.mjtSolver.mjSOL_NEWTON,
-                    "opt.disableflags": mujoco.mjtDisableBit.mjDSBL_EULERDAMP,
-                    "opt.iterations": 4,
-                    "opt.ls_iterations": 8,
-                }
-            )
+            sys = apply_mjx_solver_flags(sys, iterations=4, ls_iterations=8)
 
         kwargs["n_frames"] = kwargs.get("n_frames", n_frames)
 
@@ -69,7 +63,7 @@ class AntPush(PipelineEnv):
     def reset(self, rng: jax.Array) -> State:
         """Resets the environment to an initial state."""
 
-        rng, rng1, rng2, rng3 = jax.random.split(rng, 4)
+        rng, rng1, rng2, _ = jax.random.split(rng, 4)
 
         low, hi = -self._reset_noise_scale, self._reset_noise_scale
         q = self.sys.init_q + jax.random.uniform(rng1, (self.sys.q_size(),), minval=low, maxval=hi)
@@ -86,21 +80,7 @@ class AntPush(PipelineEnv):
         obs = self._get_obs(pipeline_state)
 
         reward, done, zero = jnp.zeros(3)
-        metrics = {
-            "reward_forward": zero,
-            "reward_survive": zero,
-            "reward_ctrl": zero,
-            "reward_contact": zero,
-            "x_position": zero,
-            "y_position": zero,
-            "distance_from_origin": zero,
-            "x_velocity": zero,
-            "y_velocity": zero,
-            "forward_reward": zero,
-            "dist": zero,
-            "success": zero,
-            "success_easy": zero,
-        }
+        metrics = ant_initial_metrics(zero)
         state = State(pipeline_state, obs, reward, done, metrics)
         return state
 

@@ -38,13 +38,13 @@ only in that the support is the current mini-pool rather than the whole buffer
 
 from __future__ import annotations
 
-import os
-import sys
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Any, Callable, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from .empowerment import _chunked_normalized_score, _ensure_ogbench_on_path
 
 
 # ── OGBench agent import ────────────────────────────────────────────────────
@@ -57,10 +57,7 @@ def _load_empowerment_agent_class(ogbench_root: str):
     ``impls/``). Mirrors :func:`empowerment._setup_external_imports` so the
     online path uses the exact same agent code as the offline path.
     """
-    impls_root = os.path.join(ogbench_root, "impls")
-    for p in (impls_root, ogbench_root):
-        if p not in sys.path:
-            sys.path.insert(0, p)
+    _ensure_ogbench_on_path(ogbench_root)
     from agents import agents as agent_registry
 
     return agent_registry["empowerment_skill"]
@@ -275,21 +272,9 @@ def make_online_empowerment_scorer(
     cs = int(chunk_size)
 
     def score(agent, states: jnp.ndarray, rng: jnp.ndarray) -> jnp.ndarray:
-        n = states.shape[0]
-        pad = (cs - (n % cs)) % cs
-        states_pad = jnp.pad(states, ((0, pad), (0, 0)))
-        total = states_pad.shape[0]
-        n_chunks = total // cs
-        acc0 = jnp.zeros((total,), dtype=jnp.float32)
-
-        def body(i, acc):
-            chunk = jax.lax.dynamic_slice_in_dim(states_pad, i * cs, cs, axis=0)
-            ki = jax.random.fold_in(rng, i)
-            s = agent.empowerment(chunk, rng=ki).astype(jnp.float32)
-            s = jnp.reshape(s, (cs,))
-            return jax.lax.dynamic_update_slice(acc, s, (i * cs,))
-
-        acc = jax.lax.fori_loop(0, n_chunks, body, acc0)
-        return (acc[:n] - mean_f) / scale_f
+        return _chunked_normalized_score(
+            lambda chunk, ki: agent.empowerment(chunk, rng=ki),
+            states, rng, cs, mean_f, scale_f,
+        )
 
     return score

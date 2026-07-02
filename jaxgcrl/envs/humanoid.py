@@ -1,11 +1,12 @@
 import os
 
 import jax
-import mujoco
 from brax import actuator, base
 from brax.envs.base import PipelineEnv, State
 from brax.io import mjcf
 from jax import numpy as jnp
+
+from jaxgcrl.envs._locomotion_common import apply_mjx_solver_flags
 
 # This is based on original Humanoid environment from Brax
 # https://github.com/google/brax/blob/main/brax/envs/humanoid.py
@@ -63,14 +64,7 @@ class Humanoid(PipelineEnv):
             sys = sys.replace(actuator=sys.actuator.replace(gear=gear))
 
         if backend == "mjx":
-            sys = sys.tree_replace(
-                {
-                    "opt.solver": mujoco.mjtSolver.mjSOL_NEWTON,
-                    "opt.disableflags": mujoco.mjtDisableBit.mjDSBL_EULERDAMP,
-                    "opt.iterations": 1,
-                    "opt.ls_iterations": 4,
-                }
-            )
+            sys = apply_mjx_solver_flags(sys)
 
         kwargs["n_frames"] = kwargs.get("n_frames", n_frames)
 

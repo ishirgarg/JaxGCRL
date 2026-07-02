@@ -49,7 +49,7 @@ from __future__ import annotations
 import functools
 import logging
 import time
-from typing import Any, Callable, Dict
+from typing import Callable, Dict
 
 import jax
 import jax.numpy as jnp
@@ -85,7 +85,7 @@ from jaxgcrl.agents.go_explore_simple.sac_discrete import (
     insert_controller_replay,
     sample_controller_replay,
 )
-from jaxgcrl.agents.crl.losses import contrastive_loss_fn, energy_fn
+from jaxgcrl.agents.go_explore.losses import contrastive_loss_fn, energy_fn
 
 
 # ── CRL controller training state ───────────────────────────────────────────────
@@ -245,10 +245,10 @@ def crl_controller_update(
         logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
         loss += logsumexp_penalty_coeff * jnp.mean(logsumexp**2)
 
-        I = jnp.eye(logits.shape[0])
-        correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
-        logits_pos = jnp.sum(logits * I) / jnp.sum(I)
-        logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
+        eye = jnp.eye(logits.shape[0])
+        correct = jnp.argmax(logits, axis=1) == jnp.argmax(eye, axis=1)
+        logits_pos = jnp.sum(logits * eye) / jnp.sum(eye)
+        logits_neg = jnp.sum(logits * (1 - eye)) / jnp.sum(1 - eye)
         return loss, (logsumexp, correct, logits_pos, logits_neg)
 
     (critic_loss_val, (logsumexp, correct, logits_pos, logits_neg)), critic_grad = (

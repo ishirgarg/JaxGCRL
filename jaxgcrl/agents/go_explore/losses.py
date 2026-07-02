@@ -1,9 +1,8 @@
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-from flax.training.train_state import TrainState
 
 from .types import TrainingState, Transition
 
@@ -73,32 +72,43 @@ def contrastive_loss_fn(name, logits):
     return critic_loss
 
 
-def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
+def _squashed_gaussian_action_and_log_prob(means, log_stds, key, keepdims: bool = True):
+    """Reparameterized tanh-squashed Gaussian sample with the tanh log-prob correction.
+
+    Returns ``(action, log_prob)`` with ``log_prob`` summed over the action dimension
+    (``keepdims`` retains that axis when True). The key is split internally so the
+    RNG stream matches the original inline blocks.
+    """
+    stds = jnp.exp(log_stds)
+    key, noise_key = jax.random.split(key)
+    x_ts = means + stds * jax.random.normal(noise_key, shape=means.shape, dtype=means.dtype)
+    action = nn.tanh(x_ts)
+    log_prob = jax.scipy.stats.norm.logpdf(x_ts, loc=means, scale=stds)
+    log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
+    log_prob = log_prob.sum(-1, keepdims=keepdims)
+    return action, log_prob
+
+
+def update_actor_and_alpha(context: Dict[str, Any], networks: Dict[str, Any],
                            transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
     """CRL actor and alpha update."""
     def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
         obs = transitions.observation  # expected_shape = self.batch_size, obs_size + goal_size
-        state = obs[:, : config["state_size"]]
+        state = obs[:, : context["state_size"]]
         future_state = transitions.extras["future_state"]
-        goal = future_state[:, config["goal_indices"]]
+        goal = future_state[:, context["goal_indices"]]
         observation = jnp.concatenate([state, goal], axis=1)
 
         # Use actor API
         means, log_stds = networks["actor"].apply(actor_params, observation)
-        stds = jnp.exp(log_stds)
-        # Split key before stochastic operation
-        key, noise_key = jax.random.split(key)
-        x_ts = means + stds * jax.random.normal(noise_key, shape=means.shape, dtype=means.dtype)
-        action = nn.tanh(x_ts)
-        log_prob = jax.scipy.stats.norm.logpdf(x_ts, loc=means, scale=stds)
-        log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
-        log_prob = log_prob.sum(-1)  # dimension = B
+        action, log_prob = _squashed_gaussian_action_and_log_prob(
+            means, log_stds, key, keepdims=False
+        )
 
         # Use critic API to compute Q-value - construct obs from state and goal
         critic = networks["critic"]
-        obs_with_goal = jnp.concatenate([state, goal], axis=1)
         # critic_params is already the full reconstructed params structure
-        q_values = critic.apply(critic_params, obs_with_goal, action)  # Shape: (batch_size, n_critics)
+        q_values = critic.apply(critic_params, observation, action)  # Shape: (batch_size, n_critics)
         # Use first critic's output for CRL
         qf_pi = q_values[:, 0]  # Shape: (batch_size,)
 
@@ -108,8 +118,8 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
 
     def alpha_loss(alpha_params, log_prob):
         alpha = jnp.exp(alpha_params["log_alpha"])
-        alpha_loss = alpha * jnp.mean(jax.lax.stop_gradient(-log_prob - config["target_entropy"]))
-        return jnp.mean(alpha_loss)
+        loss = alpha * jnp.mean(jax.lax.stop_gradient(-log_prob - context["target_entropy"]))
+        return jnp.mean(loss)
 
     full_critic_params = flatten_crl_critic_params(training_state.critic_states)
 
@@ -137,25 +147,24 @@ def update_actor_and_alpha(config: Dict[str, Any], networks: Dict[str, Any],
     return training_state, metrics
 
 
-def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
+def update_critic(context: Dict[str, Any], networks: Dict[str, Any],
                   transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
     """CRL critic update with support for multiple critics.
     
     All critics are updated through a single backprop pass, but each maintains
     its own TrainState and optimizer state (decoupled).
     """
-    state = transitions.observation[:, : config["state_size"]]
+    state = transitions.observation[:, : context["state_size"]]
     action = transitions.action
-    goal = transitions.observation[:, config["state_size"] :]
+    goal = transitions.observation[:, context["state_size"] :]
 
     critic = networks["critic"]
-    n_critics = critic.n_critics
-    
+
     # Collect all critic parameters into a tuple for single backprop
     all_critic_params = tuple(critic_i_state.params for critic_i_state in training_state.critic_states)
     
     # Loss function that computes loss for all critics in one pass
-    def all_critics_loss(critic_params_tuple, transitions, key):
+    def all_critics_loss(critic_params_tuple):
         """Compute loss for all critics simultaneously."""
         sa_input = jnp.concatenate([state, action], axis=-1)
         
@@ -172,17 +181,17 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
             g_repr = critic.g_encoders[i].apply(critic_i_params["g_encoder"], goal)
 
             # InfoNCE
-            logits = energy_fn(config["energy_fn"], sa_repr[:, None, :], g_repr[None, :, :])
-            loss = contrastive_loss_fn(config["contrastive_loss_fn"], logits)
+            logits = energy_fn(context["energy_fn"], sa_repr[:, None, :], g_repr[None, :, :])
+            loss = contrastive_loss_fn(context["contrastive_loss_fn"], logits)
 
             # logsumexp regularisation
             logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
-            loss += config["logsumexp_penalty_coeff"] * jnp.mean(logsumexp**2)
+            loss += context["logsumexp_penalty_coeff"] * jnp.mean(logsumexp**2)
 
-            I = jnp.eye(logits.shape[0])
-            correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
-            logits_pos = jnp.sum(logits * I) / jnp.sum(I)
-            logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
+            eye = jnp.eye(logits.shape[0])
+            correct = jnp.argmax(logits, axis=1) == jnp.argmax(eye, axis=1)
+            logits_pos = jnp.sum(logits * eye) / jnp.sum(eye)
+            logits_neg = jnp.sum(logits * (1 - eye)) / jnp.sum(1 - eye)
             
             losses.append(loss)
             logsumexps.append(logsumexp)
@@ -198,16 +207,16 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
     # Compute gradients for all critics in one backprop pass
     (total_loss, (logsumexps, corrects, logits_pos_list, logits_neg_list, critic_losses)), all_grads = jax.value_and_grad(
         all_critics_loss, has_aux=True
-    )(all_critic_params, transitions, key)
+    )(all_critic_params)
     
     # Apply gradients to each critic's TrainState separately (preserves optimizer state)
-    new_critic_states = []
-    for i, (critic_i_state, grad) in enumerate(zip(training_state.critic_states, all_grads)):
-        new_critic_i_state = critic_i_state.apply_gradients(grads=grad)
-        new_critic_states.append(new_critic_i_state)
-    
+    new_critic_states = tuple(
+        critic_i_state.apply_gradients(grads=grad)
+        for critic_i_state, grad in zip(training_state.critic_states, all_grads)
+    )
+
     # Update training state with all updated critic states
-    training_state = training_state.replace(critic_states=tuple(new_critic_states))
+    training_state = training_state.replace(critic_states=new_critic_states)
 
     # Average metrics for logging
     metrics = {
@@ -221,7 +230,7 @@ def update_critic(config: Dict[str, Any], networks: Dict[str, Any],
     return training_state, metrics
 
 
-def update_alpha_sac(config: Dict[str, Any], networks: Dict[str, Any],
+def update_alpha_sac(context: Dict[str, Any], networks: Dict[str, Any],
                      transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
     """SAC alpha update (matching original SAC - updates alpha first, before critic/actor).
     
@@ -233,27 +242,20 @@ def update_alpha_sac(config: Dict[str, Any], networks: Dict[str, Any],
         obs = transitions.observation
         # Use actor API
         means, log_stds = networks["actor"].apply(actor_params, obs)
-        stds = jnp.exp(log_stds)
-        # Split key before stochastic operation
-        key, noise_key = jax.random.split(key)
-        x_ts = means + stds * jax.random.normal(noise_key, shape=means.shape, dtype=means.dtype)
-        actions = nn.tanh(x_ts)
-        log_prob = jax.scipy.stats.norm.logpdf(x_ts, loc=means, scale=stds)
-        log_prob -= jnp.log((1 - jnp.square(actions)) + 1e-6)
-        log_prob = log_prob.sum(-1, keepdims=True)
+        _, log_prob = _squashed_gaussian_action_and_log_prob(means, log_stds, key)
         
         # Alpha loss: -alpha * (log_prob + target_entropy)
         # Original SAC: alpha_loss = -alpha * mean(log_prob + target_entropy)
         # CRITICAL: stop_gradient prevents alpha update from affecting actor params
         alpha = jnp.exp(alpha_params["log_alpha"])
-        per_sample = jax.lax.stop_gradient(log_prob + config["target_entropy"])  # (batch, 1)
-        sample_weights = config.get("sample_weights", None)
+        per_sample = jax.lax.stop_gradient(log_prob + context["target_entropy"])  # (batch, 1)
+        sample_weights = context.get("sample_weights", None)
         if sample_weights is None:
-            alpha_loss = -alpha * jnp.mean(per_sample)
+            loss = -alpha * jnp.mean(per_sample)
         else:
             w = sample_weights[:, None]
-            alpha_loss = -alpha * jnp.sum(w * per_sample) / (jnp.sum(w) + 1e-8)
-        return alpha_loss
+            loss = -alpha * jnp.sum(w * per_sample) / (jnp.sum(w) + 1e-8)
+        return loss
     
     alpha_loss_val, alpha_grad = jax.value_and_grad(alpha_loss)(
         training_state.alpha_state.params,
@@ -272,37 +274,30 @@ def update_alpha_sac(config: Dict[str, Any], networks: Dict[str, Any],
     return training_state, metrics
 
 
-def update_actor_sac(config: Dict[str, Any], networks: Dict[str, Any],
+def update_actor_sac(context: Dict[str, Any], networks: Dict[str, Any],
                      transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
     """SAC actor update."""
     def actor_loss(actor_params, q_params, alpha, transitions, key):
         obs = transitions.observation
         # Use actor API
         means, log_stds = networks["actor"].apply(actor_params, obs)
-        stds = jnp.exp(log_stds)
-        # Split key before stochastic operation
-        key, noise_key = jax.random.split(key)
-        x_ts = means + stds * jax.random.normal(noise_key, shape=means.shape, dtype=means.dtype)
-        actions = nn.tanh(x_ts)
-        log_prob = jax.scipy.stats.norm.logpdf(x_ts, loc=means, scale=stds)
-        log_prob -= jnp.log((1 - jnp.square(actions)) + 1e-6)
-        log_prob = log_prob.sum(-1, keepdims=True)
+        actions, log_prob = _squashed_gaussian_action_and_log_prob(means, log_stds, key)
 
         # Use critic API to get Q-values
         critic = networks["critic"]
         q_values = critic.apply(q_params, obs, actions)
-        if config.get("use_sac_critic_mean", False):
+        if context.get("use_sac_critic_mean", False):
             q_value = jnp.mean(q_values, axis=-1, keepdims=True)
         else:
             q_value = jnp.min(q_values, axis=-1, keepdims=True)  # Min over critics
 
-        sample_weights = config.get("sample_weights", None)
+        sample_weights = context.get("sample_weights", None)
         if sample_weights is None:
-            actor_loss = jnp.mean(alpha * log_prob - q_value)
+            loss = jnp.mean(alpha * log_prob - q_value)
         else:
             w = sample_weights[:, None]
-            actor_loss = jnp.sum(w * (alpha * log_prob - q_value)) / (jnp.sum(w) + 1e-8)
-        return actor_loss, log_prob
+            loss = jnp.sum(w * (alpha * log_prob - q_value)) / (jnp.sum(w) + 1e-8)
+        return loss, log_prob
 
     # Use OLD alpha value (before alpha update) - matching original SAC
     alpha = jnp.exp(training_state.alpha_state.params["log_alpha"]) if training_state.alpha_state else 0.0
@@ -327,7 +322,7 @@ def update_actor_sac(config: Dict[str, Any], networks: Dict[str, Any],
     return training_state, metrics
 
 
-def update_critic_sac(config: Dict[str, Any], networks: Dict[str, Any],
+def update_critic_sac(context: Dict[str, Any], networks: Dict[str, Any],
                       transitions: Transition, training_state: TrainingState, key: jnp.ndarray):
     """SAC critic update for an ensemble of critics.
 
@@ -343,7 +338,6 @@ def update_critic_sac(config: Dict[str, Any], networks: Dict[str, Any],
     discounts = transitions.discount
 
     critic = networks["critic"]
-    n_critics = critic.n_critics
 
     # Use OLD alpha value (before alpha update) - matching original SAC
     alpha = jnp.exp(training_state.alpha_state.params["log_alpha"]) if training_state.alpha_state else 0.0
@@ -354,24 +348,20 @@ def update_critic_sac(config: Dict[str, Any], networks: Dict[str, Any],
     # Sample next actions (shared across critics).
     actor = networks["actor"]
     next_means, next_log_stds = actor.apply(training_state.actor_state.params, next_obs)
-    next_stds = jnp.exp(next_log_stds)
-    key, noise_key = jax.random.split(key)
-    next_x_ts = next_means + next_stds * jax.random.normal(noise_key, shape=next_means.shape, dtype=next_means.dtype)
-    next_actions = nn.tanh(next_x_ts)
-    next_log_prob = jax.scipy.stats.norm.logpdf(next_x_ts, loc=next_means, scale=next_stds)
-    next_log_prob -= jnp.log((1 - jnp.square(next_actions)) + 1e-6)
-    next_log_prob = next_log_prob.sum(-1, keepdims=True)
+    next_actions, next_log_prob = _squashed_gaussian_action_and_log_prob(
+        next_means, next_log_stds, key
+    )
 
     target_q_values = critic.apply(target_q_params, next_obs, next_actions)
-    if config.get("use_sac_critic_mean", False):
+    if context.get("use_sac_critic_mean", False):
         target_q_value = jnp.mean(target_q_values, axis=-1, keepdims=True)
     else:
         target_q_value = jnp.min(target_q_values, axis=-1, keepdims=True)
-    target = rewards[:, None] + config["discounting"] * discounts[:, None] * (
+    target = rewards[:, None] + context["discounting"] * discounts[:, None] * (
         target_q_value - alpha * next_log_prob
     )  # (batch_size, 1)
 
-    sample_weights = config.get("sample_weights", None)
+    sample_weights = context.get("sample_weights", None)
     weight_vec = None if sample_weights is None else sample_weights[:, None]
 
     # Tuple of per-critic params; gradient flows to each through the

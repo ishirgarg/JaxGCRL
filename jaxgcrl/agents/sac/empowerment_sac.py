@@ -24,12 +24,13 @@ from jaxgcrl.agents.go_explore.algorithms import get_explore_policy
 from jaxgcrl.agents.go_explore.empowerment import (
     build_ogbench_empowerment_obs_template,
     infer_ogbench_root_from_run_dir,
+    _setup_external_imports,
+    _latest_epoch,
 )
 from jaxgcrl.agents.go_explore.losses import (
     update_alpha_sac,
-    update_actor_sac,
-    update_critic_sac,
-                )
+    soft_update_target_params,
+)
 from jaxgcrl.agents.go_explore.types import TrainingState as GETrainingState, Transition
 
 Metrics = Any
@@ -192,23 +193,6 @@ def _log_replay_empowerment_scatter(
     return buf_state
 
 # ---------------------------------------------------------------------------
-# External imports helper
-# ---------------------------------------------------------------------------
-
-def _setup_external_imports(ogbench_root: str):
-    """Prepare OGBench imports and return registry/helpers."""
-    import sys, os
-    impls_root = os.path.join(ogbench_root, "impls")
-    for p in (impls_root, ogbench_root):
-        if p not in sys.path:
-            sys.path.insert(0, p)
-    from agents import agents as agent_registry
-    from utils.env_utils import make_env_and_datasets
-    from utils.flax_utils import restore_agent
-    return agent_registry, make_env_and_datasets, restore_agent
-
-
-# ---------------------------------------------------------------------------
 # Main agent dataclass
 # ---------------------------------------------------------------------------
 
@@ -263,13 +247,13 @@ class EmpowermentSAC:
         # ------------------------------------------------------------------
         # Load empowerment checkpoint
         # ------------------------------------------------------------------
+        if self.run_dir is None:
+            raise ValueError("run_dir must be provided for empowerment checkpoint.")
         ogbench_root = infer_ogbench_root_from_run_dir(self.run_dir)
         agent_registry, make_env_and_datasets, restore_agent = _setup_external_imports(
             ogbench_root
         )
-        if self.run_dir is None:
-            raise ValueError("run_dir must be provided for empowerment checkpoint.")
-        import os, re, json, glob
+        import os, json
         flags_path = os.path.join(self.run_dir, "flags.json")
         with open(flags_path, "r") as f:
             flags = json.load(f)
@@ -292,19 +276,8 @@ class EmpowermentSAC:
             config=agent_cfg,
         )
         # Choose latest epoch if not provided
-        if self.epoch is None:
-            ckpts = glob.glob(os.path.join(self.run_dir, "params_*.pkl"))
-            epochs = []
-            for p in ckpts:
-                m = re.search(r"params_(\d+)\.pkl$", os.path.basename(p))
-                if m:
-                    epochs.append(int(m.group(1)))
-            if not epochs:
-                raise FileNotFoundError(f"No params_*.pkl found in {self.run_dir}")
-            self_epoch = max(epochs)
-        else:
-            self_epoch = self.epoch
-        emp_agent = restore_agent(emp_agent, self.run_dir, self_epoch)
+        resolved_epoch = _latest_epoch(self.run_dir) if self.epoch is None else self.epoch
+        emp_agent = restore_agent(emp_agent, self.run_dir, resolved_epoch)
         ex_obs_dim = int(example_batch["observations"].shape[-1])
 
         # ------------------------------------------------------------------
@@ -356,7 +329,7 @@ class EmpowermentSAC:
         # Networks
         # ------------------------------------------------------------------
         key = jax.random.PRNGKey(config.seed)
-        key, actor_key, critic_key, alpha_key, env_key, eval_env_key, buffer_key = jax.random.split(key, 7)
+        key, actor_key, critic_key, _, env_key, eval_env_key, buffer_key = jax.random.split(key, 7)
         actor, critic = get_explore_policy(
             explore_policy_type="sac",
             action_size=action_size,
@@ -457,7 +430,6 @@ class EmpowermentSAC:
                 obs_size=full_obs_size,
                 action_size=action_size,
                 state_size=full_obs_size - goal_dim,
-                agent_type="sac",
                 include_phase=False,
             )
 
@@ -567,14 +539,8 @@ class EmpowermentSAC:
             training_state, alpha_metrics = update_alpha_sac(context, networks, transitions, training_state, alpha_key)
             training_state, critic_metrics = critic.update(context, networks, transitions, training_state, critic_key)
             training_state, actor_metrics = actor.update(context, networks, transitions, training_state, actor_key)
-            full_cp = {}
-            for i, cs in enumerate(training_state.critic_states):
-                for lname, lparams in cs.params.items():
-                    full_cp[f"critic_{i}_{lname}"] = lparams
-            new_target = jax.tree_util.tree_map(
-                lambda x, y: x * (1 - self.tau) + y * self.tau,
-                training_state.target_critic_params,
-                full_cp,
+            new_target = soft_update_target_params(
+                training_state.target_critic_params, training_state.critic_states, self.tau
             )
             training_state = training_state.replace(
                 target_critic_params=new_target,
@@ -600,10 +566,10 @@ class EmpowermentSAC:
             flat_next = next_full_obs.reshape(N * L, -1)
 
             k1, k2 = jax.random.split(key)
-            cur_emp = empowerment_reward(flat_obs, k1).reshape(N, L)
             next_emp = empowerment_reward(flat_next, k2).reshape(N, L)
 
             if self.use_empowerment_diff:
+                cur_emp = empowerment_reward(flat_obs, k1).reshape(N, L)
                 emp_delta = next_emp - cur_emp
                 shaped_reward = emp_delta
             else:

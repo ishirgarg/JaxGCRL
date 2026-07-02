@@ -13,7 +13,6 @@ IK loop on an arm-only MuJoCo model. We reproduce the same loop in JAX/MJX so
 the action semantics are preserved exactly.
 """
 
-import os
 from pathlib import Path
 from typing import Tuple
 
@@ -402,8 +401,8 @@ class CubeSingle(PipelineEnv):
         # gripper, so we lock the env to it.
         if backend != 'mjx':
             raise ValueError(
-                f'CubeSingle requires backend="mjx" — brax spring/positional do not '
-                f'support the Robotiq tendon actuator or 4-bar equality constraints.'
+                'CubeSingle requires backend="mjx" — brax spring/positional do not '
+                'support the Robotiq tendon actuator or 4-bar equality constraints.'
             )
 
         mj, ik_mj = _assemble_mjcf()
