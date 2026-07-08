@@ -1,16 +1,16 @@
 #!/bin/bash
-#SBATCH --job-name=skill_k_ddsemp_high
+#SBATCH --job-name=skill_k_ddsemp
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_high
+#SBATCH --qos=rail_gpu4_lowest
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=120:00:00
-#SBATCH --array=0-15
+#SBATCH --array=0-39
 
 # SAC-discrete hierarchical skill controller over BOTH the DDS ("Discrete
 # Diffusion Skills") and the empowerment_skill checkpoint families, sweeping the
-# temporal commitment horizon k = {20, 50, 100} on two OGBench envs:
+# temporal commitment horizon k = {20, 50, 100, 250, 500} on two OGBench envs:
 #     1. ant_maze_ogbench_medium_navigate        (antmaze, medium)
 #     2. ant_ball_4d_ogbench_arena_1g_scale2     (antsoccer, scale2 arena)
 # Each env is run against four frozen skill checkpoints: {dds, empowerment} x
@@ -27,10 +27,10 @@
 #     go/explore-phase knobs for the flat agent). The controller simply tiles
 #     `episode_length` into episode_length/k macro-steps. We still pass the
 #     gcp/ep values for record-keeping; only episode_length matters.
-#   * check_config requires `episode_length % k == 0`. With k in {20,50,100}
-#     episode_length must be divisible by 100:
-#       antmaze:   gcp 800 + ep 800 -> episode_length 1600 (1600 % 100 == 0)
-#       antsoccer: gcp 200 + ep 200 -> episode_length  400 ( 400 % 100 == 0)
+#   * check_config requires `episode_length % k == 0`. With k in
+#     {20,50,100,250,500} episode_length must be divisible by 500:
+#       antmaze:   gcp 2000 + ep 2000 -> episode_length 4000 (4000 % 500 == 0)
+#       antsoccer: gcp 1000 + ep 1000 -> episode_length 2000 (2000 % 500 == 0)
 #   * --num_skills and --skill_policy_type are passed explicitly per checkpoint.
 #     Both are ASSERTED against the checkpoint's flags.json (num_skills vs the
 #     ckpt config, skill_policy_type {dds,empowerment} -> agent_name
@@ -38,11 +38,9 @@
 #     are what gets logged to wandb, so runs can be categorized by type + skills.
 #   * --controller_target_entropy_scale is fixed at 0.5 (H_bar = 0.5*log(K)).
 #
-# Full sweep = 8 base configs x 3 k-values x 1 entropy x 1 seed = 24 runs,
-# split across two priority tiers by CFG_IDX:
-#     high   : OFFSET=0  --array=0-15  -> CFG_IDX 0..15  (16 runs, this file)
-#     normal : OFFSET=16 --array=0-7   -> CFG_IDX 16..23 ( 8 runs)
-# This file is the HIGH tier.
+# Full sweep = 8 base configs x 5 k-values x 1 entropy x 1 seed = 40 runs, run
+# as a SINGLE tier (this file; the former high/normal split is merged here):
+#     --array=0-39  -> CFG_IDX 0..39  (40 runs)
 #
 #   Base configs (env, skill-policy ckpt, type, num_skills), indexed by BASE_IDX:
 #     0  ant_maze_ogbench_medium_navigate      dds          15  35176626
@@ -55,16 +53,14 @@
 #     7  ant_ball_4d_ogbench_arena_1g_scale2   empowerment  50  34739255
 #
 # Index decoding:
-#   CFG_IDX  = OFFSET + SLURM_ARRAY_TASK_ID   (0..15 for this high tier)
-#   K_IDX    = CFG_IDX % 3                     (0..2)
-#   BASE_IDX = CFG_IDX / 3                     (0..7)
+#   CFG_IDX  = SLURM_ARRAY_TASK_ID   (0..39)
+#   K_IDX    = CFG_IDX % 5           (0..4)
+#   BASE_IDX = CFG_IDX / 5           (0..7)
 #   SEED     = 0 (fixed)
 
 # Local wandb run data goes to BRC scratch (home quota is small).
 export WANDB_DIR=/global/scratch/users/ishirgarg/jaxgcrl
 mkdir -p "$WANDB_DIR"
-
-OFFSET=0
 
 # Skill checkpoints live under the shared /global/scratch OGBench tree.
 CKPT_PREFIX=/global/scratch/users/ishirgarg/ogbench/OGBench/Debug
@@ -92,20 +88,20 @@ CKPTS=(
 )
 TYPES=(dds dds empowerment empowerment dds dds empowerment empowerment)
 NUM_SKILLS=(15 50 15 50 15 50 15 50)
-EP_LENS=(1600 1600 1600 1600 400 400 400 400)
-GCP_STEPS=(800 800 800 800 200 200 200 200)
-EP_STEPS=(800 800 800 800 200 200 200 200)
+EP_LENS=(4000 4000 4000 4000 2000 2000 2000 2000)
+GCP_STEPS=(2000 2000 2000 2000 1000 1000 1000 1000)
+EP_STEPS=(2000 2000 2000 2000 1000 1000 1000 1000)
 SHORT=(am_medium am_medium am_medium am_medium \
        asoc_ar1g_s2 asoc_ar1g_s2 asoc_ar1g_s2 asoc_ar1g_s2)
 
-K_VALUES=(20 50 100)
+K_VALUES=(20 50 100 250 500)
 ENT=0.5
 SEED=0
 
 # ── Decode this array task ──────────────────────────────────────────────────
-CFG_IDX=$((OFFSET + SLURM_ARRAY_TASK_ID))
-K_IDX=$((CFG_IDX % 3))
-BASE_IDX=$((CFG_IDX / 3))
+CFG_IDX=$SLURM_ARRAY_TASK_ID
+K_IDX=$((CFG_IDX % 5))
+BASE_IDX=$((CFG_IDX / 5))
 
 ENV=${ENVS[$BASE_IDX]}
 CKPT=${CKPTS[$BASE_IDX]}
