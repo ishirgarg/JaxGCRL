@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=skill_k_ddsemp
+#SBATCH --job-name=skill_k_ddsemp_low
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_lowest
+#SBATCH --qos=rail_gpu4_low
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=120:00:00
-#SBATCH --array=0-39
+#SBATCH --array=0-19
 
 # SAC-discrete hierarchical skill controller over BOTH the DDS ("Discrete
 # Diffusion Skills") and the empowerment_skill checkpoint families, sweeping the
@@ -38,9 +38,10 @@
 #     are what gets logged to wandb, so runs can be categorized by type + skills.
 #   * --controller_target_entropy_scale is fixed at 0.5 (H_bar = 0.5*log(K)).
 #
-# Full sweep = 8 base configs x 5 k-values x 1 entropy x 1 seed = 40 runs, run
-# as a SINGLE tier (this file; the former high/normal split is merged here):
-#     --array=0-39  -> CFG_IDX 0..39  (40 runs)
+# Full sweep = 8 base configs x 5 k-values x 1 entropy x 1 seed = 40 runs, split
+# across two QOS tiers of 20 runs each:
+#     low    : OFFSET=0   --array=0-19  -> CFG_IDX 0..19  (BASE_IDX 0..3, antmaze)
+#     normal : OFFSET=20  --array=0-19  -> CFG_IDX 20..39 (BASE_IDX 4..7, antsoccer)
 #
 #   Base configs (env, skill-policy ckpt, type, num_skills), indexed by BASE_IDX:
 #     0  ant_maze_ogbench_medium_navigate      dds          15  35176626
@@ -53,9 +54,9 @@
 #     7  ant_ball_4d_ogbench_arena_1g_scale2   empowerment  50  34739255
 #
 # Index decoding:
-#   CFG_IDX  = SLURM_ARRAY_TASK_ID   (0..39)
-#   K_IDX    = CFG_IDX % 5           (0..4)
-#   BASE_IDX = CFG_IDX / 5           (0..7)
+#   CFG_IDX  = OFFSET + SLURM_ARRAY_TASK_ID   (0..39)
+#   K_IDX    = CFG_IDX % 5                     (0..4)
+#   BASE_IDX = CFG_IDX / 5                     (0..7)
 #   SEED     = 0 (fixed)
 
 # Local wandb run data goes to BRC scratch (home quota is small).
@@ -98,8 +99,11 @@ K_VALUES=(20 50 100 250 500)
 ENT=0.5
 SEED=0
 
+# This tier's offset into the global CFG_IDX space (low = 0..19).
+OFFSET=0
+
 # ── Decode this array task ──────────────────────────────────────────────────
-CFG_IDX=$SLURM_ARRAY_TASK_ID
+CFG_IDX=$((OFFSET + SLURM_ARRAY_TASK_ID))
 K_IDX=$((CFG_IDX % 5))
 BASE_IDX=$((CFG_IDX / 5))
 
@@ -121,7 +125,7 @@ echo "CFG_IDX=$CFG_IDX  ENV=$ENV  CKPT=$CKPT  TYPE=$STYPE  NUM_SKILLS=$NSKILLS  
 python run.py go-explore-simple \
         --agent_type sac_discrete \
         --env $ENV \
-        --total_env_steps 120000000 \
+        --total_env_steps 150000000 \
         --episode_length $EP_LEN \
         --num_gcp_steps $GCP \
         --num_ep_steps $EP \
