@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=120:00:00
-#SBATCH --array=0-19
+#SBATCH --array=0-39
 
 # SAC-discrete hierarchical skill controller over BOTH the DDS ("Discrete
 # Diffusion Skills") and the empowerment_skill checkpoint families, sweeping the
@@ -38,10 +38,9 @@
 #     are what gets logged to wandb, so runs can be categorized by type + skills.
 #   * --controller_target_entropy_scale is fixed at 0.5 (H_bar = 0.5*log(K)).
 #
-# Full sweep = 8 base configs x 5 k-values x 1 entropy x 1 seed = 40 runs, split
-# across two QOS tiers of 20 runs each:
-#     low    : OFFSET=0   --array=0-19  -> CFG_IDX 0..19  (BASE_IDX 0..3, antmaze)
-#     normal : OFFSET=20  --array=0-19  -> CFG_IDX 20..39 (BASE_IDX 4..7, antsoccer)
+# Full sweep = 8 base configs x 5 k-values x 1 entropy x 1 seed = 40 runs, all
+# submitted to the normal QOS tier in a single array job:
+#     normal : OFFSET=0   --array=0-39  -> CFG_IDX 0..39  (BASE_IDX 0..7, all)
 #
 #   Base configs (env, skill-policy ckpt, type, num_skills), indexed by BASE_IDX:
 #     0  ant_maze_ogbench_medium_navigate      dds          15  35176626
@@ -99,8 +98,8 @@ K_VALUES=(20 50 100 250 500)
 ENT=0.5
 SEED=0
 
-# This tier's offset into the global CFG_IDX space (normal = 20..39).
-OFFSET=20
+# This tier's offset into the global CFG_IDX space (all runs, normal = 0..39).
+OFFSET=0
 
 # ── Decode this array task ──────────────────────────────────────────────────
 CFG_IDX=$((OFFSET + SLURM_ARRAY_TASK_ID))
@@ -125,7 +124,7 @@ echo "CFG_IDX=$CFG_IDX  ENV=$ENV  CKPT=$CKPT  TYPE=$STYPE  NUM_SKILLS=$NSKILLS  
 python run.py go-explore-simple \
         --agent_type sac_discrete \
         --env $ENV \
-        --total_env_steps 150000000 \
+        --total_env_steps 180000000 \
         --episode_length $EP_LEN \
         --num_gcp_steps $GCP \
         --num_ep_steps $EP \
