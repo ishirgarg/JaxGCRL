@@ -156,6 +156,7 @@ def main(config: Config):
         "online_empowerment/q/q_loss_future",
         "online_empowerment/q/v_next_current_log_mean",
         "online_empowerment/q/v_next_future_log_mean",
+        "online_empowerment/total_loss",
         "online_empowerment/v/q_pi_log_mean",
         "online_empowerment/v/v_log_mean",
         "online_empowerment/v/v_loss",
