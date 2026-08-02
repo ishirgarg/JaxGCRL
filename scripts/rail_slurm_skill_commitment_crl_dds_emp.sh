@@ -6,26 +6,26 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=120:00:00
-#SBATCH --array=0-15
+#SBATCH --array=0-13
 
 # CRL (contrastive) hierarchical skill controller over BOTH the DDS ("Discrete
 # Diffusion Skills") and the empowerment_skill checkpoint families, on four
 # OGBench env variants:
 #     1. ant_maze_ogbench_medium_navigate            (antmaze, medium)
-#     2. ant_maze_ogbench_medium_stitch[_slice50]    (same maze, stitch ckpts)
+#     2. ant_maze_ogbench_medium_stitch              (same maze, stitch ckpts)
 #     3. ant_ball_4d_ogbench_arena_1g_scale2         (antsoccer, scale2 arena)
-#     4. ant_ball_4d_ogbench_arena_1g_scale2_stitch[_slice50] (same arena)
-# The *_stitch / *_stitch_slice50 variants are physically identical envs (the
-# suffixes map to the same maze layout in create_env); the names only encode
-# which skill-checkpoint dataset family the run is paired with, for wandb
-# categorization: DDS stitch rows use the plain *_stitch env name, empowerment
-# stitch rows (slice50 datasets) use *_stitch_slice50. Each variant runs four
-# frozen skill checkpoints: {dds, empowerment} x {15, 50}-skill.
-# Replaces the seven old skill_commitment scripts (dds_emp_normal + the six
-# k_sweep{,_crl}_{normal,low,lowest} variants) with a single array. FIXED:
-# k=20, controller_target_entropy_scale=0.25, seed 0. The contrastive critic's
+#     4. ant_ball_4d_ogbench_arena_1g_scale2_stitch  (same arena, stitch ckpts)
+# The *_stitch variants are physically identical envs (the suffix maps to the
+# same maze layout in create_env); the name only marks runs paired with
+# stitch-dataset checkpoints, for wandb categorization. FIXED: k=20,
+# controller_target_entropy_scale=0.25, seed 0. The contrastive critic's
 # InfoNCE positives are ALWAYS γ-discounted future states sampled at batch time
 # (the flat-CRL flatten_batch data path) — there is no HER and no HER flags.
+#
+# NOTE: antmaze-stitch has NO empowerment rows for now — only slice50-dataset
+# empowerment runs exist for that env and we are not using slice50 variants —
+# so the sweep is 14 runs, not 16. Replaces the seven old skill_commitment
+# scripts (dds_emp_normal + the six k_sweep{,_crl}_{normal,low,lowest}).
 #
 # agent_type=crl_skill trains an online CRL (contrastive) high-level controller
 # that picks a discrete skill every k env steps over a FROZEN OGBench
@@ -47,37 +47,34 @@
 #
 # Checkpoint run dirs verified against the NAS source tree
 # (/nas/ucb/ishirgarg/ogbench/impls/ckpts/{dds,empowerment}/<ogbench-env>/),
-# with num_skills read from each run's flags.json. Empowerment stitch runs use
-# the slice50 dataset variants for BOTH envs (antmaze-medium-stitch-slice50,
-# antsoccer-arena-stitch-slice50); DDS stitch has no slice50 variant.
+# with num_skills read from each run's flags.json.
 #
-#   BASE_IDX  env                                        type         skills  run dir
+#   BASE_IDX  env                                  type         skills  run dir
 #     0  ant_maze_ogbench_medium_navigate            dds          15  sd000_s_35757533.0.20260721_190340
 #     1  ant_maze_ogbench_medium_navigate            dds          50  sd000_s_35757534.0.20260721_190340
 #     2  ant_maze_ogbench_medium_navigate            empowerment  15  sd000_s_34594763.0.20260527_234148
 #     3  ant_maze_ogbench_medium_navigate            empowerment  50  sd000_s_34594838.0.20260527_234324
 #     4  ant_maze_ogbench_medium_stitch              dds          15  sd000_s_35757537.0.20260721_190341
 #     5  ant_maze_ogbench_medium_stitch              dds          50  sd000_s_35757538.0.20260721_190340
-#     6  ant_maze_ogbench_medium_stitch_slice50      empowerment  15  sd000_s_35873142.0.20260726_160900
-#     7  ant_maze_ogbench_medium_stitch_slice50      empowerment  50  sd000_s_35873143.0.20260726_160900
-#     8  ant_ball_4d_ogbench_arena_1g_scale2         dds          15  sd000_s_35757535.0.20260721_190341
-#     9  ant_ball_4d_ogbench_arena_1g_scale2         dds          50  sd000_s_35757536.0.20260721_190341
-#    10  ant_ball_4d_ogbench_arena_1g_scale2         empowerment  15  sd000_s_34594769.0.20260527_234149
-#    11  ant_ball_4d_ogbench_arena_1g_scale2         empowerment  50  sd000_s_34739255.0.20260531_064819
-#    12  ant_ball_4d_ogbench_arena_1g_scale2_stitch  dds          15  sd000_s_35757539.0.20260721_190340
-#    13  ant_ball_4d_ogbench_arena_1g_scale2_stitch  dds          50  sd000_s_35757532.0.20260721_190340
-#    14  ant_ball_4d_ogbench_arena_1g_scale2_stitch_slice50  empowerment  15  sd000_s_35873145.0.20260726_160900
-#    15  ant_ball_4d_ogbench_arena_1g_scale2_stitch_slice50  empowerment  50  sd000_s_35873146.0.20260726_160900
+#     6  ant_ball_4d_ogbench_arena_1g_scale2         dds          15  sd000_s_35757535.0.20260721_190341
+#     7  ant_ball_4d_ogbench_arena_1g_scale2         dds          50  sd000_s_35757536.0.20260721_190341
+#     8  ant_ball_4d_ogbench_arena_1g_scale2         empowerment  15  sd000_s_34594769.0.20260527_234149
+#     9  ant_ball_4d_ogbench_arena_1g_scale2         empowerment  50  sd000_s_34739255.0.20260531_064819
+#    10  ant_ball_4d_ogbench_arena_1g_scale2_stitch  dds          15  sd000_s_35757539.0.20260721_190340
+#    11  ant_ball_4d_ogbench_arena_1g_scale2_stitch  dds          50  sd000_s_35757532.0.20260721_190340
+#    12  ant_ball_4d_ogbench_arena_1g_scale2_stitch  empowerment  15  sd000_s_35675533.0.20260718_020653
+#    13  ant_ball_4d_ogbench_arena_1g_scale2_stitch  empowerment  50  sd000_s_35675541.0.20260718_020739
 #
-# Index decoding: BASE_IDX = SLURM_ARRAY_TASK_ID (0..15). SEED = 0 (fixed).
+# Index decoding: BASE_IDX = SLURM_ARRAY_TASK_ID (0..13). SEED = 0 (fixed).
 
 # Local wandb run data goes to BRC scratch (home quota is small).
 export WANDB_DIR=/global/scratch/users/ishirgarg/jaxgcrl
 mkdir -p "$WANDB_DIR"
 
 # Skill checkpoints live under the shared /global/scratch OGBench tree (BRC
-# mirror of the NAS run dirs listed above).
-CKPT_PREFIX=/global/scratch/users/ishirgarg/ogbench/OGBench/Debug
+# mirror of the NAS run dirs listed above). Empowerment runs sit in the Debug/
+# group; DDS runs sit in per-config groups named dds_<ogbench-env>_K<skills>.
+CKPT_ROOT=/global/scratch/users/ishirgarg/ogbench/OGBench
 
 # ── Base configs (parallel arrays, indexed by BASE_IDX) ─────────────────────
 ENVS=(
@@ -87,16 +84,14 @@ ENVS=(
   "ant_maze_ogbench_medium_navigate"
   "ant_maze_ogbench_medium_stitch"
   "ant_maze_ogbench_medium_stitch"
-  "ant_maze_ogbench_medium_stitch_slice50"
-  "ant_maze_ogbench_medium_stitch_slice50"
   "ant_ball_4d_ogbench_arena_1g_scale2"
   "ant_ball_4d_ogbench_arena_1g_scale2"
   "ant_ball_4d_ogbench_arena_1g_scale2"
   "ant_ball_4d_ogbench_arena_1g_scale2"
   "ant_ball_4d_ogbench_arena_1g_scale2_stitch"
   "ant_ball_4d_ogbench_arena_1g_scale2_stitch"
-  "ant_ball_4d_ogbench_arena_1g_scale2_stitch_slice50"
-  "ant_ball_4d_ogbench_arena_1g_scale2_stitch_slice50"
+  "ant_ball_4d_ogbench_arena_1g_scale2_stitch"
+  "ant_ball_4d_ogbench_arena_1g_scale2_stitch"
 )
 CKPTS=(
   "sd000_s_35757533.0.20260721_190340"
@@ -105,28 +100,43 @@ CKPTS=(
   "sd000_s_34594838.0.20260527_234324"
   "sd000_s_35757537.0.20260721_190341"
   "sd000_s_35757538.0.20260721_190340"
-  "sd000_s_35873142.0.20260726_160900"
-  "sd000_s_35873143.0.20260726_160900"
   "sd000_s_35757535.0.20260721_190341"
   "sd000_s_35757536.0.20260721_190341"
   "sd000_s_34594769.0.20260527_234149"
   "sd000_s_34739255.0.20260531_064819"
   "sd000_s_35757539.0.20260721_190340"
   "sd000_s_35757532.0.20260721_190340"
-  "sd000_s_35873145.0.20260726_160900"
-  "sd000_s_35873146.0.20260726_160900"
+  "sd000_s_35675533.0.20260718_020653"
+  "sd000_s_35675541.0.20260718_020739"
+)
+# Checkpoint group folder per run (DDS: dds_<env>_K<skills>; empowerment: Debug).
+GROUPS_=(
+  "dds_antmaze-medium-navigate-v0_K15"
+  "dds_antmaze-medium-navigate-v0_K50"
+  "Debug"
+  "Debug"
+  "dds_antmaze-medium-stitch-v0_K15"
+  "dds_antmaze-medium-stitch-v0_K50"
+  "dds_antsoccer-arena-navigate-v0_K15"
+  "dds_antsoccer-arena-navigate-v0_K50"
+  "Debug"
+  "Debug"
+  "dds_antsoccer-arena-stitch-v0_K15"
+  "dds_antsoccer-arena-stitch-v0_K50"
+  "Debug"
+  "Debug"
 )
 TYPES=(dds dds empowerment empowerment \
-       dds dds empowerment empowerment \
+       dds dds \
        dds dds empowerment empowerment \
        dds dds empowerment empowerment)
-NUM_SKILLS=(15 50 15 50 15 50 15 50 15 50 15 50 15 50 15 50)
-EP_LENS=(2000 2000 2000 2000 2000 2000 2000 2000 \
+NUM_SKILLS=(15 50 15 50 15 50 15 50 15 50 15 50 15 50)
+EP_LENS=(2000 2000 2000 2000 2000 2000 \
          1000 1000 1000 1000 1000 1000 1000 1000)
 SHORT=(am_medium am_medium am_medium am_medium \
-       am_medium_st am_medium_st am_medium_st50 am_medium_st50 \
+       am_medium_st am_medium_st \
        asoc_ar1g_s2 asoc_ar1g_s2 asoc_ar1g_s2 asoc_ar1g_s2 \
-       asoc_ar1g_s2_st asoc_ar1g_s2_st asoc_ar1g_s2_st50 asoc_ar1g_s2_st50)
+       asoc_ar1g_s2_st asoc_ar1g_s2_st asoc_ar1g_s2_st asoc_ar1g_s2_st)
 
 K=20
 ENT=0.25
@@ -143,15 +153,21 @@ BASE_IDX=$SLURM_ARRAY_TASK_ID
 
 ENV=${ENVS[$BASE_IDX]}
 CKPT=${CKPTS[$BASE_IDX]}
+GROUP=${GROUPS_[$BASE_IDX]}
 STYPE=${TYPES[$BASE_IDX]}
 NSKILLS=${NUM_SKILLS[$BASE_IDX]}
 EP_LEN=${EP_LENS[$BASE_IDX]}
 TAG=${SHORT[$BASE_IDX]}
 
-SKILL_DIR="${CKPT_PREFIX}/${CKPT}"
+# Run dir = <group>/<sd...>; if the group folder holds flags.json directly
+# (no sd subdir), fall back to the group folder itself.
+SKILL_DIR="${CKPT_ROOT}/${GROUP}/${CKPT}"
+if [ ! -f "${SKILL_DIR}/flags.json" ] && [ -f "${CKPT_ROOT}/${GROUP}/flags.json" ]; then
+  SKILL_DIR="${CKPT_ROOT}/${GROUP}"
+fi
 EXP_NAME="${TAG}__crlskill_${STYPE}_ns${NSKILLS}_k${K}_ent${ENT}__s${SEED}"
 
-echo "BASE_IDX=$BASE_IDX  ENV=$ENV  CKPT=$CKPT  TYPE=$STYPE  NUM_SKILLS=$NSKILLS  K=$K  ENT=$ENT  SEED=$SEED  EXP=$EXP_NAME"
+echo "BASE_IDX=$BASE_IDX  ENV=$ENV  SKILL_DIR=$SKILL_DIR  TYPE=$STYPE  NUM_SKILLS=$NSKILLS  K=$K  ENT=$ENT  SEED=$SEED  EXP=$EXP_NAME"
 
 python run.py go-explore-simple \
         --agent_type crl_skill \
