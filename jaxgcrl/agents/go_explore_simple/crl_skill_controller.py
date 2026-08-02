@@ -8,13 +8,17 @@ controller* that selects discrete skills ``z`` over a Semi-MDP (SMDP) with fixed
 
 This is the contrastive sibling of ``skill_controller.train_skill_controller``
 (``agent_type="sac_discrete"``). Everything about the SMDP plumbing — the frozen
-skill adapter, the ``k``-step macro-step rollout, HER relabeling over
-macro-steps, the deterministic eval rollout, the skill-usage histogram, and the
-skill-colored trajectory + brax HTML render — is identical and reused from
-``skill_controller`` / ``sac_discrete``. The ONLY thing that changes is the
-high-level *learner*: instead of SAC-discrete we train a CRL contrastive critic
-plus a categorical actor with an auto-tuned entropy temperature ``α``, mirroring
-``crl/losses.py`` as closely as the discrete-skill setting allows.
+skill adapter, the ``k``-step macro-step rollout, the deterministic eval
+rollout, the skill-usage histogram, and the skill-colored trajectory + brax
+HTML render — is identical and reused from ``skill_controller`` /
+``sac_discrete``. What changes is the high-level *learner* AND the data path:
+instead of SAC-discrete + HER we train a CRL contrastive critic plus a
+categorical actor with an auto-tuned entropy temperature ``α``, with InfoNCE
+positives sampled EXACTLY the way the flat ``agent_type="crl"`` path does it —
+raw macro-transitions (with ``traj_id``) are stored in a trajectory-preserving
+queue, and at batch time each row's goal is drawn from a discount-weighted
+*future* macro-step of the same episode (``go_explore/utils.flatten_batch``,
+applied by the flat path via ``CRLActor.process_transitions``).
 
 CRL high-level learner (mirrors ``crl/losses.py`` ``update_critic`` /
 ``update_actor_and_alpha``):
@@ -24,8 +28,10 @@ CRL high-level learner (mirrors ``crl/losses.py`` ``update_critic`` /
     is the discrete skill — exactly how the frozen low-level policy consumes
     skills); ``g_encoder`` consumes the goal (controller_obs goal slice). InfoNCE
     over the in-batch goals via ``energy_fn`` + ``contrastive_loss_fn`` with the
-    same ``logsumexp_penalty_coeff``. HER (uniform-future relabel) supplies the
-    future-goal positives — the SMDP analogue of CRL's ``flatten_batch``.
+    same ``logsumexp_penalty_coeff``. Positives are ALWAYS sampled future
+    states: each batch row's goal is the achieved goal of a future macro-step
+    from the same episode, sampled with probability ∝ γ^Δt (the SMDP port of
+    CRL's ``flatten_batch``; γ measured in env steps, so γ_macro = γ^k per row).
 
   - **Categorical actor** ``π(z | s, g)``: an MLP -> logits over ``num_skills``.
     Actor loss is the exact-soft discrete analogue of CRL's actor loss
@@ -41,7 +47,10 @@ CRL high-level learner (mirrors ``crl/losses.py`` ``update_critic`` /
     controller's convention).
 
 The critic is purely contrastive (goal-reaching InfoNCE over (s,z)->future-goal,
-no reward bootstrap / Bellman target) — faithful to ``crl/losses.py``.
+no reward bootstrap / Bellman target) — faithful to ``crl/losses.py``. There is
+NO HER path here: unlike the SAC-discrete controller, goals are never relabeled
+at insert time and the stored reward is never recomputed; relabeling happens
+purely at batch-construction time, exactly like the flat CRL agent.
 """
 
 from __future__ import annotations
@@ -78,13 +87,8 @@ from jaxgcrl.agents.go_explore_simple.skill_controller import (
     load_frozen_skill_policy,
     make_skill_action_fn,
 )
-from jaxgcrl.agents.go_explore_simple.sac_discrete import (
-    DiscreteActorNet,
-    her_relabel_sequence,
-    init_controller_replay,
-    insert_controller_replay,
-    sample_controller_replay,
-)
+from jaxgcrl.agents.go_explore_simple.sac_discrete import DiscreteActorNet
+from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 from jaxgcrl.agents.go_explore.losses import contrastive_loss_fn, energy_fn
 
 
@@ -297,14 +301,6 @@ def train_crl_skill_controller(
     ``self`` is the ``GoExploreSimple`` dataclass instance (config holder). The
     SMDP plumbing mirrors ``train_skill_controller``; the learner is CRL.
     """
-    # CRL fundamentally relies on future-goal positives (HER), so the contrastive
-    # controller requires the HER data path. Non-HER has no contrastive positives.
-    assert bool(self.use_her), (
-        "agent_type='crl_skill' requires use_her=True: the contrastive critic "
-        "is trained on HER future-goal positives (the SMDP analogue of CRL's "
-        "flatten_batch)."
-    )
-
     unwrapped_env = train_env
     eval_env_base = eval_env if eval_env is not None else train_env
 
@@ -323,10 +319,7 @@ def train_crl_skill_controller(
     emp_agent, num_skills, skill_obs_builder = load_frozen_skill_policy(
         self, unwrapped_env, skill_key
     )
-    logging.info(
-        "crl skill controller: num_skills=%d, k=%d, use_her=%s, p_future_her_goal=%.3f",
-        num_skills, k, bool(self.use_her), float(self.p_future_her_goal),
-    )
+    logging.info("crl skill controller: num_skills=%d, k=%d", num_skills, k)
     skill_action_train = make_skill_action_fn(
         emp_agent, skill_obs_builder, num_skills,
         deterministic=self.deterministic_skill_actions,
@@ -357,7 +350,40 @@ def train_crl_skill_controller(
         actor_key=actor_key, sa_key=sa_key, g_key=g_key,
     )
 
-    replay_state = init_controller_replay(self.controller_replay_size, obs_size)
+    # ── Trajectory-preserving macro-step replay (mirrors the flat CRL buffer) ──
+    # Raw macro-transitions (goals NOT relabeled, ``traj_id`` kept) are stored
+    # per-env in time order; sampling returns contiguous per-env windows of
+    # ``macro_window`` macro-steps, from which ``flatten_macro_batch`` draws the
+    # future-goal positives — identical structure to the flat agent's
+    # ``TrajectoryUniformSamplingQueue`` + ``flatten_batch`` pipeline.
+    macro_window = config.episode_length // k  # macro-steps per episode
+    assert macro_window >= 2, (
+        "crl_skill needs episode_length/k >= 2 macro-steps so every window has "
+        "at least one future state to sample as an InfoNCE positive."
+    )
+    # Capacity is in per-env rows; keep the same total macro-transition budget
+    # as the flat controller replay (controller_replay_size) with a floor that
+    # guarantees the sampler always has a full window plus history.
+    max_replay_rows = max(2 * macro_window + 1, self.controller_replay_size // num_envs)
+    dummy_macro_step = {
+        "obs": jnp.zeros((obs_size,), dtype=jnp.float32),
+        "skill": jnp.zeros((), dtype=jnp.int32),
+        "reward": jnp.zeros((), dtype=jnp.float32),
+        "next_obs": jnp.zeros((obs_size,), dtype=jnp.float32),
+        "done": jnp.zeros((), dtype=jnp.float32),
+        "traj_id": jnp.zeros((), dtype=jnp.float32),
+    }
+    replay_buffer = TrajectoryUniformSamplingQueue(
+        max_replay_size=max_replay_rows,
+        dummy_data_sample=dummy_macro_step,
+        sample_batch_size=self.batch_size,
+        num_envs=num_envs,
+        episode_length=macro_window,
+    )
+    replay_buffer.insert_internal = jax.jit(replay_buffer.insert_internal)
+    replay_buffer.sample_internal = jax.jit(replay_buffer.sample_internal)
+    rng, buffer_key = jax.random.split(rng)
+    replay_state = replay_buffer.init(buffer_key)
 
     # Bound the per-skill kwargs so the update is a clean JIT-friendly closure.
     _update = functools.partial(
@@ -395,8 +421,8 @@ def train_crl_skill_controller(
         ``γ_low``-discounted reward up to the first in-window termination,
         ``done`` is any termination in the window, ``next_obs`` is frozen at the
         first termination. (The contrastive critic ignores ``R`` — it learns from
-        HER future-goal positives — but we keep the same transition fields so the
-        replay buffer + relabeling code is shared verbatim.)
+        sampled future-goal positives — but we keep the same transition fields as
+        the SAC-discrete controller so the SMDP plumbing stays identical.)
         """
         R0 = jnp.zeros((num_envs,), dtype=jnp.float32)
         disc0 = jnp.ones((num_envs,), dtype=jnp.float32)
@@ -455,16 +481,26 @@ def train_crl_skill_controller(
         }
         return env_state, step, R, done
 
-    def collect_macro(controller_state, env_state, replay_state, key):
-        env_state, step, R, done = step_macro(controller_state, env_state, key)
-        replay_state = insert_controller_replay(replay_state, step)
-        return env_state, replay_state, R, done
-
-    n_grad_steps = max(1, self.train_step_multiplier)
+    def collect_block(controller_state, env_state, key):
+        """Collect one episode-length block of raw macro-steps for all envs."""
+        def f(carry, _):
+            es_, k_ = carry
+            k_, ck = jax.random.split(k_)
+            es_, step, _, _ = step_macro(controller_state, es_, ck)
+            return (es_, k_), step
+        (env_state, _), block = jax.lax.scan(
+            f, (env_state, key), (), length=macro_window
+        )
+        return env_state, block  # block leaves: (macro_window, num_envs, ...)
 
     # ── Step bookkeeping (identical accounting to the SAC-discrete path) ──────
     env_steps_per_macro = num_envs * k
-    num_prefill_macro_steps = int(np.ceil(self.min_replay_size / num_envs))
+    # Prefill in whole blocks; at least 2 so the queue's sampler always has a
+    # valid start range (insert_position > macro_window).
+    num_prefill_blocks = max(
+        2, int(np.ceil(self.min_replay_size / (macro_window * num_envs)))
+    )
+    num_prefill_macro_steps = num_prefill_blocks * macro_window
     num_prefill_env_steps = num_prefill_macro_steps * env_steps_per_macro
     available_env_steps = max(env_steps_per_macro, config.total_env_steps - num_prefill_env_steps)
     env_steps_per_epoch = available_env_steps // config.num_evals
@@ -478,75 +514,93 @@ def train_crl_skill_controller(
         def f(carry, _):
             cs, es, rs, k_ = carry
             k_, ck = jax.random.split(k_)
-            es, rs, _, _ = collect_macro(cs, es, rs, ck)
+            es, block = collect_block(cs, es, ck)
+            rs = replay_buffer.insert(rs, block)
             return (cs, es, rs, k_), None
         (controller_state, env_state, replay_state, _), _ = jax.lax.scan(
-            f, (controller_state, env_state, replay_state, key), (), length=num_prefill_macro_steps
+            f, (controller_state, env_state, replay_state, key), (), length=num_prefill_blocks
         )
         return controller_state, env_state, replay_state
 
-    # ── HER (hindsight relabel) — the contrastive data path ──────────────────
-    # Collect a block of macro-steps, relabel each transition's goal with a
-    # uniformly-sampled *future* achieved state from the SAME episode (matched by
-    # traj_id), store in the flat replay, sample i.i.d. batches, and run the CRL
-    # contrastive update with in-batch goals as negatives.
-    HER_MAX_WINDOW = 512
-    her_window = min(config.episode_length // k, HER_MAX_WINDOW)  # macro-steps / block
-    blocks_per_epoch = max(1, int(round(macro_steps_per_epoch / her_window)))
+    # ── Contrastive data path (exact mimic of the flat CRL agent) ────────────
+    # Per block: collect raw macro-steps, insert into the trajectory queue,
+    # sample per-env macro-step windows from the WHOLE buffer, draw each row's
+    # goal from a γ-discounted future macro-step of the same episode
+    # (``flatten_macro_batch`` below == ``go_explore/utils.flatten_batch`` on
+    # macro rows), then permute, split into batches, and do one full pass of
+    # contrastive updates — the structure of the flat path's ``training_step``
+    # (get_experience -> buffer.sample -> process_transitions -> scan(update)).
+    blocks_per_epoch = max(1, int(round(macro_steps_per_epoch / macro_window)))
     _goal_indices = jnp.asarray(
         [int(i) for i in np.asarray(unwrapped_env.goal_indices)]
     )
-    _goal_reach_thresh = float(unwrapped_env.goal_reach_thresh)
-    _relabel_seq = functools.partial(
-        her_relabel_sequence,
-        state_size=state_size,
-        goal_indices=_goal_indices,
-        goal_reach_thresh=_goal_reach_thresh,
-        p_future_her_goal=float(self.p_future_her_goal),
-    )
+    # Rows are k env steps apart, so the flat agent's per-env-step ``discounting``
+    # becomes ``discounting**k`` per macro-row: γ^Δt measured in env steps.
+    gamma_macro = float(self.discounting) ** k
 
-    def collect_block(controller_state, env_state, key):
-        def f(carry, _):
-            es_, k_ = carry
-            k_, ck = jax.random.split(k_)
-            es_, step, _, _ = step_macro(controller_state, es_, ck)
-            return (es_, k_), step
-        (env_state, _), block = jax.lax.scan(
-            f, (env_state, key), (), length=her_window
+    def flatten_macro_batch(seq, sample_key):
+        """``go_explore/utils.flatten_batch`` ported to one env's macro window.
+
+        ``seq`` fields are (T, ...) raw macro-transitions. Each row's goal is the
+        achieved goal of a future row of the same episode, sampled with
+        probability ∝ γ_macro^Δrows (traj_id-masked, ``eye*1e-5`` self-fallback
+        for rows with no future — identical to the flat implementation). The
+        last row is dropped (it has no future). Rewards are NOT recomputed; the
+        contrastive critic never reads them.
+        """
+        T = seq["obs"].shape[0]
+        arrangement = jnp.arange(T)
+        is_future = (arrangement[:, None] < arrangement[None]).astype(jnp.float32)
+        discount = gamma_macro ** jnp.array(
+            arrangement[None] - arrangement[:, None], dtype=jnp.float32
         )
-        return env_state, block  # block leaves: (her_window, num_envs, ...)
+        tid = seq["traj_id"]
+        same_traj = (tid[None, :] == tid[:, None]).astype(jnp.float32)
+        probs = is_future * discount * same_traj + jnp.eye(T) * 1e-5
+
+        goal_index = jax.random.categorical(sample_key, jnp.log(probs))
+        future_state = seq["obs"][goal_index[:-1], :state_size]
+        goal = future_state[:, _goal_indices]
+
+        state = seq["obs"][:-1, :state_size]
+        next_state = seq["next_obs"][:-1, :state_size]
+        return {
+            "obs": jnp.concatenate([state, goal], axis=1),
+            "skill": seq["skill"][:-1],
+            "reward": seq["reward"][:-1],
+            "next_obs": jnp.concatenate([next_state, goal], axis=1),
+            "done": seq["done"][:-1],
+        }
+
+    flat_rows = num_envs * (macro_window - 1)
+    num_batches = max(1, flat_rows // self.batch_size)
 
     @jax.jit
-    def training_epoch_her(controller_state, env_state, replay_state, key):
+    def training_epoch(controller_state, env_state, replay_state, key):
         def block_step(carry, _):
             cs, es, rs, k_ = carry
-            k_, collect_key, relabel_key, train_key = jax.random.split(k_, 4)
+            k_, collect_key, flatten_key, perm_key = jax.random.split(k_, 4)
 
             es, block = collect_block(cs, es, collect_key)
+            rs = replay_buffer.insert(rs, block)
 
-            # Relabel per env over its macro-step sequence, then flatten to i.i.d.
-            block_env_major = jax.tree_util.tree_map(
-                lambda x: jnp.swapaxes(x, 0, 1), block
-            )  # (num_envs, her_window, ...)
-            rkeys = jax.random.split(relabel_key, num_envs)
-            relabeled = jax.vmap(_relabel_seq)(block_env_major, rkeys)
+            # Sample windows -> future-goal positives -> permute -> batches.
+            rs, seqs = replay_buffer.sample(rs)  # leaves: (num_envs, macro_window, ...)
+            fkeys = jax.random.split(flatten_key, num_envs)
+            flat = jax.vmap(flatten_macro_batch)(seqs, fkeys)
             flat = jax.tree_util.tree_map(
-                lambda x: x.reshape((num_envs * her_window,) + x.shape[2:]), relabeled
+                lambda x: x.reshape((flat_rows,) + x.shape[2:]), flat
             )
-            rs = insert_controller_replay(rs, flat)
-
-            def upd(carry2, _):
-                cs2, k2 = carry2
-                k2, sk = jax.random.split(k2)
-                batch = sample_controller_replay(rs, sk, self.batch_size)
-                cs2, m = _update(cs2, batch)
-                return (cs2, k2), m
-
-            # Keep updates-per-collected-macro-step equal to the non-HER budget.
-            (cs, _), m = jax.lax.scan(
-                upd, (cs, train_key), (), length=her_window * n_grad_steps
+            perm = jax.random.permutation(perm_key, flat_rows)
+            batched = jax.tree_util.tree_map(
+                lambda x: x[perm][: num_batches * self.batch_size].reshape(
+                    (num_batches, self.batch_size) + x.shape[1:]
+                ),
+                flat,
             )
-            cs = cs.replace(env_steps=cs.env_steps + num_envs * k * her_window)
+
+            cs, m = jax.lax.scan(lambda cs2, batch: _update(cs2, batch), cs, batched)
+            cs = cs.replace(env_steps=cs.env_steps + num_envs * k * macro_window)
             m = jax.tree_util.tree_map(jnp.mean, m)
             m["macro_reward_mean"] = jnp.mean(block["reward"])
             m["macro_done_mean"] = jnp.mean(block["done"])
@@ -709,7 +763,7 @@ def train_crl_skill_controller(
     for ne in range(config.num_evals):
         t = time.time()
         rng, epoch_key, eval_rng = jax.random.split(rng, 3)
-        controller_state, env_state, replay_state, raw_metrics = training_epoch_her(
+        controller_state, env_state, replay_state, raw_metrics = training_epoch(
             controller_state, env_state, replay_state, epoch_key
         )
         raw_metrics = jax.tree_util.tree_map(lambda x: x.block_until_ready(), raw_metrics)
@@ -717,7 +771,7 @@ def train_crl_skill_controller(
         training_walltime += epoch_time
 
         current_step = int(controller_state.env_steps) + num_prefill_env_steps
-        sps = (env_steps_per_macro * macro_steps_per_epoch) / max(epoch_time, 1e-6)
+        sps = (env_steps_per_macro * macro_window * blocks_per_epoch) / max(epoch_time, 1e-6)
 
         metrics = {
             "training/sps": sps,

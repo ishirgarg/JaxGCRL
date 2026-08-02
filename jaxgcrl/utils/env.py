@@ -76,6 +76,8 @@ legal_envs = (
     "ant_ball_ogbench_arena_1g",
     "ant_ball_4d_ogbench_arena_1g",
     "ant_ball_4d_ogbench_arena_1g_scale2",
+    "ant_ball_4d_ogbench_arena_1g_scale2_stitch",
+    "ant_ball_4d_ogbench_arena_1g_scale2_stitch_slice50",
     "ant_ball_4d_ogbench_small_easy_square_1g_scale2",
     "ant_ball_4d_ogbench_arena_1g_scale1",
     "ant_ball_ogbench_arena_stitch",
@@ -86,6 +88,8 @@ legal_envs = (
     "ant_maze_ogbench_arena",
     "ant_maze_ogbench_medium_navigate",
     "ant_maze_ogbench_medium_explore",
+    "ant_maze_ogbench_medium_stitch",
+    "ant_maze_ogbench_medium_stitch_slice50",
     "ant_maze_ogbench_medium_1g",
     "ant_maze_ogbench_u",
     "pointmaze_ogbench_teleport",
@@ -143,6 +147,10 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         # 4D-goal variant: goal = [ant_x, ant_y, ball_x, ball_y] where both
         # ant and ball must reach the same G cell for default goals.
         layout = env_name[len("ant_ball_4d_ogbench_"):]
+        # "_stitch" / "_stitch_slice50" are dataset/categorization tags only —
+        # they map to the same physical layout as the base name.
+        if layout.endswith("_slice50"):
+            layout = layout[: -len("_slice50")]
         if layout.endswith("_stitch"):
             layout = layout[: -len("_stitch")]
         # "_scale2" layouts use a 16x16 grid at maze_size_scaling=2.0 (half the
@@ -205,9 +213,14 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
             # defaults to mjx so physics match the OGBench offline dataset
             # (timestep=0.02, gear=30). Legacy layouts stay on spring.
             layout = env_name[4:]
-            # The "_explore" variant reuses the medium maze layout; only the
-            # offline dataset differs (antmaze-medium-explore-v0).
-            if layout == "maze_ogbench_medium_explore":
+            # The "_explore" / "_stitch" / "_stitch_slice50" variants reuse the
+            # medium maze layout; only the offline dataset (and hence which
+            # skill checkpoint is paired with the run) differs.
+            if layout in (
+                "maze_ogbench_medium_explore",
+                "maze_ogbench_medium_stitch",
+                "maze_ogbench_medium_stitch_slice50",
+            ):
                 layout = "maze_ogbench_medium_navigate"
             if "ogbench" in layout:
                 env = AntMaze(backend=backend or "mjx", maze_layout_name=layout)

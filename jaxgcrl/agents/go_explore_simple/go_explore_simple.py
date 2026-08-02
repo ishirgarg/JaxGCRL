@@ -223,11 +223,12 @@ class GoExploreSimple:
             )
             assert config.num_evals > 0, "num_evals must be > 0"
             if self.agent_type == "crl_skill":
-                # The contrastive controller learns from HER future-goal positives
-                # (the SMDP analogue of CRL's flatten_batch); HER is mandatory.
-                assert bool(self.use_her), (
-                    "agent_type='crl_skill' requires use_her=True (contrastive critic "
-                    "trains on HER future-goal positives)."
+                # The contrastive controller always samples γ-discounted future
+                # states for its InfoNCE positives (flatten_batch, like the flat
+                # CRL path); use_her / p_future_her_goal are ignored by it.
+                assert config.episode_length // self.skill_commitment_k >= 2, (
+                    "agent_type='crl_skill' needs episode_length/k >= 2 macro-steps "
+                    "so each window has a future state to sample as a positive."
                 )
             return
 
