@@ -64,10 +64,13 @@ from jaxgcrl.agents.go_explore_simple.sac_discrete import (
 
 
 def load_frozen_skill_policy(self, unwrapped_env, template_key):
-    """Load + freeze an OGBench skill-conditioned policy and resolve num_skills.
+    """Load + freeze an OGBench skill-conditioned policy and resolve the skill space.
 
-    Returns ``(emp_agent, num_skills, skill_obs_builder)``. The skill policy is
-    never differentiated; we only call its frozen ``policy`` submodule.
+    Returns ``(emp_agent, num_skills, skill_obs_builder)``, where ``num_skills``
+    is the discrete skill count for a discrete controller, or the continuous
+    skill vector dimensionality when ``self.continuous_skill`` is True. The
+    skill policy is never differentiated; we only call its frozen ``policy``
+    submodule.
     """
     state_size = int(unwrapped_env.state_dim)
     emp_agent, ex_obs_dim, base_obs_template = load_offline_empowerment_agent(
@@ -97,17 +100,31 @@ def load_frozen_skill_policy(self, unwrapped_env, template_key):
             state_size=state_size,
         )
 
-    # num_skills: explicit override, else inferred from the checkpoint config.
-    ckpt_num_skills = int(emp_agent.config["num_skills"])
-    if self.num_skills is not None:
-        num_skills = int(self.num_skills)
-        if num_skills != ckpt_num_skills:
-            raise ValueError(
-                f"num_skills override ({num_skills}) disagrees with the loaded skill "
-                f"checkpoint's num_skills ({ckpt_num_skills}); they must match."
-            )
+    if getattr(self, "continuous_skill", False):
+        # skill_dim: explicit override, else inferred from the checkpoint config
+        # (falls back to 8 if the checkpoint doesn't record it).
+        ckpt_skill_dim = int(emp_agent.config.get("skill_dim", 8))
+        if self.skill_dim is not None:
+            num_skills = int(self.skill_dim)
+            if num_skills != ckpt_skill_dim:
+                raise ValueError(
+                    f"skill_dim override ({num_skills}) disagrees with the loaded skill "
+                    f"checkpoint's skill_dim ({ckpt_skill_dim}); they must match."
+                )
+        else:
+            num_skills = ckpt_skill_dim
     else:
-        num_skills = ckpt_num_skills
+        # num_skills: explicit override, else inferred from the checkpoint config.
+        ckpt_num_skills = int(emp_agent.config["num_skills"])
+        if self.num_skills is not None:
+            num_skills = int(self.num_skills)
+            if num_skills != ckpt_num_skills:
+                raise ValueError(
+                    f"num_skills override ({num_skills}) disagrees with the loaded skill "
+                    f"checkpoint's num_skills ({ckpt_num_skills}); they must match."
+                )
+        else:
+            num_skills = ckpt_num_skills
 
     # skill_policy_type: assert (never derive) the checkpoint's agent family so
     # the wandb-logged config value is guaranteed to describe the real ckpt.
@@ -181,26 +198,37 @@ def _make_dds_skill_action_fn(emp_agent, skill_obs_builder, *, deterministic):
     return skill_action_fn
 
 
-def make_skill_action_fn(emp_agent, skill_obs_builder, num_skills, *, deterministic):
-    """Adapter: (jaxgcrl states, discrete skill indices) -> low-level actions.
+def make_skill_action_fn(
+    emp_agent, skill_obs_builder, num_skills, *, deterministic, continuous=False
+):
+    """Adapter: (jaxgcrl states, skill) -> low-level actions.
 
     Generic over any OGBench skill-conditioned agent. For agents with a policy
-    submodule of signature ``policy(obs, skills_onehot)`` returning a ``distrax``
-    dist (e.g. ``empowerment_skill``) the skill index is one-hot fed to that
-    policy. For DDS checkpoints the index instead selects a VQ codebook embedding
-    decoded into an action (see ``_make_dds_skill_action_fn``). The frozen
-    ``emp_agent`` params are captured by closure (no gradient ever flows into
-    them) — identical pattern to ``make_offline_empowerment_scorer``.
+    submodule of signature ``policy(obs, z)`` returning a ``distrax`` dist (e.g.
+    ``empowerment_skill``), the skill is fed directly to that policy: one-hot
+    encoded when ``continuous=False`` (discrete skill index in
+    ``[0, num_skills)``), or passed through as a raw continuous vector of
+    dimension ``num_skills`` when ``continuous=True``. For DDS checkpoints the
+    discrete index instead selects a VQ codebook embedding decoded into an
+    action (see ``_make_dds_skill_action_fn``); DDS is inherently discrete and
+    is not supported when ``continuous=True``. The frozen ``emp_agent`` params
+    are captured by closure (no gradient ever flows into them) — identical
+    pattern to ``make_offline_empowerment_scorer``.
     """
     if _is_dds_agent(emp_agent):
+        if continuous:
+            raise ValueError(
+                "continuous_skill=True is incompatible with a DDS skill checkpoint "
+                "(DDS uses a discrete VQ codebook)."
+            )
         return _make_dds_skill_action_fn(
             emp_agent, skill_obs_builder, deterministic=deterministic
         )
 
-    def skill_action_fn(states: jnp.ndarray, skill_indices: jnp.ndarray, key: jax.Array):
+    def skill_action_fn(states: jnp.ndarray, skill: jnp.ndarray, key: jax.Array):
         emp_obs = skill_obs_builder(states)                  # OGBench-mapped state
-        z_onehot = jax.nn.one_hot(skill_indices, num_skills)
-        dist = emp_agent.network.select("policy")(emp_obs, z_onehot)
+        z = skill if continuous else jax.nn.one_hot(skill, num_skills)
+        dist = emp_agent.network.select("policy")(emp_obs, z)
         a = dist.mode() if deterministic else dist.sample(seed=key)
         return jnp.clip(a, -1.0, 1.0)
 

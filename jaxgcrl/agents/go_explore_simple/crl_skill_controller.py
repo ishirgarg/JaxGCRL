@@ -51,6 +51,22 @@ no reward bootstrap / Bellman target) — faithful to ``crl/losses.py``. There i
 NO HER path here: unlike the SAC-discrete controller, goals are never relabeled
 at insert time and the stored reward is never recomputed; relabeling happens
 purely at batch-construction time, exactly like the flat CRL agent.
+
+When ``self.continuous_skill`` is True, the controller's action space is a
+continuous skill vector instead of a discrete index: the categorical actor is
+swapped for the same ``Actor`` network used for continuous action spaces
+elsewhere in this repo (a learned state-dependent Gaussian mean + log-std), but
+UNSQUASHED — the skill latent lives in all of R^d (whatever the frozen
+low-level policy was trained to condition on), not tanh-bounded like an env
+action, so sampling/log-prob use ``_gaussian_skill_and_log_prob`` (no tanh
+correction) rather than ``go_explore/losses.py``'s squashed variant. Skills are
+concatenated directly into the contrastive critic's ``sa_encoder`` input (no
+one-hot), and the actor/alpha losses are the reparameterized-sample SAC updates
+(mirroring ``update_actor_and_alpha``, minus the squashing) instead of the
+exact enumeration over one-hot skills. Everything else — the SMDP macro-step
+plumbing, the trajectory replay + future-goal positive sampling, the eval loop
+— is unchanged; ``self.skill_dim`` (analogous to ``num_skills``) sets the
+continuous skill dimensionality.
 """
 
 from __future__ import annotations
@@ -78,7 +94,7 @@ from jaxgcrl.envs.wrappers import (
 from jaxgcrl.utils.evaluator import EvalWrapper
 from jaxgcrl.agents.go_explore.utils import save_params
 from jaxgcrl.agents.go_explore.goal_proposers import create_random_env_goals_proposer
-from jaxgcrl.agents.go_explore.networks import Encoder
+from jaxgcrl.agents.go_explore.networks import Actor, Encoder
 
 # Frozen-skill adapters + the skill-colored trajectory plot are shared verbatim
 # with the SAC-discrete controller; only the high-level learner differs.
@@ -90,6 +106,22 @@ from jaxgcrl.agents.go_explore_simple.skill_controller import (
 from jaxgcrl.agents.go_explore_simple.sac_discrete import DiscreteActorNet
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 from jaxgcrl.agents.go_explore.losses import contrastive_loss_fn, energy_fn
+
+
+def _gaussian_skill_and_log_prob(means, log_stds, key, keepdims: bool = True):
+    """Reparameterized Gaussian sample, UNSQUASHED (skill latent lives in R^d).
+
+    Unlike ``go_explore/losses.py::_squashed_gaussian_action_and_log_prob``
+    (used for bounded env actions), a continuous skill has no valid range to
+    tanh-squash into — it's whatever the frozen low-level policy was trained
+    to condition on — so this omits the tanh + log-det-Jacobian correction.
+    """
+    stds = jnp.exp(log_stds)
+    key, noise_key = jax.random.split(key)
+    skill = means + stds * jax.random.normal(noise_key, shape=means.shape, dtype=means.dtype)
+    log_prob = jax.scipy.stats.norm.logpdf(skill, loc=means, scale=stds)
+    log_prob = log_prob.sum(-1, keepdims=keepdims)
+    return skill, log_prob
 
 
 # ── CRL controller training state ───────────────────────────────────────────────
@@ -107,7 +139,7 @@ class CRLControllerState:
 
 
 def create_crl_controller_state(
-    actor_net: DiscreteActorNet,
+    actor_net,
     sa_encoder: Encoder,
     g_encoder: Encoder,
     *,
@@ -121,11 +153,14 @@ def create_crl_controller_state(
     sa_key: jax.Array,
     g_key: jax.Array,
 ) -> CRLControllerState:
-    """Initialize the categorical actor, contrastive critic, and α states.
+    """Initialize the actor, contrastive critic, and α states.
 
     Mirrors CRL's network/state setup: the critic is a single ``TrainState`` whose
-    params hold both encoders (``sa_encoder`` over ``[state, one_hot(z)]`` and
-    ``g_encoder`` over the goal); ``log_alpha`` starts at 0.
+    params hold both encoders (``sa_encoder`` over ``[state, skill]`` — skill is
+    one-hot for a discrete controller (``actor_net`` a ``DiscreteActorNet``) or a
+    raw continuous vector for a continuous controller (``actor_net`` an
+    ``Actor``) — and ``g_encoder`` over the goal); ``log_alpha`` starts at 0.
+    ``num_skills`` doubles as the continuous skill dimensionality in that case.
     """
     obs_size = state_size + goal_size
     actor_params = actor_net.init(actor_key, jnp.ones((1, obs_size), dtype=jnp.float32))
@@ -162,8 +197,9 @@ def create_crl_controller_state(
 def crl_controller_update(
     controller_state: CRLControllerState,
     batch: Dict[str, jnp.ndarray],
+    key: jax.Array,
     *,
-    actor_net: DiscreteActorNet,
+    actor_net,
     sa_encoder: Encoder,
     g_encoder: Encoder,
     num_skills: int,
@@ -172,17 +208,26 @@ def crl_controller_update(
     contrastive_loss_name: str,
     logsumexp_penalty_coeff: float,
     target_entropy: float,
+    continuous: bool = False,
 ):
     """One CRL gradient step for the high-level controller.
 
     Order follows ``crl.py``'s ``update_networks``: actor + α first, then the
     contrastive critic. ``α`` uses the OLD (pre-update) value for the actor loss,
     matching CRL. There is no Bellman target / Polyak averaging — the critic is
-    purely contrastive (InfoNCE over (state, one_hot(z)) -> future-goal positives,
+    purely contrastive (InfoNCE over (state, skill) -> future-goal positives,
     with in-batch goals as negatives), exactly like ``update_critic``.
+
+    When ``continuous=False`` the actor is categorical (``actor_net`` a
+    ``DiscreteActorNet``) and the actor loss exactly enumerates every one-hot
+    skill. When ``continuous=True`` the actor is a tanh-squashed Gaussian
+    (``actor_net`` an ``Actor``, same as the flat CRL agent's continuous action
+    space) and the actor/alpha losses are the reparameterized-sample versions
+    from ``go_explore/losses.py::update_actor_and_alpha`` — ``num_skills``
+    doubles as the continuous skill dimensionality, and no one-hot is used
+    anywhere (the raw skill vector is concatenated with the state instead).
     """
     obs = batch["obs"]                       # (B, obs_size) = [state, goal]
-    skill = batch["skill"].astype(jnp.int32)
     reward = batch["reward"]
     done = batch["done"]
     B = obs.shape[0]
@@ -193,38 +238,63 @@ def crl_controller_update(
     critic_params = controller_state.critic_state.params
     old_alpha = jnp.exp(controller_state.alpha_state.params["log_alpha"])
 
-    # ── Actor + α update (mirror crl ``update_actor_and_alpha``, categorical) ──
-    def actor_loss_fn(a_params):
-        logits = actor_net.apply(a_params, obs)            # (B, K)
-        log_pi = jax.nn.log_softmax(logits, axis=-1)       # (B, K)
-        pi = jnp.exp(log_pi)                               # (B, K)
-        entropy = -jnp.sum(pi * log_pi, axis=-1)           # (B,)  H(π)
+    # ── Actor + α update (mirror crl ``update_actor_and_alpha``) ─────────────
+    if continuous:
+        def actor_loss_fn(a_params, key):
+            means, log_stds = actor_net.apply(a_params, obs)   # (B, K), (B, K)
+            skill, log_prob = _gaussian_skill_and_log_prob(
+                means, log_stds, key, keepdims=False
+            )  # skill: (B, K), log_prob: (B,)
 
-        # Per-skill contrastive Q(s, z, g) for *every* z (batch the K one-hots).
-        sa_params = critic_params["sa_encoder"]
-        g_params = critic_params["g_encoder"]
-        onehots = jnp.eye(num_skills, dtype=state.dtype)               # (K, K)
-        state_b = jnp.broadcast_to(state[:, None, :], (B, num_skills, state_size))
-        onehot_b = jnp.broadcast_to(onehots[None, :, :], (B, num_skills, num_skills))
-        sa_in = jnp.concatenate([state_b, onehot_b], axis=-1)         # (B, K, state+K)
-        sa_repr = sa_encoder.apply(sa_params, sa_in)                  # (B, K, repr)
-        g_repr = g_encoder.apply(g_params, goal)                     # (B, repr)
-        q = energy_fn(energy_fn_name, sa_repr, g_repr[:, None, :])    # (B, K)
-        q = jax.lax.stop_gradient(q)
+            sa_params = critic_params["sa_encoder"]
+            g_params = critic_params["g_encoder"]
+            sa_repr = sa_encoder.apply(sa_params, jnp.concatenate([state, skill], axis=-1))
+            g_repr = g_encoder.apply(g_params, goal)
+            q = energy_fn(energy_fn_name, sa_repr, g_repr)     # (B,); NOT stop-gradiented
+            # -> gradient flows to the actor through the reparameterized skill.
 
-        # J = E_s Σ_z π(z|s,g)·(α·log π(z|s,g) − Q(s,z,g))
-        per_state = jnp.sum(pi * (old_alpha * log_pi - q), axis=-1)   # (B,)
-        return jnp.mean(per_state), entropy
+            per_state = old_alpha * log_prob - q               # (B,)
+            return jnp.mean(per_state), log_prob
 
-    (actor_loss_val, entropy), actor_grad = jax.value_and_grad(
-        actor_loss_fn, has_aux=True
-    )(actor_params)
+        (actor_loss_val, entropy_term), actor_grad = jax.value_and_grad(
+            actor_loss_fn, has_aux=True
+        )(actor_params, key)
+        # ``entropy_term`` here is log_prob (B,); reused below as ``entropy`` for
+        # the alpha loss and the shared "controller_entropy" metric (-log_prob).
+        entropy = -entropy_term
+    else:
+        def actor_loss_fn(a_params, key):
+            logits = actor_net.apply(a_params, obs)            # (B, K)
+            log_pi = jax.nn.log_softmax(logits, axis=-1)       # (B, K)
+            pi = jnp.exp(log_pi)                               # (B, K)
+            entropy = -jnp.sum(pi * log_pi, axis=-1)           # (B,)  H(π)
+
+            # Per-skill contrastive Q(s, z, g) for *every* z (batch the K one-hots).
+            sa_params = critic_params["sa_encoder"]
+            g_params = critic_params["g_encoder"]
+            onehots = jnp.eye(num_skills, dtype=state.dtype)               # (K, K)
+            state_b = jnp.broadcast_to(state[:, None, :], (B, num_skills, state_size))
+            onehot_b = jnp.broadcast_to(onehots[None, :, :], (B, num_skills, num_skills))
+            sa_in = jnp.concatenate([state_b, onehot_b], axis=-1)         # (B, K, state+K)
+            sa_repr = sa_encoder.apply(sa_params, sa_in)                  # (B, K, repr)
+            g_repr = g_encoder.apply(g_params, goal)                     # (B, repr)
+            q = energy_fn(energy_fn_name, sa_repr, g_repr[:, None, :])    # (B, K)
+            q = jax.lax.stop_gradient(q)
+
+            # J = E_s Σ_z π(z|s,g)·(α·log π(z|s,g) − Q(s,z,g))
+            per_state = jnp.sum(pi * (old_alpha * log_pi - q), axis=-1)   # (B,)
+            return jnp.mean(per_state), entropy
+
+        (actor_loss_val, entropy), actor_grad = jax.value_and_grad(
+            actor_loss_fn, has_aux=True
+        )(actor_params, key)
     new_actor_state = controller_state.actor_state.apply_gradients(grads=actor_grad)
 
     def alpha_loss_fn(alpha_params):
         alpha = jnp.exp(alpha_params["log_alpha"])
         # crl alpha_loss: α·mean(stop_gradient(−log_prob − H̄)); discrete
-        # substitution −log_prob -> entropy H(π)  =>  α·mean(sg(H − H̄)).
+        # substitution −log_prob -> entropy H(π)  =>  α·mean(sg(H − H̄)); the
+        # continuous branch uses −log_prob directly (== ``entropy`` above).
         return alpha * jnp.mean(jax.lax.stop_gradient(entropy - target_entropy))
 
     alpha_loss_val, alpha_grad = jax.value_and_grad(alpha_loss_fn)(
@@ -233,12 +303,14 @@ def crl_controller_update(
     new_alpha_state = controller_state.alpha_state.apply_gradients(grads=alpha_grad)
 
     # ── Critic update (mirror crl ``update_critic`` exactly) ─────────────────
-    z_onehot = jax.nn.one_hot(skill, num_skills)           # (B, K)
+    skill = batch["skill"] if continuous else jax.nn.one_hot(
+        batch["skill"].astype(jnp.int32), num_skills
+    )  # (B, K)
 
     def critic_loss_fn(c_params):
         sa_params = c_params["sa_encoder"]
         g_params = c_params["g_encoder"]
-        sa_repr = sa_encoder.apply(sa_params, jnp.concatenate([state, z_onehot], axis=-1))
+        sa_repr = sa_encoder.apply(sa_params, jnp.concatenate([state, skill], axis=-1))
         g_repr = g_encoder.apply(g_params, goal)
 
         # InfoNCE over the in-batch goals.
@@ -310,6 +382,7 @@ def train_crl_skill_controller(
     num_envs = config.num_envs
     k = self.skill_commitment_k
     gamma_low = self.gamma_low
+    continuous_skill = bool(getattr(self, "continuous_skill", False))
 
     rng = jax.random.PRNGKey(config.seed)
     rng, skill_key, actor_key, sa_key, g_key, env_key = jax.random.split(rng, 6)
@@ -319,22 +392,37 @@ def train_crl_skill_controller(
     emp_agent, num_skills, skill_obs_builder = load_frozen_skill_policy(
         self, unwrapped_env, skill_key
     )
-    logging.info("crl skill controller: num_skills=%d, k=%d", num_skills, k)
+    logging.info(
+        "crl skill controller: num_skills=%d, k=%d, continuous_skill=%s",
+        num_skills, k, continuous_skill,
+    )
     skill_action_train = make_skill_action_fn(
         emp_agent, skill_obs_builder, num_skills,
-        deterministic=self.deterministic_skill_actions,
+        deterministic=self.deterministic_skill_actions, continuous=continuous_skill,
     )
     skill_action_eval = make_skill_action_fn(
         emp_agent, skill_obs_builder, num_skills, deterministic=True,
+        continuous=continuous_skill,
     )
 
-    target_entropy = float(self.controller_target_entropy_scale) * float(np.log(num_skills))
+    # Continuous: standard SAC heuristic (-0.5 * skill_dim), matching the flat
+    # agent's continuous-action target entropy. Discrete: scaled max entropy.
+    if continuous_skill:
+        target_entropy = -0.5 * float(num_skills)
+    else:
+        target_entropy = float(self.controller_target_entropy_scale) * float(np.log(num_skills))
 
-    # ── Controller networks + state (categorical actor + contrastive critic) ──
-    actor_net = DiscreteActorNet(
-        num_skills=num_skills, h_dim=self.h_dim, n_hidden=self.n_hidden,
-        skip_connections=self.skip_connections, use_relu=self.use_relu, use_ln=self.use_ln,
-    )
+    # ── Controller networks + state (actor + contrastive critic) ─────────────
+    if continuous_skill:
+        actor_net = Actor(
+            action_size=num_skills, network_width=self.h_dim, network_depth=self.n_hidden,
+            skip_connections=self.skip_connections, use_relu=self.use_relu, use_ln=self.use_ln,
+        )
+    else:
+        actor_net = DiscreteActorNet(
+            num_skills=num_skills, h_dim=self.h_dim, n_hidden=self.n_hidden,
+            skip_connections=self.skip_connections, use_relu=self.use_relu, use_ln=self.use_ln,
+        )
     sa_encoder = Encoder(
         repr_dim=self.repr_dim, network_width=self.h_dim, network_depth=self.n_hidden,
         skip_connections=self.skip_connections, use_relu=self.use_relu, use_ln=self.use_ln,
@@ -349,6 +437,27 @@ def train_crl_skill_controller(
         policy_lr=self.policy_lr, critic_lr=self.critic_lr, alpha_lr=self.alpha_lr,
         actor_key=actor_key, sa_key=sa_key, g_key=g_key,
     )
+
+    # ── Skill selection (stochastic-train / deterministic-mode) ──────────────
+    # Shared by ``step_macro``, ``evaluate``, and ``render_skill_controller`` so
+    # the discrete/continuous branch lives in exactly one place.
+    if continuous_skill:
+        def sample_skill(actor_params, obs, key):
+            means, log_stds = actor_net.apply(actor_params, obs)
+            z, _ = _gaussian_skill_and_log_prob(means, log_stds, key, keepdims=False)
+            return z
+
+        def skill_mode(actor_params, obs):
+            means, _ = actor_net.apply(actor_params, obs)
+            return means
+    else:
+        def sample_skill(actor_params, obs, key):
+            logits = actor_net.apply(actor_params, obs)
+            return jax.random.categorical(key, logits)
+
+        def skill_mode(actor_params, obs):
+            logits = actor_net.apply(actor_params, obs)
+            return jnp.argmax(logits, axis=-1).astype(jnp.int32)
 
     # ── Trajectory-preserving macro-step replay (mirrors the flat CRL buffer) ──
     # Raw macro-transitions (goals NOT relabeled, ``traj_id`` kept) are stored
@@ -365,9 +474,14 @@ def train_crl_skill_controller(
     # as the flat controller replay (controller_replay_size) with a floor that
     # guarantees the sampler always has a full window plus history.
     max_replay_rows = max(2 * macro_window + 1, self.controller_replay_size // num_envs)
+    dummy_skill = (
+        jnp.zeros((num_skills,), dtype=jnp.float32)
+        if continuous_skill
+        else jnp.zeros((), dtype=jnp.int32)
+    )
     dummy_macro_step = {
         "obs": jnp.zeros((obs_size,), dtype=jnp.float32),
-        "skill": jnp.zeros((), dtype=jnp.int32),
+        "skill": dummy_skill,
         "reward": jnp.zeros((), dtype=jnp.float32),
         "next_obs": jnp.zeros((obs_size,), dtype=jnp.float32),
         "done": jnp.zeros((), dtype=jnp.float32),
@@ -392,6 +506,7 @@ def train_crl_skill_controller(
         num_skills=num_skills, state_size=state_size,
         energy_fn_name=self.energy_fn, contrastive_loss_name=self.contrastive_loss_fn,
         logsumexp_penalty_coeff=self.logsumexp_penalty_coeff, target_entropy=target_entropy,
+        continuous=continuous_skill,
     )
 
     # ── Env stacks (identical to the SAC-discrete controller) ────────────────
@@ -465,8 +580,7 @@ def train_crl_skill_controller(
 
         controller_obs = env_state.obs  # [state, goal]
         traj_id = env_state.info["traj_id"]
-        logits = actor_net.apply(controller_state.actor_state.params, controller_obs)
-        z = jax.random.categorical(z_key, logits)  # stochastic during training
+        z = sample_skill(controller_state.actor_state.params, controller_obs, z_key)  # stochastic during training
 
         env_state, R, next_obs, done = rollout_macro_step(
             env_state, z, roll_key, skill_action_train
@@ -579,7 +693,7 @@ def train_crl_skill_controller(
     def training_epoch(controller_state, env_state, replay_state, key):
         def block_step(carry, _):
             cs, es, rs, k_ = carry
-            k_, collect_key, flatten_key, perm_key = jax.random.split(k_, 4)
+            k_, collect_key, flatten_key, perm_key, update_key = jax.random.split(k_, 5)
 
             es, block = collect_block(cs, es, collect_key)
             rs = replay_buffer.insert(rs, block)
@@ -599,7 +713,13 @@ def train_crl_skill_controller(
                 flat,
             )
 
-            cs, m = jax.lax.scan(lambda cs2, batch: _update(cs2, batch), cs, batched)
+            update_keys = jax.random.split(update_key, num_batches)
+
+            def scan_update(cs2, xs):
+                batch, uk = xs
+                return _update(cs2, batch, uk)
+
+            cs, m = jax.lax.scan(scan_update, cs, (batched, update_keys))
             cs = cs.replace(env_steps=cs.env_steps + num_envs * k * macro_window)
             m = jax.tree_util.tree_map(jnp.mean, m)
             m["macro_reward_mean"] = jnp.mean(block["reward"])
@@ -623,13 +743,16 @@ def train_crl_skill_controller(
         reset_keys = jax.random.split(key, num_eval_envs)
         state = e_env.reset(reset_keys)  # goal=None -> env's eval task goals
 
-        skill0 = jnp.zeros((num_eval_envs,), dtype=jnp.int32)
+        skill0 = (
+            jnp.zeros((num_eval_envs, num_skills), dtype=jnp.float32)
+            if continuous_skill
+            else jnp.zeros((num_eval_envs,), dtype=jnp.int32)
+        )
 
         def body(carry, i):
             state, skill = carry
             controller_obs = state.obs
-            logits = actor_net.apply(controller_state.actor_state.params, controller_obs)
-            new_skill = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+            new_skill = skill_mode(controller_state.actor_state.params, controller_obs)
             reselect = (i % k) == 0
             skill = jnp.where(reselect, new_skill, skill)
             a = skill_action_eval(state.obs[:, :state_size], skill, key)
@@ -653,23 +776,31 @@ def train_crl_skill_controller(
             out["eval/episode_success_any"] = float(np.mean(np.asarray(em["success"]) > 0.0))
         out["eval/avg_episode_length"] = float(np.mean(np.asarray(eval_metrics.episode_steps)))
 
-        # ── Skill-usage distribution (choices made at the reselection steps) ──
-        skills_np = np.asarray(skills)                 # (episode_length, num_eval_envs)
-        chosen = skills_np[0::k].reshape(-1).astype(int)  # i % k == 0 -> a skill choice
-        counts = np.bincount(chosen, minlength=num_skills).astype(np.float64)
-        fracs = counts / max(counts.sum(), 1.0)
-        nz = fracs > 0
-        out["eval/skill_entropy"] = float(-(fracs[nz] * np.log(fracs[nz])).sum())
-        out["eval/skill_max_frac"] = float(fracs.max())
-        out["eval/skill_active_count"] = float((counts > 0).sum())
-        # Route the histogram through the single per-step log_wandb call (via the
-        # reserved "_wandb_media" key) instead of a separate same-step wandb.log,
-        # which the live server would treat as a step collision and drop the
-        # scalar metrics logged afterward (zeros in wandb). See utils/env.py.
-        media = out.setdefault("_wandb_media", {})
-        media["eval/skill_usage_hist"] = wandb.Histogram(
-            np_histogram=(counts, np.arange(num_skills + 1) - 0.5)
-        )
+        if continuous_skill:
+            # ── Continuous skill usage: just log the per-dim std of choices made
+            # at the reselection steps (no discrete histogram/entropy applies).
+            skills_np = np.asarray(skills)              # (episode_length, num_eval_envs, K)
+            chosen = skills_np[0::k].reshape(-1, num_skills)
+            out["eval/skill_std_mean"] = float(np.mean(np.std(chosen, axis=0)))
+        else:
+            # ── Skill-usage distribution (choices made at the reselection steps) ──
+            skills_np = np.asarray(skills)                 # (episode_length, num_eval_envs)
+            chosen = skills_np[0::k].reshape(-1).astype(int)  # i % k == 0 -> a skill choice
+            counts = np.bincount(chosen, minlength=num_skills).astype(np.float64)
+            fracs = counts / max(counts.sum(), 1.0)
+            nz = fracs > 0
+            out["eval/skill_entropy"] = float(-(fracs[nz] * np.log(fracs[nz])).sum())
+            out["eval/skill_max_frac"] = float(fracs.max())
+            out["eval/skill_active_count"] = float((counts > 0).sum())
+            # Route the histogram through the single per-step log_wandb call (via
+            # the reserved "_wandb_media" key) instead of a separate same-step
+            # wandb.log, which the live server would treat as a step collision and
+            # drop the scalar metrics logged afterward (zeros in wandb). See
+            # utils/env.py.
+            media = out.setdefault("_wandb_media", {})
+            media["eval/skill_usage_hist"] = wandb.Histogram(
+                np_histogram=(counts, np.arange(num_skills + 1) - 0.5)
+            )
         return out
 
     # ── Render: faithful hierarchical rollout (controller + frozen skill) ────
@@ -683,8 +814,7 @@ def train_crl_skill_controller(
 
         @jax.jit
         def pick(obs_b):
-            logits = actor_net.apply(actor_params, obs_b)
-            return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+            return skill_mode(actor_params, obs_b)
 
         @jax.jit
         def act(state_b, skill_b, akey):
@@ -696,7 +826,11 @@ def train_crl_skill_controller(
         key, rk = jax.random.split(key)
         state = jit_reset(rk)
         rollout, xy_list, skill_list = [], [], []
-        skill = jnp.zeros((1,), dtype=jnp.int32)
+        skill = (
+            jnp.zeros((1, num_skills), dtype=jnp.float32)
+            if continuous_skill
+            else jnp.zeros((1,), dtype=jnp.int32)
+        )
         for i in range(episode_length):
             rollout.append(state.pipeline_state)
             obs_b = state.obs[None]
@@ -706,11 +840,10 @@ def train_crl_skill_controller(
             a = act(obs_b[:, :state_size], skill, ak)
             obs_np = np.asarray(state.obs)
             xy_list.append(obs_np[prim_idx])
-            skill_list.append(int(skill[0]))
+            skill_list.append(int(skill[0]) if not continuous_skill else np.asarray(skill[0]))
             state = jit_step(state, a[0])
 
         xy = np.stack(xy_list)
-        skills = np.asarray(skill_list)
         goal_xy = np.asarray(state.obs)[state_size:][:2]
 
         # (1) brax 3D HTML
@@ -721,18 +854,21 @@ def train_crl_skill_controller(
         except Exception as e:  # rendering must never crash training
             logging.warning("skill HTML render failed: %s", e)
 
-        # (2) skill-colored 2D trajectory
-        try:
-            fig = _plot_skill_colored_trajectory(
-                xy, skills, num_skills,
-                unwrapped_env.x_bounds, unwrapped_env.y_bounds,
-                goal_xy=goal_xy, title=f"skills over trajectory @ step {num_steps}",
-            )
-            media["render/skill_trajectory"] = wandb.Image(fig)
-            import matplotlib.pyplot as plt
-            plt.close(fig)
-        except Exception as e:
-            logging.warning("skill trajectory plot failed: %s", e)
+        # (2) skill-colored 2D trajectory (discrete skills only — the plot colors
+        # segments by a discrete skill index, which has no continuous analogue).
+        if not continuous_skill:
+            try:
+                skills = np.asarray(skill_list)
+                fig = _plot_skill_colored_trajectory(
+                    xy, skills, num_skills,
+                    unwrapped_env.x_bounds, unwrapped_env.y_bounds,
+                    goal_xy=goal_xy, title=f"skills over trajectory @ step {num_steps}",
+                )
+                media["render/skill_trajectory"] = wandb.Image(fig)
+                import matplotlib.pyplot as plt
+                plt.close(fig)
+            except Exception as e:
+                logging.warning("skill trajectory plot failed: %s", e)
         return media
 
     # ── Prefill ──────────────────────────────────────────────────────────────
@@ -748,8 +884,7 @@ def train_crl_skill_controller(
 
         def policy(obs, rng_key):
             obs_b = obs[None] if obs.ndim == 1 else obs
-            logits = actor_net.apply(actor_params, obs_b)
-            z = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+            z = skill_mode(actor_params, obs_b)
             a = skill_action_eval(obs_b[:, :state_size], z, rng_key)
             a = a[0] if obs.ndim == 1 else a
             return a, {}

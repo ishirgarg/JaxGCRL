@@ -191,6 +191,14 @@ class GoExploreSimple:
     skill_policy_run_dir: Optional[str] = None    # OGBench skill-agent checkpoint dir (flags.json + params_*.pkl)
     skill_policy_epoch: Optional[int] = None       # None -> latest
     num_skills: Optional[int] = None               # None -> infer from checkpoint config
+    # If True, the high-level controller's action space is a *continuous* skill
+    # vector (Gaussian actor, reparameterized SAC-style updates) instead of a
+    # discrete skill index. Requires a frozen low-level policy checkpoint whose
+    # ``policy(obs, z)`` submodule already accepts a continuous ``z`` directly
+    # (no one-hot encoding); DDS checkpoints (VQ codebook) are inherently
+    # discrete and are incompatible with continuous_skill=True.
+    continuous_skill: bool = False
+    skill_dim: Optional[int] = 8                    # continuous skill vector dim; None -> infer from checkpoint config
     # Skill-policy family, purely for wandb categorization. When set it is
     # ASSERTED against the checkpoint's flags.json agent_name (dds -> "dds",
     # empowerment -> "empowerment_skill") rather than derived from it; the config
@@ -205,6 +213,10 @@ class GoExploreSimple:
     controller_replay_size: int = 50000
 
     def check_config(self, config):
+        assert not self.continuous_skill or self.agent_type == "crl_skill", (
+            "continuous_skill=True is only supported for agent_type='crl_skill' "
+            "(the SAC-discrete controller is inherently discrete)."
+        )
         if self.agent_type in ("sac_discrete", "crl_skill"):
             assert self.skill_policy_run_dir is not None, (
                 f"agent_type='{self.agent_type}' requires skill_policy_run_dir (OGBench skill checkpoint)."
@@ -214,9 +226,18 @@ class GoExploreSimple:
                 "episode_length must be divisible by skill_commitment_k so macro-steps "
                 "tile the episode exactly."
             )
-            assert self.num_skills is None or self.num_skills > 1, (
-                "num_skills (if set) must be > 1 for a discrete controller."
-            )
+            if self.continuous_skill:
+                assert self.skill_dim is None or self.skill_dim > 0, (
+                    "skill_dim (if set) must be > 0 for a continuous controller."
+                )
+                assert self.skill_policy_type != "dds", (
+                    "continuous_skill=True is incompatible with skill_policy_type='dds' "
+                    "(DDS uses a discrete VQ codebook)."
+                )
+            else:
+                assert self.num_skills is None or self.num_skills > 1, (
+                    "num_skills (if set) must be > 1 for a discrete controller."
+                )
             assert self.skill_policy_type in (None, "dds", "empowerment"), (
                 f"skill_policy_type={self.skill_policy_type!r} must be one of "
                 "None, 'dds', 'empowerment'."
