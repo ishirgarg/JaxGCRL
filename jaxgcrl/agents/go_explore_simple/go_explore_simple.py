@@ -204,7 +204,7 @@ class GoExploreSimple:
     # empowerment -> "empowerment_skill") rather than derived from it; the config
     # value is what gets logged. None disables the check. Likewise num_skills
     # (when set) is asserted against the checkpoint and the config value is used.
-    skill_policy_type: Optional[str] = None        # {"dds", "empowerment"}
+    skill_policy_type: Optional[str] = None        # {"dds", "empowerment", "dads"}
     skill_commitment_k: int = 10                   # fixed open-loop temporal commitment
     use_full_skill_obs: bool = True                # full state row -> skill net (else override-index template)
     deterministic_skill_actions: bool = True       # frozen policy uses dist.mode() (vs sample)
@@ -238,9 +238,9 @@ class GoExploreSimple:
                 assert self.num_skills is None or self.num_skills > 1, (
                     "num_skills (if set) must be > 1 for a discrete controller."
                 )
-            assert self.skill_policy_type in (None, "dds", "empowerment"), (
+            assert self.skill_policy_type in (None, "dds", "empowerment", "dads"), (
                 f"skill_policy_type={self.skill_policy_type!r} must be one of "
-                "None, 'dds', 'empowerment'."
+                "None, 'dds', 'empowerment', 'dads'."
             )
             assert config.num_evals > 0, "num_evals must be > 0"
             if self.agent_type == "crl_skill":

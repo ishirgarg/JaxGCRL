@@ -150,7 +150,11 @@ def load_frozen_skill_policy(self, unwrapped_env, template_key):
 # Maps the human-facing ``skill_policy_type`` config value to the OGBench
 # ``agent_name`` recorded in the checkpoint's flags.json. Used to ASSERT the
 # configured type against the loaded checkpoint (never to derive it).
-_SKILL_POLICY_TYPE_TO_AGENT_NAME = {"dds": "dds", "empowerment": "empowerment_skill"}
+_SKILL_POLICY_TYPE_TO_AGENT_NAME = {
+    "dds": "dds",
+    "empowerment": "empowerment_skill",
+    "dads": "dads",
+}
 
 
 def _is_dds_agent(emp_agent) -> bool:
@@ -166,6 +170,23 @@ def _is_dds_agent(emp_agent) -> bool:
     except Exception:
         pass
     return "modules_codebook" in emp_agent.network.params
+
+
+def _is_dads_agent(emp_agent) -> bool:
+    """Whether ``emp_agent`` is a DADS ("Dynamics-Aware Discovery of Skills") checkpoint.
+
+    DADS (OGBench's offline variant, ``impls/agents/dads.py``) names its
+    skill-conditioned policy submodule ``actor`` (signature ``actor(obs,
+    skills_onehot)``, same shape contract as ``empowerment_skill``'s
+    ``policy``) rather than ``policy``, so it needs the module name swapped in
+    ``make_skill_action_fn`` but otherwise reuses the default adapter.
+    """
+    try:
+        if str(emp_agent.config.get("agent_name", "")) == "dads":
+            return True
+    except Exception:
+        pass
+    return "modules_actor" in emp_agent.network.params and "modules_skill_dynamics" in emp_agent.network.params
 
 
 def _make_dds_skill_action_fn(emp_agent, skill_obs_builder, *, deterministic):
@@ -208,12 +229,14 @@ def make_skill_action_fn(
     ``empowerment_skill``), the skill is fed directly to that policy: one-hot
     encoded when ``continuous=False`` (discrete skill index in
     ``[0, num_skills)``), or passed through as a raw continuous vector of
-    dimension ``num_skills`` when ``continuous=True``. For DDS checkpoints the
-    discrete index instead selects a VQ codebook embedding decoded into an
-    action (see ``_make_dds_skill_action_fn``); DDS is inherently discrete and
-    is not supported when ``continuous=True``. The frozen ``emp_agent`` params
-    are captured by closure (no gradient ever flows into them) — identical
-    pattern to ``make_offline_empowerment_scorer``.
+    dimension ``num_skills`` when ``continuous=True``. DADS checkpoints use the
+    same ``(obs, skills_onehot) -> dist`` contract but name the submodule
+    ``actor`` instead of ``policy``. For DDS checkpoints the discrete index
+    instead selects a VQ codebook embedding decoded into an action (see
+    ``_make_dds_skill_action_fn``); DDS is inherently discrete and is not
+    supported when ``continuous=True``. The frozen ``emp_agent`` params are
+    captured by closure (no gradient ever flows into them) — identical pattern
+    to ``make_offline_empowerment_scorer``.
     """
     if _is_dds_agent(emp_agent):
         if continuous:
@@ -225,10 +248,12 @@ def make_skill_action_fn(
             emp_agent, skill_obs_builder, deterministic=deterministic
         )
 
+    policy_module = "actor" if _is_dads_agent(emp_agent) else "policy"
+
     def skill_action_fn(states: jnp.ndarray, skill: jnp.ndarray, key: jax.Array):
         emp_obs = skill_obs_builder(states)                  # OGBench-mapped state
         z = skill if continuous else jax.nn.one_hot(skill, num_skills)
-        dist = emp_agent.network.select("policy")(emp_obs, z)
+        dist = emp_agent.network.select(policy_module)(emp_obs, z)
         a = dist.mode() if deterministic else dist.sample(seed=key)
         return jnp.clip(a, -1.0, 1.0)
 
