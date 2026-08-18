@@ -7,12 +7,15 @@ maximize task reward, with fixed temporal commitment ``k``.
 
 See ``SKILL_CONTROLLER_DESIGN.md`` for the full spec. Key pieces:
   - ``load_frozen_skill_policy`` / ``make_skill_action_fn``: a generic adapter over
-    any OGBench skill-conditioned agent. Two skill parameterizations are
+    any OGBench skill-conditioned agent. Three skill parameterizations are
     supported: (1) agents with a policy submodule of signature
-    ``policy(obs, skills_onehot)`` (e.g. ``empowerment_skill``), and (2) DDS
+    ``policy(obs, skills_onehot)`` (e.g. ``empowerment_skill``), (2) DDS
     (``dds``, "Discrete Diffusion Skills"), whose discrete skill index selects a
     VQ codebook embedding that a diffusion/categorical decoder turns into an
-    action. In both cases the controller selects a discrete skill in
+    action, and (3) ``dads`` — OGBench's ``opal`` agent trained with
+    ``config["latent_type"]="discrete"``, whose discrete skill index is
+    one-hot encoded and concatenated onto the obs before a single ``decoder``
+    call. In all cases the controller selects a discrete skill in
     ``[0, num_skills)`` and gets back a low-level action.
   - ``rollout_macro_step``: a ``lax.scan`` over ``k`` env steps under one fixed
     per-env skill, producing one SMDP macro-transition ``(s_t, z, R, s_{t+k}, done)``.
@@ -143,17 +146,33 @@ def load_frozen_skill_policy(self, unwrapped_env, template_key):
                 f"agent_name={expected_agent_name!r}, but the loaded skill "
                 f"checkpoint has agent_name={ckpt_agent_name!r}; they must match."
             )
+        # "dads" and OPAL's continuous VAE path share agent_name="opal"; the
+        # only thing distinguishing them is config["latent_type"]. Assert it
+        # explicitly so skill_policy_type="dads" can never silently load a
+        # continuous-latent OPAL checkpoint (whose "decoder" submodule expects
+        # a Gaussian skill_dim vector, not a one-hot over num_skills).
+        if skill_policy_type == "dads":
+            ckpt_latent_type = str(emp_agent.config.get("latent_type", ""))
+            if ckpt_latent_type != "discrete":
+                raise ValueError(
+                    "skill_policy_type='dads' expects checkpoint "
+                    f"config['latent_type']='discrete', but the loaded checkpoint has "
+                    f"latent_type={ckpt_latent_type!r}; they must match."
+                )
 
     return emp_agent, num_skills, skill_obs_builder
 
 
 # Maps the human-facing ``skill_policy_type`` config value to the OGBench
 # ``agent_name`` recorded in the checkpoint's flags.json. Used to ASSERT the
-# configured type against the loaded checkpoint (never to derive it).
+# configured type against the loaded checkpoint (never to derive it). "dads"
+# and OPAL's own continuous VAE variant share agent_name="opal" — see the
+# config["latent_type"] assert in ``load_frozen_skill_policy`` and
+# ``_is_dads_agent`` below for how they're actually told apart.
 _SKILL_POLICY_TYPE_TO_AGENT_NAME = {
     "dds": "dds",
     "empowerment": "empowerment_skill",
-    "dads": "dads",
+    "dads": "opal",
 }
 
 
@@ -173,20 +192,28 @@ def _is_dds_agent(emp_agent) -> bool:
 
 
 def _is_dads_agent(emp_agent) -> bool:
-    """Whether ``emp_agent`` is a DADS ("Dynamics-Aware Discovery of Skills") checkpoint.
+    """Whether ``emp_agent`` is a "dads" checkpoint: OGBench's ``opal`` agent
+    (``impls/agents/opal.py``) trained with ``config["latent_type"]="discrete"``
+    (the paper's Appendix F offline-DADS path — EM-clustered discrete skills +
+    BC), as opposed to OPAL's own default continuous VAE latent (also
+    ``agent_name="opal"``, ``latent_type="continuous"``).
 
-    DADS (OGBench's offline variant, ``impls/agents/dads.py``) names its
-    skill-conditioned policy submodule ``actor`` (signature ``actor(obs,
-    skills_onehot)``, same shape contract as ``empowerment_skill``'s
-    ``policy``) rather than ``policy``, so it needs the module name swapped in
-    ``make_skill_action_fn`` but otherwise reuses the default adapter.
+    The discrete path has no ``policy(obs, skills_onehot)`` or ``actor(obs,
+    skills_onehot)`` submodule; its skill-conditioned policy is a ``decoder``
+    submodule called with a SINGLE concatenated ``[obs, skill_onehot]`` array
+    (not two separate args), so it needs the
+    ``_make_dads_skill_action_fn`` adapter instead of the default one.
     """
     try:
-        if str(emp_agent.config.get("agent_name", "")) == "dads":
+        if (
+            str(emp_agent.config.get("agent_name", "")) == "opal"
+            and str(emp_agent.config.get("latent_type", "")) == "discrete"
+        ):
             return True
     except Exception:
         pass
-    return "modules_actor" in emp_agent.network.params and "modules_skill_dynamics" in emp_agent.network.params
+    params = emp_agent.network.params
+    return "modules_skill_prior" in params and "modules_traj_model" in params
 
 
 def _make_dds_skill_action_fn(emp_agent, skill_obs_builder, *, deterministic):
@@ -219,6 +246,30 @@ def _make_dds_skill_action_fn(emp_agent, skill_obs_builder, *, deterministic):
     return skill_action_fn
 
 
+def _make_dads_skill_action_fn(emp_agent, skill_obs_builder, num_skills, *, deterministic):
+    """Adapter for a frozen "dads" checkpoint (OPAL, ``latent_type="discrete"``).
+
+    The discrete-latent ``decoder`` submodule takes a SINGLE concatenated
+    ``[obs, skill_onehot]`` array (not two separate args like
+    ``empowerment_skill``'s ``policy``), so the discrete skill index is
+    one-hot encoded over ``num_skills`` and concatenated onto the mapped obs
+    before the call. Inherently discrete (the skill prior is a categorical
+    over ``num_skills`` and the decoder is only ever trained on one-hot
+    skills) — there is no continuous-skill variant. The frozen ``emp_agent``
+    params are captured by closure (no gradient ever flows into them).
+    """
+
+    def skill_action_fn(states: jnp.ndarray, skill_indices: jnp.ndarray, key: jax.Array):
+        emp_obs = skill_obs_builder(states)                  # OGBench-mapped state
+        z = jax.nn.one_hot(skill_indices, num_skills)
+        sz = jnp.concatenate([emp_obs, z], axis=-1)
+        dist = emp_agent.network.select("decoder")(sz)
+        a = dist.mode() if deterministic else dist.sample(seed=key)
+        return jnp.clip(a, -1.0, 1.0)
+
+    return skill_action_fn
+
+
 def make_skill_action_fn(
     emp_agent, skill_obs_builder, num_skills, *, deterministic, continuous=False
 ):
@@ -229,14 +280,15 @@ def make_skill_action_fn(
     ``empowerment_skill``), the skill is fed directly to that policy: one-hot
     encoded when ``continuous=False`` (discrete skill index in
     ``[0, num_skills)``), or passed through as a raw continuous vector of
-    dimension ``num_skills`` when ``continuous=True``. DADS checkpoints use the
-    same ``(obs, skills_onehot) -> dist`` contract but name the submodule
-    ``actor`` instead of ``policy``. For DDS checkpoints the discrete index
-    instead selects a VQ codebook embedding decoded into an action (see
-    ``_make_dds_skill_action_fn``); DDS is inherently discrete and is not
-    supported when ``continuous=True``. The frozen ``emp_agent`` params are
-    captured by closure (no gradient ever flows into them) — identical pattern
-    to ``make_offline_empowerment_scorer``.
+    dimension ``num_skills`` when ``continuous=True``. For DDS checkpoints the
+    discrete index instead selects a VQ codebook embedding decoded into an
+    action (see ``_make_dds_skill_action_fn``); DDS is inherently discrete and
+    is not supported when ``continuous=True``. "dads" checkpoints (OPAL,
+    discrete latent) instead concatenate a one-hot skill onto the obs and call
+    a single ``decoder`` submodule (see ``_make_dads_skill_action_fn``); also
+    inherently discrete. The frozen ``emp_agent`` params are captured by
+    closure (no gradient ever flows into them) — identical pattern to
+    ``make_offline_empowerment_scorer``.
     """
     if _is_dds_agent(emp_agent):
         if continuous:
@@ -248,12 +300,20 @@ def make_skill_action_fn(
             emp_agent, skill_obs_builder, deterministic=deterministic
         )
 
-    policy_module = "actor" if _is_dads_agent(emp_agent) else "policy"
+    if _is_dads_agent(emp_agent):
+        if continuous:
+            raise ValueError(
+                "continuous_skill=True is incompatible with a 'dads' skill checkpoint "
+                "(its skill prior/decoder are trained only on one-hot discrete skills)."
+            )
+        return _make_dads_skill_action_fn(
+            emp_agent, skill_obs_builder, num_skills, deterministic=deterministic
+        )
 
     def skill_action_fn(states: jnp.ndarray, skill: jnp.ndarray, key: jax.Array):
         emp_obs = skill_obs_builder(states)                  # OGBench-mapped state
         z = skill if continuous else jax.nn.one_hot(skill, num_skills)
-        dist = emp_agent.network.select(policy_module)(emp_obs, z)
+        dist = emp_agent.network.select("policy")(emp_obs, z)
         a = dist.mode() if deterministic else dist.sample(seed=key)
         return jnp.clip(a, -1.0, 1.0)
 

@@ -8,9 +8,12 @@
 #SBATCH --time=120:00:00
 #SBATCH --array=0-3
 
-# CRL (contrastive) hierarchical skill controller over frozen DADS ("Dynamics-
-# Aware Discovery of Skills", OGBench's offline variant, impls/agents/dads.py)
-# skill-conditioned checkpoints, on four OGBench env variants:
+# CRL (contrastive) hierarchical skill controller over frozen "dads" checkpoints
+# — OGBench's ``opal`` agent (impls/agents/opal.py, agent_name="opal") trained
+# with config["latent_type"]="discrete" (the OPAL paper's Appendix F
+# offline-DADS path: EM-clustered discrete skills + BC), NOT a separate "dads"
+# agent class or OGBench's earlier impls/agents/dads.py (unused here) — on four
+# OGBench env variants:
 #     0. ant_maze_ogbench_medium_navigate            (antmaze, medium)
 #     1. ant_maze_ogbench_medium_stitch              (same maze, stitch ckpt)
 #     2. ant_ball_4d_ogbench_arena_1g_scale2         (antsoccer, scale2 arena)
@@ -35,9 +38,9 @@
 #       antsoccer: episode_length 1000 (1000 % 20 == 0)
 #   * --num_skills and --skill_policy_type dads are passed explicitly per
 #     checkpoint and asserted against the checkpoint's flags.json (num_skills
-#     vs the ckpt config, skill_policy_type=dads -> agent_name=dads); the
-#     config values are what gets logged to wandb, so runs can be categorized
-#     by type + skills.
+#     vs the ckpt config; skill_policy_type=dads -> agent_name=opal AND
+#     config["latent_type"]=discrete, both asserted); the config values are
+#     what gets logged to wandb, so runs can be categorized by type + skills.
 #   * --controller_target_entropy_scale 0.25 (H_bar = 0.25*log(num_skills)).
 #   * CRL hyperparameters (contrastive critic) are passed explicitly:
 #     --energy_fn, --contrastive_loss_fn, --logsumexp_penalty_coeff, --repr_dim.

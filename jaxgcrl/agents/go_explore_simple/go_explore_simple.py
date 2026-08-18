@@ -230,9 +230,10 @@ class GoExploreSimple:
                 assert self.skill_dim is None or self.skill_dim > 0, (
                     "skill_dim (if set) must be > 0 for a continuous controller."
                 )
-                assert self.skill_policy_type != "dds", (
+                assert self.skill_policy_type not in ("dds", "dads"), (
                     "continuous_skill=True is incompatible with skill_policy_type='dds' "
-                    "(DDS uses a discrete VQ codebook)."
+                    "(DDS uses a discrete VQ codebook) or 'dads' (its skill prior/decoder "
+                    "are trained only on one-hot discrete skills)."
                 )
             else:
                 assert self.num_skills is None or self.num_skills > 1, (
