@@ -32,12 +32,13 @@
 #     contrastive critic consumes the skill vector directly (no one-hot). The
 #     frozen low-level policy is OPAL's ``decoder`` submodule, called on a
 #     single concatenated [obs, z].
-#   * --skill_dim 10 replaces --num_skills. It is ASSERTED against the
-#     checkpoint's flags.json config["skill_dim"] (a mismatch aborts before
-#     training), and skill_policy_type=opal asserts agent_name="opal" AND
-#     config["latent_type"]="continuous". NOTE: the local copy of
-#     run_opal_sweep.sh shows --agent.skill_dim=8; if these checkpoints predate
-#     the bump to 10, the run will fail loudly on the assert — set SKILL_DIM=8.
+#   * --skill_dim 8 replaces --num_skills. 8 is what these checkpoints were
+#     trained with (run_opal_sweep.sh --agent.skill_dim=8, which is also
+#     opal.py's default). It is ASSERTED against the checkpoint's flags.json
+#     config["skill_dim"] (a mismatch aborts before training), and
+#     skill_policy_type=opal asserts agent_name="opal" AND
+#     config["latent_type"]="continuous". The pre-check below reads the value
+#     out of flags.json and aborts in ~1s if it disagrees.
 #   * --use_skill_prior_kl: the controller's max-entropy bonus is REPLACED by
 #     SPiRL's skill-prior divergence (Pertsch, Lee & Lim, CoRL 2020, §3.3).
 #     Max-ent RL regularizes toward a uniform reference; this swaps that
@@ -50,10 +51,11 @@
 #   * --skill_prior_target_kl sweeps δ, the target divergence that supersedes
 #     the target entropy H̄ in the auto-tuned α (an UPPER bound where the
 #     entropy constraint is a lower bound, so KL > δ drives α up). δ is in nats
-#     SUMMED over latent dims, hence tied to skill_dim=10 here. SPiRL used δ=1
+#     SUMMED over latent dims, hence tied to skill_dim=8 here. SPiRL used δ=1
 #     (maze navigation) and δ=5 (block stacking, kitchen) at |Z|=10; this sweep
-#     brackets both. --controller_target_entropy_scale is therefore unused and
-#     not passed.
+#     brackets both, though at |Z|=8 those reference values do not transfer
+#     exactly — the same δ is a tighter constraint per dimension here.
+#     --controller_target_entropy_scale is therefore unused and not passed.
 #
 # k is SWEPT over {10, 20}; seed 0, same CRL critic hyperparameters and step
 # budget as the DADS sweep.
@@ -117,7 +119,7 @@ CKPTS=(
 EP_LENS=(2000 2000 1000 1000)
 SHORT=(am_medium am_medium_st asoc_ar1g_s2 asoc_ar1g_s2_st)
 
-# ── Target divergence δ sweep (nats summed over the 10 latent dims) ─────────
+# ── Target divergence δ sweep (nats summed over the 8 latent dims) ──────────
 DELTAS=(1 5 10 20)
 
 # ── Skill commitment k sweep (env steps one skill is held for) ──────────────
@@ -126,7 +128,7 @@ KS=(10 20)
 
 SEED=0
 STYPE=opal
-SKILL_DIM=10
+SKILL_DIM=8
 
 # ── CRL (contrastive critic) hyperparameters ────────────────────────────────
 ENERGY_FN=norm
@@ -186,7 +188,7 @@ fi
 if [ "$CKPT_SKILL_DIM" != "$SKILL_DIM" ]; then
   echo "ERROR: SKILL_DIM=$SKILL_DIM but $SKILL_DIR was trained with skill_dim=$CKPT_SKILL_DIM." >&2
   echo "       Set SKILL_DIM=$CKPT_SKILL_DIM above, and note that the DELTAS grid is in nats" >&2
-  echo "       SUMMED over latent dims, so it is tied to |Z|=$CKPT_SKILL_DIM rather than 10." >&2
+  echo "       SUMMED over latent dims, so it is tied to |Z|=$CKPT_SKILL_DIM rather than $SKILL_DIM." >&2
   exit 1
 fi
 
