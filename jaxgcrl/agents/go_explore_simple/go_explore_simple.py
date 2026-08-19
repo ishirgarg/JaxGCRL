@@ -204,7 +204,22 @@ class GoExploreSimple:
     # empowerment -> "empowerment_skill") rather than derived from it; the config
     # value is what gets logged. None disables the check. Likewise num_skills
     # (when set) is asserted against the checkpoint and the config value is used.
-    skill_policy_type: Optional[str] = None        # {"dds", "empowerment", "dads"}
+    skill_policy_type: Optional[str] = None        # {"dds", "empowerment", "dads", "opal"}
+
+    # ── SPiRL skill-prior KL (replaces the controller's entropy bonus) ──────
+    # When True the high-level controller's max-entropy bonus is replaced by
+    # −D_KL(π(z|s) ‖ p_a(z|s)) against the frozen state-conditioned Gaussian
+    # skill prior that ships with the low-level checkpoint (Pertsch, Lee & Lim,
+    # CoRL 2020, §3.3), and the target entropy is replaced by the target
+    # divergence below. Continuous skills only (the prior is a diagonal
+    # Gaussian over the skill latent), and only continuous-latent OPAL
+    # checkpoints expose such a prior.
+    use_skill_prior_kl: bool = False
+    # δ, the target divergence for the auto-tuned α. Required (no default) when
+    # use_skill_prior_kl=True: δ is in nats SUMMED over latent dimensions, so it
+    # is tied to skill_dim and does not transfer across latent sizes. SPiRL used
+    # δ=1 (maze navigation) and δ=5 (block stacking, kitchen) at |Z|=10.
+    skill_prior_target_kl: Optional[float] = None
     skill_commitment_k: int = 10                   # fixed open-loop temporal commitment
     use_full_skill_obs: bool = True                # full state row -> skill net (else override-index template)
     deterministic_skill_actions: bool = True       # frozen policy uses dist.mode() (vs sample)
@@ -216,6 +231,13 @@ class GoExploreSimple:
         assert not self.continuous_skill or self.agent_type == "crl_skill", (
             "continuous_skill=True is only supported for agent_type='crl_skill' "
             "(the SAC-discrete controller is inherently discrete)."
+        )
+        assert not self.use_skill_prior_kl or (
+            self.agent_type == "crl_skill" and self.continuous_skill
+        ), (
+            "use_skill_prior_kl=True requires agent_type='crl_skill' with "
+            "continuous_skill=True (the skill prior is a diagonal Gaussian over a "
+            "continuous skill latent)."
         )
         if self.agent_type in ("sac_discrete", "crl_skill"):
             assert self.skill_policy_run_dir is not None, (
@@ -235,13 +257,35 @@ class GoExploreSimple:
                     "(DDS uses a discrete VQ codebook) or 'dads' (its skill prior/decoder "
                     "are trained only on one-hot discrete skills)."
                 )
+                if self.use_skill_prior_kl:
+                    assert (
+                        self.skill_prior_target_kl is not None
+                        and self.skill_prior_target_kl > 0
+                    ), (
+                        "use_skill_prior_kl=True requires skill_prior_target_kl (δ) > 0. "
+                        "δ is in nats summed over latent dims, so it scales with "
+                        "skill_dim and must be set explicitly."
+                    )
+                    assert self.skill_policy_type in (None, "opal"), (
+                        "use_skill_prior_kl=True requires a continuous-latent OPAL "
+                        "skill checkpoint (skill_policy_type='opal'); no other "
+                        "supported checkpoint family ships a state-conditioned "
+                        "Gaussian skill prior."
+                    )
             else:
+                assert self.skill_policy_type != "opal", (
+                    "skill_policy_type='opal' (continuous-latent OPAL) requires "
+                    "agent_type='crl_skill' with continuous_skill=True; its decoder is "
+                    "trained only on Gaussian skill_dim latents, never on one-hot skills."
+                )
                 assert self.num_skills is None or self.num_skills > 1, (
                     "num_skills (if set) must be > 1 for a discrete controller."
                 )
-            assert self.skill_policy_type in (None, "dds", "empowerment", "dads"), (
+            assert self.skill_policy_type in (
+                None, "dds", "empowerment", "dads", "opal"
+            ), (
                 f"skill_policy_type={self.skill_policy_type!r} must be one of "
-                "None, 'dds', 'empowerment', 'dads'."
+                "None, 'dds', 'empowerment', 'dads', 'opal'."
             )
             assert config.num_evals > 0, "num_evals must be > 0"
             if self.agent_type == "crl_skill":

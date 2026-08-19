@@ -82,7 +82,7 @@ NUM_SKILLS=(15 15 15 15)
 EP_LENS=(2000 2000 1000 1000)
 SHORT=(am_medium am_medium_st asoc_ar1g_s2 asoc_ar1g_s2_st)
 
-K=20
+K=10
 ENT=0.25
 SEED=0
 STYPE=dads

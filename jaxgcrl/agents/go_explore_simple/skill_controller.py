@@ -150,14 +150,16 @@ def load_frozen_skill_policy(self, unwrapped_env, template_key):
         # only thing distinguishing them is config["latent_type"]. Assert it
         # explicitly so skill_policy_type="dads" can never silently load a
         # continuous-latent OPAL checkpoint (whose "decoder" submodule expects
-        # a Gaussian skill_dim vector, not a one-hot over num_skills).
-        if skill_policy_type == "dads":
+        # a Gaussian skill_dim vector, not a one-hot over num_skills), nor
+        # skill_policy_type="opal" a discrete-latent one.
+        expected_latent_type = _SKILL_POLICY_TYPE_TO_LATENT_TYPE.get(skill_policy_type)
+        if expected_latent_type is not None:
             ckpt_latent_type = str(emp_agent.config.get("latent_type", ""))
-            if ckpt_latent_type != "discrete":
+            if ckpt_latent_type != expected_latent_type:
                 raise ValueError(
-                    "skill_policy_type='dads' expects checkpoint "
-                    f"config['latent_type']='discrete', but the loaded checkpoint has "
-                    f"latent_type={ckpt_latent_type!r}; they must match."
+                    f"skill_policy_type={skill_policy_type!r} expects checkpoint "
+                    f"config['latent_type']={expected_latent_type!r}, but the loaded "
+                    f"checkpoint has latent_type={ckpt_latent_type!r}; they must match."
                 )
 
     return emp_agent, num_skills, skill_obs_builder
@@ -168,11 +170,22 @@ def load_frozen_skill_policy(self, unwrapped_env, template_key):
 # configured type against the loaded checkpoint (never to derive it). "dads"
 # and OPAL's own continuous VAE variant share agent_name="opal" — see the
 # config["latent_type"] assert in ``load_frozen_skill_policy`` and
-# ``_is_dads_agent`` below for how they're actually told apart.
+# ``_is_dads_agent`` / ``_is_opal_continuous_agent`` below for how they're
+# actually told apart.
 _SKILL_POLICY_TYPE_TO_AGENT_NAME = {
     "dds": "dds",
     "empowerment": "empowerment_skill",
     "dads": "opal",
+    "opal": "opal",
+}
+
+# ``skill_policy_type`` values that pin a specific OPAL ``config["latent_type"]``.
+# Both map to agent_name="opal"; only latent_type separates them, and picking
+# the wrong one silently feeds a one-hot to a decoder expecting a Gaussian
+# skill vector (or vice versa).
+_SKILL_POLICY_TYPE_TO_LATENT_TYPE = {
+    "dads": "discrete",
+    "opal": "continuous",
 }
 
 
@@ -214,6 +227,104 @@ def _is_dads_agent(emp_agent) -> bool:
         pass
     params = emp_agent.network.params
     return "modules_skill_prior" in params and "modules_traj_model" in params
+
+
+def _is_opal_continuous_agent(emp_agent) -> bool:
+    """Whether ``emp_agent`` is a continuous-latent OPAL checkpoint.
+
+    OGBench's ``opal`` agent (``impls/agents/opal.py``) trained with
+    ``config["latent_type"]="continuous"`` — the VAE path: a BiGRU posterior
+    ``encoder`` q(z|tau), a state-conditioned Gaussian ``prior`` p(z|s_1), and a
+    Gaussian ``decoder`` pi(a|s,z). This is the SPiRL/OPAL skill structure, and
+    the only checkpoint family here that ships a *continuous* skill latent
+    together with a *state-conditioned Gaussian prior* over it.
+
+    Distinguished from the discrete Appendix-F path (``_is_dads_agent``, also
+    ``agent_name="opal"``) purely by ``config["latent_type"]``; the module
+    layouts also differ (``prior``/``encoder``/``decoder`` here vs
+    ``skill_prior``/``traj_model``/``decoder`` there).
+
+    Decided on ``agent_name``/``latent_type`` alone, with no fallback to sniffing
+    the module layout: ``quest`` exposes exactly the same encoder/prior/decoder
+    keys, but with a ``decoder`` over code tensors and a three-argument
+    ``prior``, so a layout sniff would mis-route it into OPAL's adapters. Both
+    config keys are always present — ``load_offline_empowerment_agent`` looks the
+    checkpoint's ``agent_name`` up in the agent registry before we ever get here,
+    and ``latent_type`` is asserted by OPAL's own constructor.
+    """
+    return (
+        str(emp_agent.config.get("agent_name", "")) == "opal"
+        and str(emp_agent.config.get("latent_type", "")) == "continuous"
+    )
+
+
+def _make_opal_continuous_skill_action_fn(emp_agent, skill_obs_builder, *, deterministic):
+    """Adapter for a frozen continuous-latent OPAL checkpoint.
+
+    Its low-level controller is the ``decoder`` submodule, called with a SINGLE
+    concatenated ``[obs, z]`` array (like the discrete "dads" path, but with the
+    raw ``skill_dim`` Gaussian latent in place of the one-hot) — not the two-arg
+    ``policy(obs, z)`` signature ``empowerment_skill`` uses. The frozen
+    ``emp_agent`` params are captured by closure (no gradient ever flows into
+    them).
+    """
+
+    def skill_action_fn(states: jnp.ndarray, skills: jnp.ndarray, key: jax.Array):
+        emp_obs = skill_obs_builder(states)                  # OGBench-mapped state
+        sz = jnp.concatenate([emp_obs, skills], axis=-1)
+        dist = emp_agent.network.select("decoder")(sz)
+        a = dist.mode() if deterministic else dist.sample(seed=key)
+        return jnp.clip(a, -1.0, 1.0)
+
+    return skill_action_fn
+
+
+def make_skill_prior_fn(emp_agent, skill_obs_builder, *, skill_dim, state_size):
+    """Frozen state-conditioned Gaussian skill prior ``p_a(z|s)``.
+
+    Returns ``prior_fn(states) -> (mean, log_std)``, both ``(B, skill_dim)``, for
+    the SPiRL skill-prior KL that replaces the entropy bonus (see
+    ``crl_skill_controller``). Only continuous-latent OPAL checkpoints are
+    supported: their ``prior`` submodule is a diagonal-Gaussian MLP head over the
+    skill latent, so the divergence has a closed form.
+
+    The returned means/log-stds are ``stop_gradient``-ed: the prior is frozen, so
+    it must contribute no gradient even though the controller's actor loss
+    differentiates the KL that consumes them.
+    """
+    if not _is_opal_continuous_agent(emp_agent):
+        try:
+            found = (
+                f"agent_name={str(emp_agent.config.get('agent_name', ''))!r}, "
+                f"latent_type={str(emp_agent.config.get('latent_type', ''))!r}"
+            )
+        except Exception:  # never let describing the checkpoint mask the real error
+            found = "checkpoint config unreadable"
+        raise ValueError(
+            "use_skill_prior_kl=True requires a frozen skill checkpoint exposing a "
+            "state-conditioned diagonal-Gaussian skill prior p(z|s); only "
+            "continuous-latent OPAL checkpoints (agent_name='opal', "
+            f"latent_type='continuous') provide one. Loaded checkpoint: {found}."
+        )
+
+    def prior_fn(states: jnp.ndarray):
+        emp_obs = skill_obs_builder(states)                  # OGBench-mapped state
+        dist = emp_agent.network.select("prior")(emp_obs)    # MultivariateNormalDiag
+        mean = jax.lax.stop_gradient(dist.loc)
+        log_std = jax.lax.stop_gradient(jnp.log(dist.scale_diag))
+        return mean, log_std
+
+    # Probe once (eagerly, outside any jit) so a skill_dim mismatch between the
+    # controller's action space and the prior surfaces here rather than as an
+    # opaque broadcasting bug inside the KL.
+    probe_mean, probe_log_std = prior_fn(jnp.zeros((1, state_size), dtype=jnp.float32))
+    if probe_mean.shape != (1, skill_dim) or probe_log_std.shape != (1, skill_dim):
+        raise ValueError(
+            f"Skill prior emits shape {tuple(probe_mean.shape)}, expected "
+            f"(1, {skill_dim}); the frozen prior's latent dimensionality must "
+            "match the controller's continuous skill dimensionality."
+        )
+    return prior_fn
 
 
 def _make_dds_skill_action_fn(emp_agent, skill_obs_builder, *, deterministic):
@@ -286,9 +397,12 @@ def make_skill_action_fn(
     is not supported when ``continuous=True``. "dads" checkpoints (OPAL,
     discrete latent) instead concatenate a one-hot skill onto the obs and call
     a single ``decoder`` submodule (see ``_make_dads_skill_action_fn``); also
-    inherently discrete. The frozen ``emp_agent`` params are captured by
-    closure (no gradient ever flows into them) — identical pattern to
-    ``make_offline_empowerment_scorer``.
+    inherently discrete. Continuous-latent OPAL checkpoints concatenate the raw
+    Gaussian skill vector onto the obs and call the same ``decoder`` submodule
+    (see ``_make_opal_continuous_skill_action_fn``); those are inherently
+    continuous and require ``continuous=True``. The frozen ``emp_agent`` params
+    are captured by closure (no gradient ever flows into them) — identical
+    pattern to ``make_offline_empowerment_scorer``.
     """
     if _is_dds_agent(emp_agent):
         if continuous:
@@ -308,6 +422,17 @@ def make_skill_action_fn(
             )
         return _make_dads_skill_action_fn(
             emp_agent, skill_obs_builder, num_skills, deterministic=deterministic
+        )
+
+    if _is_opal_continuous_agent(emp_agent):
+        if not continuous:
+            raise ValueError(
+                "A continuous-latent OPAL skill checkpoint requires continuous_skill=True "
+                "(its decoder is trained only on Gaussian skill_dim latents, never on "
+                "one-hot skills)."
+            )
+        return _make_opal_continuous_skill_action_fn(
+            emp_agent, skill_obs_builder, deterministic=deterministic
         )
 
     def skill_action_fn(states: jnp.ndarray, skill: jnp.ndarray, key: jax.Array):

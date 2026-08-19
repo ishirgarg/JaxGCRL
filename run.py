@@ -117,7 +117,14 @@ def main(config: Config):
         "training/controller_alpha",
         "training/controller_alpha_loss",
         "training/controller_entropy",
+        # The controller emits exactly ONE of these constraint pairs: the
+        # target entropy under the max-ent objective, or the skill-prior
+        # divergence + its target δ under use_skill_prior_kl. The unused half is
+        # backfilled with 0 by ensure_metric, so read whichever pair the run's
+        # objective actually optimizes.
         "training/controller_target_entropy",
+        "training/controller_prior_kl",
+        "training/controller_target_kl",
         "training/controller_reward_mean",
         "training/controller_done_mean",
         "training/macro_reward_mean",

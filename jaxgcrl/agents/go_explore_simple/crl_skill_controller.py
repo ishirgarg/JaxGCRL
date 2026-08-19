@@ -67,6 +67,18 @@ exact enumeration over one-hot skills. Everything else — the SMDP macro-step
 plumbing, the trajectory replay + future-goal positive sampling, the eval loop
 — is unchanged; ``self.skill_dim`` (analogous to ``num_skills``) sets the
 continuous skill dimensionality.
+
+With ``self.use_skill_prior_kl`` (continuous only) the max-entropy bonus is
+replaced by SPiRL's skill-prior divergence (Pertsch, Lee & Lim, CoRL 2020, §3.3):
+max-ent RL regularizes toward a *uniform* reference, and this swaps that
+reference for the frozen state-conditioned prior ``p_a(z|s)`` shipped with the
+low-level checkpoint. ``H(π) → −D_KL(π(·|s) ‖ p_a(·|s))`` in the actor
+objective, and the target entropy ``H̄`` becomes a target divergence ``δ``
+(``self.skill_prior_target_kl``) in the α dual — an upper bound where the
+entropy constraint is a lower bound. The divergence is computed analytically
+(both distributions are diagonal Gaussians). The contrastive critic is NOT
+touched: SPiRL also folds the divergence into the value backup, but that step
+presumes a bootstrapped critic, and this one is trained purely by InfoNCE.
 """
 
 from __future__ import annotations
@@ -102,6 +114,7 @@ from jaxgcrl.agents.go_explore_simple.skill_controller import (
     _plot_skill_colored_trajectory,
     load_frozen_skill_policy,
     make_skill_action_fn,
+    make_skill_prior_fn,
 )
 from jaxgcrl.agents.go_explore_simple.sac_discrete import DiscreteActorNet
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
@@ -122,6 +135,23 @@ def _gaussian_skill_and_log_prob(means, log_stds, key, keepdims: bool = True):
     log_prob = jax.scipy.stats.norm.logpdf(skill, loc=means, scale=stds)
     log_prob = log_prob.sum(-1, keepdims=keepdims)
     return skill, log_prob
+
+
+def _diag_gaussian_kl(mean_q, log_std_q, mean_p, log_std_p):
+    """Analytic ``D_KL( N(mean_q, diag σ_q²) ‖ N(mean_p, diag σ_p²) )``, summed over dims.
+
+    Both arguments are (..., K) diagonal-Gaussian parameterizations. SPiRL
+    computes this divergence in closed form rather than by sampling: a sampled
+    estimate is inaccurate exactly where it matters most — early in training,
+    between a randomly initialized policy and the prior.
+
+    Returned in nats **summed over the latent dimensions**, which is the
+    convention the target divergence ``δ`` is expressed in (so δ scales with |Z|).
+    """
+    var_ratio = jnp.exp(2.0 * (log_std_q - log_std_p))
+    sq_dist = ((mean_q - mean_p) ** 2) * jnp.exp(-2.0 * log_std_p)
+    per_dim = (log_std_p - log_std_q) + 0.5 * (var_ratio + sq_dist - 1.0)
+    return jnp.sum(per_dim, axis=-1)
 
 
 # ── CRL controller training state ───────────────────────────────────────────────
@@ -209,6 +239,8 @@ def crl_controller_update(
     logsumexp_penalty_coeff: float,
     target_entropy: float,
     continuous: bool = False,
+    prior_fn=None,
+    target_kl: float = None,
 ):
     """One CRL gradient step for the high-level controller.
 
@@ -226,7 +258,25 @@ def crl_controller_update(
     from ``go_explore/losses.py::update_actor_and_alpha`` — ``num_skills``
     doubles as the continuous skill dimensionality, and no one-hot is used
     anywhere (the raw skill vector is concatenated with the state instead).
+
+    When ``prior_fn`` is given (continuous only), the max-ent entropy bonus is
+    replaced by SPiRL's skill-prior divergence: the reference distribution for
+    the regularizer stops being uniform and becomes the frozen state-conditioned
+    prior ``p_a(z|s)``. Concretely ``−log π(z|s)`` becomes
+    ``−D_KL(π(·|s) ‖ p_a(·|s))`` in the actor objective, and the target entropy
+    ``H̄`` becomes a target *divergence* ``δ = target_kl`` in the α objective —
+    an upper bound where the entropy constraint is a lower bound, hence the sign
+    flip. The critic is untouched: it is purely contrastive with no bootstrapped
+    backup, so SPiRL's divergence-augmented value backup has no analogue here.
     """
+    if prior_fn is not None:
+        if not continuous:
+            raise ValueError(
+                "prior_fn (skill-prior KL) is only defined for a continuous skill "
+                "latent; the discrete controller's prior would be a categorical."
+            )
+        if target_kl is None:
+            raise ValueError("prior_fn requires target_kl (the target divergence δ).")
     obs = batch["obs"]                       # (B, obs_size) = [state, goal]
     reward = batch["reward"]
     done = batch["done"]
@@ -239,7 +289,14 @@ def crl_controller_update(
     old_alpha = jnp.exp(controller_state.alpha_state.params["log_alpha"])
 
     # ── Actor + α update (mirror crl ``update_actor_and_alpha``) ─────────────
+    use_prior_kl = prior_fn is not None
     if continuous:
+        if use_prior_kl:
+            # Frozen p_a(z|s) at the macro-step start states — the same states the
+            # skill is selected from, matching the prior's p(z|s_1) training
+            # condition. Constant w.r.t. the actor params (stop_gradient inside).
+            prior_mean, prior_log_std = prior_fn(state)        # (B, K), (B, K)
+
         def actor_loss_fn(a_params, key):
             means, log_stds = actor_net.apply(a_params, obs)   # (B, K), (B, K)
             skill, log_prob = _gaussian_skill_and_log_prob(
@@ -253,15 +310,25 @@ def crl_controller_update(
             q = energy_fn(energy_fn_name, sa_repr, g_repr)     # (B,); NOT stop-gradiented
             # -> gradient flows to the actor through the reparameterized skill.
 
-            per_state = old_alpha * log_prob - q               # (B,)
-            return jnp.mean(per_state), log_prob
+            if use_prior_kl:
+                # Analytic, so the regularizer's gradient reaches the actor
+                # through (means, log_stds) directly rather than through the
+                # sample — lower variance than the sampled log_prob it replaces.
+                kl = _diag_gaussian_kl(means, log_stds, prior_mean, prior_log_std)  # (B,)
+                reg = kl
+            else:
+                kl = jnp.zeros_like(log_prob)
+                reg = log_prob
 
-        (actor_loss_val, entropy_term), actor_grad = jax.value_and_grad(
+            per_state = old_alpha * reg - q                    # (B,)
+            return jnp.mean(per_state), (log_prob, kl)
+
+        (actor_loss_val, (log_prob, kl)), actor_grad = jax.value_and_grad(
             actor_loss_fn, has_aux=True
         )(actor_params, key)
-        # ``entropy_term`` here is log_prob (B,); reused below as ``entropy`` for
-        # the alpha loss and the shared "controller_entropy" metric (-log_prob).
-        entropy = -entropy_term
+        # Both auxes are evaluated at the OLD actor params, matching how the
+        # entropy version feeds the alpha loss below.
+        entropy = -log_prob
     else:
         def actor_loss_fn(a_params, key):
             logits = actor_net.apply(a_params, obs)            # (B, K)
@@ -288,10 +355,17 @@ def crl_controller_update(
         (actor_loss_val, entropy), actor_grad = jax.value_and_grad(
             actor_loss_fn, has_aux=True
         )(actor_params, key)
+        kl = jnp.zeros_like(entropy)
     new_actor_state = controller_state.actor_state.apply_gradients(grads=actor_grad)
 
     def alpha_loss_fn(alpha_params):
         alpha = jnp.exp(alpha_params["log_alpha"])
+        if use_prior_kl:
+            # SPiRL's dual: argmin_{α>0} E[ α·δ − α·D_KL ]. Sign-flipped relative
+            # to the entropy version because the divergence constraint is an
+            # UPPER bound (KL ≤ δ) where the entropy one is a lower bound, so
+            # KL > δ now drives α up instead of down.
+            return alpha * jnp.mean(jax.lax.stop_gradient(target_kl - kl))
         # crl alpha_loss: α·mean(stop_gradient(−log_prob − H̄)); discrete
         # substitution −log_prob -> entropy H(π)  =>  α·mean(sg(H − H̄)); the
         # continuous branch uses −log_prob directly (== ``entropy`` above).
@@ -344,8 +418,9 @@ def crl_controller_update(
         "controller_actor_loss": actor_loss_val,
         "controller_alpha": old_alpha,
         "controller_alpha_loss": alpha_loss_val,
+        # Logged in both modes: under the prior-KL objective the entropy is no
+        # longer the optimized quantity but stays informative alongside the KL.
         "controller_entropy": jnp.mean(entropy),
-        "controller_target_entropy": jnp.asarray(target_entropy, dtype=jnp.float32),
         "controller_critic_loss": critic_loss_val,
         # Contrastive-critic-specific metrics (mirror update_critic).
         "controller_categorical_accuracy": jnp.mean(correct),
@@ -355,6 +430,15 @@ def crl_controller_update(
         "controller_reward_mean": jnp.mean(reward),
         "controller_done_mean": jnp.mean(done),
     }
+    # Only log the constraint the dual is actually enforcing, so a wandb panel
+    # can never show a stale target for the objective that isn't running.
+    if use_prior_kl:
+        metrics["controller_prior_kl"] = jnp.mean(kl)
+        metrics["controller_target_kl"] = jnp.asarray(target_kl, dtype=jnp.float32)
+    else:
+        metrics["controller_target_entropy"] = jnp.asarray(
+            target_entropy, dtype=jnp.float32
+        )
     return new_controller_state, metrics
 
 
@@ -392,9 +476,11 @@ def train_crl_skill_controller(
     emp_agent, num_skills, skill_obs_builder = load_frozen_skill_policy(
         self, unwrapped_env, skill_key
     )
+    use_skill_prior_kl = bool(getattr(self, "use_skill_prior_kl", False))
     logging.info(
-        "crl skill controller: num_skills=%d, k=%d, continuous_skill=%s",
-        num_skills, k, continuous_skill,
+        "crl skill controller: num_skills=%d, k=%d, continuous_skill=%s, "
+        "use_skill_prior_kl=%s",
+        num_skills, k, continuous_skill, use_skill_prior_kl,
     )
     skill_action_train = make_skill_action_fn(
         emp_agent, skill_obs_builder, num_skills,
@@ -411,6 +497,34 @@ def train_crl_skill_controller(
         target_entropy = -0.5 * float(num_skills)
     else:
         target_entropy = float(self.controller_target_entropy_scale) * float(np.log(num_skills))
+
+    # ── SPiRL skill-prior KL (replaces the entropy bonus) ────────────────────
+    # The frozen prior p_a(z|s) comes from the same checkpoint as the low-level
+    # policy, and the target entropy H̄ is superseded by a target divergence δ.
+    if use_skill_prior_kl:
+        if not continuous_skill:
+            raise ValueError(
+                "use_skill_prior_kl=True requires continuous_skill=True (the prior "
+                "is a diagonal Gaussian over a continuous skill latent)."
+            )
+        if self.skill_prior_target_kl is None or self.skill_prior_target_kl <= 0:
+            # Re-checked here rather than relying solely on check_config's asserts,
+            # which vanish under PYTHONOPTIMIZE. A non-positive δ would silently
+            # inverse the dual (α driven up without bound).
+            raise ValueError(
+                "use_skill_prior_kl=True requires skill_prior_target_kl (δ) > 0; got "
+                f"{self.skill_prior_target_kl!r}. δ is in nats summed over the latent "
+                f"dimensions, so it scales with skill_dim (={num_skills} here) and does "
+                "not transfer across latent sizes."
+            )
+        target_kl = float(self.skill_prior_target_kl)
+        prior_fn = make_skill_prior_fn(
+            emp_agent, skill_obs_builder, skill_dim=num_skills, state_size=state_size
+        )
+        logging.info("crl skill controller: skill-prior KL on, target_kl=%.4f", target_kl)
+    else:
+        target_kl = None
+        prior_fn = None
 
     # ── Controller networks + state (actor + contrastive critic) ─────────────
     if continuous_skill:
@@ -506,7 +620,7 @@ def train_crl_skill_controller(
         num_skills=num_skills, state_size=state_size,
         energy_fn_name=self.energy_fn, contrastive_loss_name=self.contrastive_loss_fn,
         logsumexp_penalty_coeff=self.logsumexp_penalty_coeff, target_entropy=target_entropy,
-        continuous=continuous_skill,
+        continuous=continuous_skill, prior_fn=prior_fn, target_kl=target_kl,
     )
 
     # ── Env stacks (identical to the SAC-discrete controller) ────────────────
