@@ -2,7 +2,7 @@
 #SBATCH --job-name=crl_rlpd_he
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_low
+#SBATCH --qos=rail_gpu4_normal
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=120:00:00
