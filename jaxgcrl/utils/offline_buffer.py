@@ -21,6 +21,7 @@ from jaxgcrl.agents.go_explore.types import Transition
 # Mapping from JaxGCRL environment names to OGBench dataset names.
 JAXGCRL_TO_OGBENCH = {
     "ant_maze_ogbench_medium_navigate": "antmaze-medium-navigate-v0",
+    "ant_maze_ogbench_medium_stitch": "antmaze-medium-stitch-v0",
     "ant_maze_ogbench_medium_explore": "antmaze-medium-explore-v0",
     "ant_maze_ogbench_medium_1g": "antmaze-medium-explore-v0",
     "ant_maze_ogbench_arena": "antmaze-arena-v0",
@@ -40,6 +41,7 @@ JAXGCRL_TO_OGBENCH = {
     # scale2 variants share the OGBench frame ([-6, 26]) with their base envs,
     # so they reuse the same RLPD datasets.
     "ant_ball_4d_ogbench_arena_1g_scale2": "antsoccer-arena-navigate-v0",
+    "ant_ball_4d_ogbench_arena_1g_scale2_stitch": "antsoccer-arena-stitch-v0",
     "ant_ball_4d_ogbench_small_easy_square_1g_scale2": "antsoccer-arena-stitch-v0",
     "ant_ball_4d_ogbench_small_easy_square": "antsoccer-arena-navigate-v0",
     "ant_ball_4d_ogbench_small_easy_square_stitch": "antsoccer-arena-stitch-v0",
