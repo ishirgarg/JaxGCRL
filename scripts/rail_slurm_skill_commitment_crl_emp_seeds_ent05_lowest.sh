@@ -2,7 +2,7 @@
 #SBATCH --job-name=crl_emp_e05
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_lowest
+#SBATCH --qos=rail_gpu4_low
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=120:00:00
@@ -17,7 +17,7 @@
 # families swapped out for empowerment_skill.
 #
 # Unlike the dads/dds sweep there is NO entropy sweep here: only ENT=0.5 is run.
-# Priority is LOWEST (rail_gpu4_lowest).
+# Priority is LOW (rail_gpu4_low).
 #
 # ENT is the scale on the auto-tuned α's target entropy,
 # H_bar = ENT * log(num_skills) — the LOWER bound the dual enforces on the
